@@ -22,7 +22,10 @@ OBJDUMP="${OBJDUMP:-llvm-objdump}"
 SIZE="${SIZE:-llvm-size}"
 OBJCOPY="${OBJCOPY:-llvm-objcopy}"
 B=build
-QFLAGS="-M mps2-an500 -nographic -monitor none -serial stdio -semihosting-config enable=on,target=native"
+# An image ends its run by printing "[hackos] exit status N" and requesting a
+# system reset; -no-reboot turns the reset into the end of the emulator run.
+# No semihosting: the guest has no channel to the host except its UART.
+QFLAGS="-M mps2-an500 -nographic -monitor none -serial stdio -no-reboot"
 # Kernel tests run with QEMU's instruction counter as the clock (32 ns per
 # instruction, idle time skipped): tick-exact timing checks then do not depend
 # on how busy the host is.  The monitor session below runs in real time.
@@ -34,8 +37,17 @@ expect() {  # expect <description> <file> <extended regex>
     if grep -Eq -- "$3" "$2"; then ok "$1"; else bad "$1 (no match for /$3/ in $2)"; fi
 }
 
-run_qemu() {  # run_qemu <elf> <logfile>  -> exit status of QEMU (124 = timeout)
+# Status of a finished run: 124 if QEMU had to be killed, otherwise the N of
+# the image's last "[hackos] exit status N" line, 125 if it printed none.
+run_status() {  # run_status <logfile> <exit status of timeout/qemu>
+    [ "$2" -eq 124 ] && return 124
+    local n; n="$(tr -d '\r' < "$1" | sed -n 's/^\[hackos\] exit status \([0-9]*\)$/\1/p' | tail -1)"
+    [ -n "$n" ] || return 125
+    return "$n"
+}
+run_qemu() {  # run_qemu <elf> <logfile>  -> status of the run (see run_status)
     timeout 60 "$QEMU" $QFLAGS -kernel "$1" </dev/null >"$2" 2>"$2.err"
+    run_status "$2" $?
 }
 
 # Start QEMU with its serial input on a FIFO we can write to while watching
@@ -58,7 +70,7 @@ wait_for() {  # wait_for <fixed string> [occurrences]  (up to 60 s)
     done
 }
 say() { printf "$1" >&9; }
-qemu_wait() { local rc; wait $QPID; rc=$?; exec 9>&-; rm -f $B/uart.in; return $rc; }
+qemu_wait() { local rc; wait $QPID; rc=$?; exec 9>&-; rm -f $B/uart.in; run_status "$QLOG" $rc; }
 
 echo "[test] === 1. compiler: thumbv7em target ($ADDER/scripts/test_llvm_thumbv7em.sh)"
 if bash "$ADDER/scripts/test_llvm_thumbv7em.sh" > $B/compiler_test.log 2>&1; then
@@ -143,7 +155,7 @@ echo "[test] === 4. run-time self-test under QEMU (milestone 1 checks)"
 EXPECTED_SELF="$(grep -cE '^ +check\(' demo/main.ad)"
 run_qemu $B/selftest.elf $B/selftest.out; rc=$?
 cat $B/selftest.out
-[ $rc -eq 0 ] && ok "QEMU exit status 0" || bad "QEMU exit status $rc (124 = timed out)"
+[ $rc -eq 0 ] && ok "exit status 0" || bad "exit status $rc (124 = timed out)"
 nfail="$(grep -c '^FAIL ' $B/selftest.out)"; npass="$(grep -c '^PASS ' $B/selftest.out)"
 [ "$nfail" = 0 ] && ok "no FAIL lines" || bad "$nfail FAIL lines"
 [ "$npass" = "$EXPECTED_SELF" ] && ok "$npass PASS lines (all $EXPECTED_SELF checks ran)" || bad "$npass PASS lines, expected $EXPECTED_SELF"
@@ -164,7 +176,7 @@ fi
 qemu_wait; rc=$?
 tr -d '\r' < $B/ktest.out > $B/ktest.txt
 cat $B/ktest.txt
-[ $rc -eq 0 ] && ok "QEMU exit status 0" || bad "QEMU exit status $rc (124 = timed out; otherwise the number of failed checks)"
+[ $rc -eq 0 ] && ok "exit status 0" || bad "exit status $rc (124 = timed out; otherwise the number of failed checks)"
 nfail="$(grep -c '^FAIL ' $B/ktest.txt)"; npass="$(grep -c '^PASS ' $B/ktest.txt)"
 [ "$nfail" = 0 ] && ok "no FAIL lines" || bad "$nfail FAIL lines"
 [ "$npass" = "$EXPECTED_K" ] && ok "$npass PASS lines (all $EXPECTED_K checks ran)" || bad "$npass PASS lines, expected $EXPECTED_K"
@@ -235,7 +247,7 @@ qemu_wait; rc=$?
 tr -d '\r' < $B/monitor.out > $B/monitor.txt
 cat $B/monitor.txt
 M=$B/monitor.txt
-[ $rc -eq 0 ] && ok "monitor: 'halt 0' ended the run with status 0" || bad "monitor: QEMU exit status $rc"
+[ $rc -eq 0 ] && ok "monitor: 'halt 0' ended the run with status 0" || bad "monitor: exit status $rc"
 expect "monitor: banner" $M '^HackOS 0\.2 \(milestone 2\)'
 expect "monitor: 29 prompts" $M 'hackos> halt 0'
 expect "monitor: help lists the commands" $M '^  ps +threads: state'
@@ -265,7 +277,7 @@ nd="$(grep -c '^d$' $M)"; [ "$nd" = 1 ] && ok "monitor: /tmp/d listed once, gone
 echo "[test] === 7. fatal-fault report under QEMU (undefined instruction before the scheduler runs)"
 run_qemu $B/faulttest.elf $B/faulttest.out; rc=$?
 cat $B/faulttest.out
-[ $rc -eq 3 ] && ok "QEMU exit status 3 (fault handler ended the run)" || bad "QEMU exit status $rc, want 3"
+[ $rc -eq 3 ] && ok "exit status 3 (fault handler ended the run)" || bad "exit status $rc, want 3"
 expect "reported as UsageFault" $B/faulttest.out 'HackOS FAULT: UsageFault \(exception 6\)'
 expect "CFSR = 0x00010000 (UFSR.UNDEFINSTR)" $B/faulttest.out 'CFSR  = 0x00010000'
 expect "UNDEFINSTR decoded" $B/faulttest.out 'UFSR.UNDEFINSTR'

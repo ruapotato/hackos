@@ -97,7 +97,7 @@ $(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(COB
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 
 run: $(B)/hackos.elf
-	$(QEMU) -M mps2-an500 -nographic -semihosting-config enable=on,target=native -kernel $<
+	$(QEMU) -M mps2-an500 -nographic -no-reboot -kernel $<
 
 size: $(B)/hackos.elf
 	$(SIZE) $<

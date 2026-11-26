@@ -1,12 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- what happens when main() returns or the kernel gives up.
-# Test builds end the emulator run through semihosting; see kernel/semihost.ad.
+# HackOS -- what happens when main() returns, the kernel gives up, or someone
+# asks for a halt: report a status on the console and reset the system.
+#
+# The status line is the whole protocol between an image and the test harness:
+#
+#     [hackos] exit status N
+#
+# followed by a system reset request (AIRCR.SYSRESETREQ), which is what a
+# real board does to restart.  The harness starts QEMU with `-no-reboot`, so
+# the reset ends the emulator run, and reads N from the serial log.  Nothing
+# here depends on a debugger or on semihosting: the same code is correct on
+# hardware, where it reboots the device.
 
-from kernel.semihost import semihost_exit
-from kernel.cpu import cpu_irq_disable
+from kernel.cpu import cpu_irq_disable, mmio_write32
+from kernel.print import kputs, kput_u64
 
 
 def hackos_exit(code: uint32):
     cpu_irq_disable()
-    semihost_exit(code)
+    kputs("\n[hackos] exit status ")
+    kput_u64(cast[uint64](code))
+    kputs("\n")
+    while 1 == 1:
+        mmio_write32(0xE000ED0C, 0x05FA0004)        # AIRCR: VECTKEY | SYSRESETREQ
