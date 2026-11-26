@@ -5,8 +5,9 @@
 A small operating system for the HackerSlide hack pad: a handheld built around
 an NXP i.MX RT117x microcontroller (ARM Cortex-M7, double-precision FPU, memory
 protection unit but no MMU, 64-128 MB of SDRAM). HackOS is written in
-[Adder](https://github.com/HamnixOS), the language of the Hamnix operating
-system, and is meant to reuse Hamnix's file-system layer, libraries and shell
+[Adder](https://github.com/HamnixOS/adder), the language of the Hamnix operating
+system (it needs the `cortex-m7` branch of
+[ruapotato/adder](https://github.com/ruapotato/adder/tree/cortex-m7)), and is meant to reuse Hamnix's file-system layer, libraries and shell
 on top of a new kernel that needs no page tables.
 
 ## Status: milestone 1, emulator only
