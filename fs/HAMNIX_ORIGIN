@@ -36,3 +36,6 @@ f95df9759a8d15b3b06ca54d0545b3c81257d6b27dc34db2ca72d5c10aebd842  user/hamnix/ha
 ad23d93c2860deaa1f0537e1f7c9e2e161b1cdb6a95a6ebf528037be3c579120  lib/regex.ad
 93e3582dcde57079d03d310a9df6c0962ec2ca8f51ebb63f4eac437486ba5bac  lib/hamcomplete.ad
 8f93b9abc28d8ee6aa2b3fbcf53ec64152c089b4823c764b798f11bfe28956c9  lib/passwd/passwd.ad
+#
+# FAT32 (milestone 3), over HackOS's block layer (kernel/block/blk.ad).
+325f7d6bf158ef7d1e65d17412b0c1659796779f0ebd6c48b1687ba44947cd40  fs/fat.ad

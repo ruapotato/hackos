@@ -12,6 +12,15 @@ from drivers.tty.console import console_write
 
 PRINTK_BUF: uint32 = 256
 
+# Hamnix code sets a console log level around noisy sections.  HackOS has one
+# level: everything is printed.  The call is accepted and remembered.
+PRINTK_LEVEL_EMERG: int32 = 0
+printk_level: int32 = 7
+
+
+def printk_set_level(level: int32):
+    printk_level = level
+
 
 def _pk_putc(buf: Ptr[uint8], n: uint32, cap: uint32, c: uint32) -> uint32:
     if n + 1 < cap:

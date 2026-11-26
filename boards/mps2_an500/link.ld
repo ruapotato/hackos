@@ -112,6 +112,13 @@ SECTIONS
     } > RAM
     __ram_end = ORIGIN(RAM) + LENGTH(RAM);
 
+    /* The RAM disk ("ram0", kernel/block/blk.ad): the upper half of the
+     * kernel RAM region, which the kernel's own data does not come near.
+     * The test harness has QEMU load a FAT32 image here (-device loader). */
+    __ramdisk_start = ORIGIN(RAM) + 0x200000;
+    __ramdisk_size = 0x200000;
+    ASSERT(__fault_stack_top <= __ramdisk_start, "kernel data runs into the RAM disk")
+
     __user_end = ORIGIN(XRAM) + LENGTH(XRAM);
     __user_start = __user_end - __user_size;
     __heap_start = ALIGN(__xbss_end, 16);

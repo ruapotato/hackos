@@ -30,6 +30,9 @@ QFLAGS="-M mps2-an500 -nographic -monitor none -serial stdio -no-reboot"
 # instruction, idle time skipped): tick-exact timing checks then do not depend
 # on how busy the host is.  The monitor session below runs in real time.
 ICOUNT="-icount shift=5,sleep=off"
+# The "card": a FAT32 image placed in the RAM disk before the kernel starts
+# (the Makefile builds it with mtools).
+SDCARD="-device loader,file=$B/sd.img,addr=0x20200000"
 fails=0
 ok()  { echo "[test] ok: $1"; }
 bad() { echo "[test] FAIL: $1"; fails=$((fails+1)); }
@@ -171,7 +174,7 @@ expect "RESULT: PASS" $B/selftest.out '^RESULT: PASS'
 
 echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, processes, pipes, console)"
 EXPECTED_K="$(grep -cE '^ +check\(' tests/ktest_main.ad)"
-qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT"
+qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT $SDCARD"
 if wait_for "-- 9. console"; then
     # typed "by hand": a line, corrections with DEL and backspace, a line
     # killed with Ctrl-U, a line read in two pieces, Ctrl-D
@@ -319,7 +322,7 @@ echo "[test] === 8. the shell: Hamnix's hamsh as a process on the UART console, 
 # counted; instead every command is followed by `wc < /dev/null`, whose output
 # "0 0 0" is never part of what was typed, and the harness waits for the n-th
 # one before it types the next command.
-qemu_start $B/hackos.elf $B/shell.out
+qemu_start $B/hackos.elf $B/shell.out "$SDCARD"
 m=0
 sh() {  # type one command line, then the marker command; wait for the marker
     m=$((m+1))
@@ -354,6 +357,17 @@ if wait_for "hamsh\$ "; then
     sh 'cat /tmp/err'
     shn 'ptest peek 20000000'
     sh 'echo after the fault $status'
+    # the card
+    sh 'ls /sd'
+    sh 'cat /sd/README.TXT'
+    sh 'cp /sd/PATTERN.BIN /tmp/pattern'
+    sh 'cat /tmp/pattern | wc'
+    sh 'cp /tmp/pattern /sd/BACK.BIN'
+    sh 'cat /sd/BACK.BIN | wc'
+    shn '/sd/DOCS/HELLO card'
+    sh 'echo from the card $status'
+    sh 'rm /sd/BACK.BIN'
+    sh 'cat /sd/BACK.BIN'
     # a script file, written with the shell itself, run by a second hamsh
     sh "echo 'echo script started' > /tmp/s.hsh"
     sh "echo 'ls /bin | wc > /tmp/count' >> /tmp/s.hsh"
@@ -406,6 +420,12 @@ expect "shell: script: for loop" $S '^script word beta$'
 expect "shell: script: arithmetic and if" $S '^script n is 42$'
 expect "shell: script: built-in into a pipe" $S '^1 2 13$'
 expect "shell: script: exit status" $S '^script status 5$'
+expect "shell: ls /sd shows the files of the FAT volume" $S '^PATTERN\.BIN$'
+expect "shell: cat a file from the card" $S '^HackOS reads it through Hamnix fs/fat.ad\.$'
+n40k="$(grep -c '^157 627 40000$' $S)"
+[ "$n40k" = 2 ] && ok "shell: cp card -> tmpfs -> card, 40000 bytes each way" || bad "shell: the 40000-byte copies were counted $n40k times, expected 2"
+expect "shell: a program run from the card" $S '^from the card 2$'
+expect "shell: rm on the card" $S '^cat: cannot open /sd/BACK.BIN: .*file does not exist'
 nmark="$(grep -c '^0 0 0$' $S)"
 [ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"
 

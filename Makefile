@@ -158,13 +158,28 @@ $(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/f
 	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(B)/romfs.o $<
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 
-run: $(B)/hackos.elf
-	$(QEMU) -M mps2-an500 -nographic -no-reboot -kernel $<
+# The "card": a 2 MiB FAT32 image made with mtools, loaded by QEMU into the
+# RAM disk (boards/mps2_an500/link.ld: __ramdisk_start) before the kernel
+# starts.  512-byte clusters; a file with a long name, a file that spans many
+# clusters, a sub-directory.  Without mtools there is no image and no /sd.
+SD_ADDR := 0x20200000
+$(B)/sd.img: tests/sd/readme.txt $(B)/user/hello | $(B)
+	rm -f $@ && truncate -s 2M $@
+	mformat -i $@ -F -c 1 -v HACKOS ::
+	mcopy -i $@ tests/sd/readme.txt ::README.TXT
+	mcopy -i $@ tests/sd/readme.txt "::A long file name.text"
+	mmd -i $@ ::DOCS
+	mcopy -i $@ $(B)/user/hello ::DOCS/HELLO
+	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 7 + 3) & 255 for i in range(40000)))" > $(B)/pattern.bin
+	mcopy -i $@ $(B)/pattern.bin ::PATTERN.BIN
+
+run: $(B)/hackos.elf $(B)/sd.img
+	$(QEMU) -M mps2-an500 -nographic -no-reboot -device loader,file=$(B)/sd.img,addr=$(SD_ADDR) -kernel $<
 
 size: $(B)/hackos.elf
 	$(SIZE) $<
 
-test: $(B)/hackos.elf $(B)/monitor.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf
+test: $(B)/hackos.elf $(B)/monitor.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf $(B)/sd.img
 	ADDER=$(ADDER) bash tests/run_all.sh
 
 measure: $(HOST_AC)
