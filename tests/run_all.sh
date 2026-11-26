@@ -169,7 +169,7 @@ nfail="$(grep -c '^FAIL ' $B/selftest.out)"; npass="$(grep -c '^PASS ' $B/selfte
 [ "$npass" = "$EXPECTED_SELF" ] && ok "$npass PASS lines (all $EXPECTED_SELF checks ran)" || bad "$npass PASS lines, expected $EXPECTED_SELF"
 expect "RESULT: PASS" $B/selftest.out '^RESULT: PASS'
 
-echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, processes, console)"
+echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, processes, pipes, console)"
 EXPECTED_K="$(grep -cE '^ +check\(' tests/ktest_main.ad)"
 qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT"
 if wait_for "-- 9. console"; then
@@ -213,6 +213,24 @@ if [ -n "$cyc" ]; then
 else
     bad "no system-call benchmark line"
 fi
+
+# process figures (instructions = timer cycles * 40 / 32, as above)
+bench() { sed -n "s/^BENCH $1: .* in \([0-9]*\) timer cycles.*/\1/p" $B/ktest.txt; }
+c_spawn="$(bench spawn)"; c_rfork="$(bench rfork)"; c_pipe="$(bench pipe)"
+c_hamsh="$(sed -n 's/^BENCH hamsh: .*collect: \([0-9]*\) timer cycles.*/\1/p' $B/ktest.txt)"
+if [ -n "$c_spawn" ] && [ -n "$c_rfork" ] && [ -n "$c_pipe" ] && [ -n "$c_hamsh" ]; then
+    i_spawn=$(( c_spawn * 40 / 32 / 20 ))
+    echo "[test] info: $i_spawn instructions per spawn + exit + wait of /bin/ptest ($(stat -c %s $B/user/ptest)-byte file)"
+    echo "[test] info: $(( (c_rfork * 40 / 32 - i_spawn) / 20 )) instructions per rfork + exec + exit + wait of the same program"
+    echo "[test] info: $(( c_hamsh * 40 / 32 )) instructions to start /bin/hamsh ($(stat -c %s $B/user/hamsh)-byte file), run an empty script and collect it"
+    echo "[test] info: pipe: $(( (c_pipe * 40 / 32 - 2 * i_spawn) * 100 / 1048576 )) instructions per 100 bytes, process to process (1 MiB in 4 KiB writes and reads)"
+    ok "process benchmarks ran"
+else
+    bad "process benchmark lines missing"
+fi
+expect "tmpfs per-file cost reported" $B/ktest.txt '^BENCH tmpfs: an empty file takes 0 bytes of kernel heap, its first byte [0-9]+ more'
+expect "a faulting process is reported as a process, by name" $B/ktest.txt "process [0-9]+ 'ptest' ended: stack overflow at 0x60"
+expect "the loaded C program printed through its relocated pointers" $B/ktest.txt '^crel: relocated pointers ok$'
 
 echo "[test] === 6. monitor session over the UART (real-time clock, commands typed by the harness)"
 qemu_start $B/monitor.elf $B/monitor.out

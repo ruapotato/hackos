@@ -31,6 +31,8 @@ from tests.kt_cinterop import ci_scalars, ci_callback, ci_structs, ci_sht_serial
 from drivers.i2c.sensirion_hal import hal_calls
 from kernel.proc import proc_spawn, proc_waitpid, proc_waitpid_jc, proc_spawned, proc_execs, proc_last_block, proc_last_image, proc_last_stack, proc_last_relocs
 from mm.slab import pheap
+from kernel.pipe import pipe_alloc_chan, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_live
+from fs.tmpfs import TmpfsEntry
 from fs.hvfs import fs_lock
 from kernel.sync import mutex_dead_released
 
@@ -1121,6 +1123,81 @@ def test_proc():
     printk4(", threads %d (was %d), open files %d (was %d)\n", cast[uint64](threads_in_use()), cast[uint64](thr0), cast[uint64](vfs_open_count()), cast[uint64](open0))
 
 
+# ============================================================ 12. pipes, /fd names
+def test_pipes():
+    printk0("-- 12. pipes and /fd names\n")
+    nul: Ptr[uint8] = cast[Ptr[uint8]](0)
+    klive0: uint32 = kheap.n_live
+    open0: uint32 = vfs_open_count()
+    # the pipe object itself, from kernel threads
+    s: int32 = pipe_alloc_chan(1)
+    pipe_inc_reader(s)
+    pipe_inc_writer(s)
+    buf: Array[32, uint8]
+    w: int64 = pipe_write(s, "0123456789", 10, 0)
+    r1: int64 = pipe_read(s, &buf[0], 4, 0)
+    r2: int64 = pipe_read(s, &buf[4], 28, 0)
+    check(cast[uint32](s >= 0 and w == 10 and r1 == 4 and r2 == 6 and buf[0] == 48 and buf[9] == 57 and pipe_read(s, &buf[0], 8, 1) == 0), "pipe: bytes in order, short reads, non-blocking read of an empty pipe is 0")
+    pipe_close_writer(s)
+    check(cast[uint32](pipe_read(s, &buf[0], 8, 0) == 0 and pipe_read(s, &buf[0], 8, 1) == -1 and pipe_live == 1), "pipe: end of file once the last writer is gone")
+    pipe_close_reader(s)
+    check(cast[uint32](pipe_live == 0 and kheap.n_live == klive0), "pipe: freed when the last reference goes")
+    code: int64 = run_prog("/bin/ptest", "pipe", nul, nul)
+    printk1("   ptest pipe -> %d\n", cast[uint64](code))
+    check(cast[uint32](code == 255 and pipe_live == 0), "/fd: a process binds both ends of a pipe at /fd names: data, kinds, end of file, EPIPE, rebinding")
+    code = run_prog("/bin/ptest", "pipexfer", "00040000", nul)
+    check(cast[uint32](code == 3 and pipe_live == 0), "pipe: 256 KiB from one process to another through a 4 KiB pipe, every byte checked")
+    code = run_prog("/bin/ptest", "vfpipe", nul, nul)
+    check(cast[uint32](code == 40 and pipe_live == 0), "pipe: a child of rfork that has not exec'ed is not put to sleep on a full pipe (EAGAIN)")
+    code = run_prog("/bin/ptest", "redir", "/bin/hello", nul)
+    printk1("   ptest redir -> %d\n", cast[uint64](code))
+    check(cast[uint32](code == 15), "/fd: the parent binds its child's /fd/1 to a file after the spawn; the child was held until then")
+    vfs_unlink("/tmp/redir.out")
+    check(cast[uint32](kheap.n_live == klive0 and vfs_open_count() == open0 and pipe_live == 0 and heap_check(&kheap) == 0), "pipe: nothing left allocated or open")
+
+
+# ============================================================ process benchmarks
+def bench_proc():
+    nul: Ptr[uint8] = cast[Ptr[uint8]](0)
+    # spawn + exit + wait of a small program (8 KB file, 16 KB block)
+    c0: uint64 = cycles_now()
+    i: uint32 = 0
+    while i < 20:
+        run_prog("/bin/ptest", "nop", nul, nul)
+        i = i + 1
+    c1: uint64 = cycles_now()
+    printk2("BENCH spawn: %d x (spawn + exit + wait) of /bin/ptest in %d timer cycles\n", 20, c1 - c0)
+    # the same through rfork + exec, from a process (0x14 = 20 times)
+    c0 = cycles_now()
+    run_prog("/bin/ptest", "forkbench", "14", nul)
+    c1 = cycles_now()
+    printk2("BENCH rfork: %d x (rfork + exec + exit + wait) of /bin/ptest in %d timer cycles (one spawn of the driver included)\n", 20, c1 - c0)
+    # a large program: the shell running an empty script
+    fd: int32 = vfs_open("/tmp/empty.hsh", OWRITE | OTRUNC | OCREATE)
+    vfs_write(fd, "exit 0\n", 7)
+    vfs_close(fd)
+    c0 = cycles_now()
+    code: int64 = run_prog("/bin/hamsh", "/tmp/empty.hsh", nul, nul)
+    c1 = cycles_now()
+    vfs_unlink("/tmp/empty.hsh")
+    printk3("BENCH hamsh: start, run `exit 0` and collect: %d timer cycles (status %d); block %d bytes", c1 - c0, cast[uint64](code), cast[uint64](proc_last_block))
+    printk2(" (stack %d, image %d)\n", cast[uint64](proc_last_stack), cast[uint64](proc_last_image))
+    # pipe throughput: 1 MiB between two processes
+    c0 = cycles_now()
+    run_prog("/bin/ptest", "pipebench", "00100000", nul)
+    c1 = cycles_now()
+    printk2("BENCH pipe: %d bytes from process to process in %d timer cycles (two spawns included)\n", 1048576, c1 - c0)
+    # tmpfs: what one small file costs
+    k0: uint32 = kheap.used_bytes
+    fd = vfs_open("/tmp/one", OWRITE | OTRUNC | OCREATE)
+    k1: uint32 = kheap.used_bytes
+    vfs_write(fd, "x", 1)
+    k2: uint32 = kheap.used_bytes
+    vfs_close(fd)
+    vfs_unlink("/tmp/one")
+    printk3("BENCH tmpfs: an empty file takes %d bytes of kernel heap, its first byte %d more; table entry %d bytes\n", cast[uint64](k1 - k0), cast[uint64](k2 - k1), sizeof(TmpfsEntry))
+
+
 def runner(arg: uint64) -> int64:
     vfs_open_stdio()
     test_boot()
@@ -1133,7 +1210,9 @@ def runner(arg: uint64) -> int64:
     test_fs()
     test_c()
     test_proc()
+    test_pipes()
     bench_switch()
+    bench_proc()
     test_console()
     if failures == 0:
         printk0("RESULT: PASS (all checks passed)\n")

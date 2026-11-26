@@ -15,15 +15,16 @@
 # yield loop on the write side, and its ring is a fixed 128 KiB per pipe.
 # Here both sides sleep on wait queues, the ring is PIPE_CAP bytes from the
 # kernel heap, and every operation is a short critical section (the copy is
-# done in pieces of at most PIPE_COPY bytes with interrupts masked).
+# done in pieces of at most PIPE_COPY bytes, word by word, with interrupts masked).
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.rt import rt_memcpy
 from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, WAIT_FOREVER
 from mm.slab import kmalloc, kfree
 
 PIPE_MAX: uint32 = 16
-PIPE_CAP: uint32 = 4096
-PIPE_COPY: uint32 = 256
+PIPE_CAP: uint32 = 4096             # a power of two
+PIPE_COPY: uint32 = 1024            # bytes copied per critical section
 EPIPE: int32 = -32
 EAGAIN: int32 = -11
 
@@ -186,14 +187,18 @@ def pipe_read(slot: int32, dst: Ptr[uint8], n: uint64, nonblock: uint32) -> int6
             return 0
     got: uint64 = 0
     while got < n and p[0].count > 0:
-        buf: Ptr[uint8] = cast[Ptr[uint8]](p[0].buf)
-        k: uint32 = 0
-        while k < PIPE_COPY and got < n and p[0].count > 0:
-            dst[got] = buf[p[0].head]
-            p[0].head = (p[0].head + 1) % PIPE_CAP
-            p[0].count = p[0].count - 1
-            got = got + 1
-            k = k + 1
+        # one piece: up to PIPE_COPY bytes, not across the end of the ring
+        k: uint32 = p[0].count
+        if k > PIPE_COPY:
+            k = PIPE_COPY
+        if cast[uint64](k) > n - got:
+            k = cast[uint32](n - got)
+        if k > PIPE_CAP - p[0].head:
+            k = PIPE_CAP - p[0].head
+        rt_memcpy(cast[uint64](dst) + got, p[0].buf + cast[uint64](p[0].head), cast[uint64](k))
+        p[0].head = (p[0].head + k) & (PIPE_CAP - 1)
+        p[0].count = p[0].count - k
+        got = got + cast[uint64](k)
         # let interrupts in between pieces
         cpu_irq_restore(irq)
         irq = cpu_irq_save()
@@ -229,13 +234,17 @@ def pipe_write(slot: int32, src: Ptr[uint8], n: uint64, noblock: uint32) -> int6
                 return cast[int64](EAGAIN)
             wq_wait(&p[0].wr_wq, WAIT_FOREVER)
             continue
-        buf: Ptr[uint8] = cast[Ptr[uint8]](p[0].buf)
-        k: uint32 = 0
-        while k < PIPE_COPY and done < n and p[0].count < PIPE_CAP:
-            buf[(p[0].head + p[0].count) % PIPE_CAP] = src[done]
-            p[0].count = p[0].count + 1
-            done = done + 1
-            k = k + 1
+        tail: uint32 = (p[0].head + p[0].count) & (PIPE_CAP - 1)
+        k: uint32 = PIPE_CAP - p[0].count
+        if k > PIPE_COPY:
+            k = PIPE_COPY
+        if cast[uint64](k) > n - done:
+            k = cast[uint32](n - done)
+        if k > PIPE_CAP - tail:
+            k = PIPE_CAP - tail
+        rt_memcpy(p[0].buf + cast[uint64](tail), cast[uint64](src) + done, cast[uint64](k))
+        p[0].count = p[0].count + k
+        done = done + cast[uint64](k)
         p[0].bytes = p[0].bytes + cast[uint64](k)
         wq_wake_all(&p[0].rd_wq)
         cpu_irq_restore(irq)
