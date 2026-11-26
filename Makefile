@@ -31,7 +31,7 @@ ASFLAGS := $(CPUFLAGS) -ffreestanding
 LDFLAGS := -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static
 
 B := build
-SRC_AD := $(wildcard kernel/*.ad boards/mps2_an500/*.ad demo/*.ad tests/*.ad)
+SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/mps2_an500/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
 
 .SECONDARY:
 .PHONY: all test run size measure clean compiler
@@ -55,17 +55,21 @@ $(B)/%.ll: $(SRC_AD) $(HOST_AC) | $(B)
 	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $(ROOT_$*) $@
 	@grep '^; ADDER_STAT' $@
 
-ROOT_hackos := demo/main.ad
+ROOT_hackos := init/main.ad
+ROOT_selftest := demo/main.ad
+KOBJS_hackos := $(B)/switch.o
 ROOT_faulttest := tests/fault_main.ad
+ROOT_t1 := tests/scratch/t1.ad
+KOBJS_t1 := $(B)/switch.o
 
 $(B)/%.o: $(B)/%.ll
 	$(CLANG) $(LLFLAGS) -c $< -o $@
 
-$(B)/startup.o: arch/armv7m/startup.S | $(B)
+$(B)/%.o: arch/armv7m/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o boards/mps2_an500/link.ld
-	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $<
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o boards/mps2_an500/link.ld
+	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/cpu.o $(KOBJS_$*) $<
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 
 run: $(B)/hackos.elf

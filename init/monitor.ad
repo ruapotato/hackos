@@ -1,0 +1,283 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the built-in kernel monitor: a small command loop on the console.
+# It is a privileged kernel thread and calls kernel services directly.  It is
+# not a shell (Hamnix's hamsh comes with program loading); it exists to look
+# at the kernel and to exercise it by hand.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk3, printk4
+from kernel.sched.core import Thread, threads, thr, thread_create, thread_join, thread_sleep, thread_kstack_used, thread_ustack_used, sched_now, sched_switches, sched_current, THREAD_MAX, TF_USER, T_UNUSED, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE, STACK_GUARD
+from mm.slab import kheap, uheap
+from mm.heap import Heap, heap_total, heap_free_bytes, heap_free_blocks, heap_largest_free, heap_check
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_chdir, vfs_getcwd, vfs_open_stdio, vfs_open_count, OREAD, OWRITE, OTRUNC, OCREATE, OAPPEND
+from kernel.syscall import sys_count
+from kernel.trap import trap_count
+from kernel.exit import hackos_exit
+from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf
+from drivers.tty.console import con_rx_bytes
+
+mon_line: Array[256, uint8]
+mon_argv: Array[8, uint64]
+mon_argc: uint32 = 0
+mon_iobuf: Array[512, uint8]
+mon_errbuf: Array[64, uint8]
+# a kernel variable for `fault kread` / `fault kwrite` to aim at
+mon_secret: volatile uint32 = 0x5EC2E7
+
+
+def _streq(a: Ptr[uint8], b: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while a[i] != 0 and a[i] == b[i]:
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+def _arg(i: uint32) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](mon_argv[i])
+
+
+# Split mon_line in place into at most 8 words.  The last word keeps the rest
+# of the line when `rest_from` words have been taken (for `write f some text`).
+def _split(rest_from: uint32):
+    mon_argc = 0
+    i: uint32 = 0
+    while mon_line[i] != 0 and mon_argc < 8:
+        while mon_line[i] == 32:
+            i = i + 1
+        if mon_line[i] == 0:
+            break
+        mon_argv[mon_argc] = cast[uint64](&mon_line[i])
+        mon_argc = mon_argc + 1
+        if mon_argc == rest_from + 1 and rest_from != 0:
+            return
+        while mon_line[i] != 0 and mon_line[i] != 32:
+            i = i + 1
+        if mon_line[i] == 32:
+            mon_line[i] = 0
+            i = i + 1
+
+
+def _perr(what: Ptr[uint8], rc: int64):
+    es: Ptr[uint8] = &thr(sched_current)[0].errstr[0]
+    printk3("%s: error %d (%s)\n", cast[uint64](what), cast[uint64](rc), cast[uint64](es))
+
+
+def _state_name(s: uint32) -> Ptr[uint8]:
+    if s == T_READY:
+        return "ready"
+    if s == T_RUNNING:
+        return "running"
+    if s == T_BLOCKED:
+        return "blocked"
+    if s == T_ZOMBIE:
+        return "zombie"
+    return "?"
+
+
+def mon_ps():
+    printk0("TID NAME             STATE   PRI MODE  STACK used/size  USTACK used/size  TICKS  SWITCHES\n")
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        t: Ptr[Thread] = &threads[i]
+        if t[0].state != T_UNUSED:
+            mode: Ptr[uint8] = "kern"
+            if (t[0].flags & TF_USER) != 0:
+                mode = "user"
+            printk4("%3d %16s %7s %3d ", cast[uint64](t[0].tid), cast[uint64](&t[0].name[0]), cast[uint64](_state_name(t[0].state)), cast[uint64](t[0].prio))
+            printk3("%4s  %6d/%6d", cast[uint64](mode), thread_kstack_used(t), t[0].kstack_size - cast[uint64](STACK_GUARD))
+            if (t[0].flags & TF_USER) != 0:
+                printk2("    %6d/%6d", thread_ustack_used(t), t[0].ustack_size - cast[uint64](STACK_GUARD))
+            else:
+                printk0("                 -")
+            printk2(" %6d %9d\n", t[0].cpu_ticks, t[0].switches)
+        i = i + 1
+    printk2("uptime %d ticks, %d context switches\n", sched_now(), sched_switches)
+
+
+def _heap_line(name: Ptr[uint8], h: Ptr[Heap]):
+    printk4("%s heap: total %d  used %d  peak %d", cast[uint64](name), heap_total(h), cast[uint64](h[0].used_bytes), cast[uint64](h[0].peak_bytes))
+    printk3("  free %d in %d block(s), largest %d\n", heap_free_bytes(h), heap_free_blocks(h), heap_largest_free(h))
+    printk4("  live blocks %d  allocs %d  frees %d  failed %d", cast[uint64](h[0].n_live), cast[uint64](h[0].n_alloc), cast[uint64](h[0].n_free), cast[uint64](h[0].n_fail))
+    printk2("  requested bytes live %d  consistency %d\n", cast[uint64](h[0].req_bytes), cast[uint64](heap_check(h)))
+
+
+def mon_heap():
+    _heap_line("kernel", &kheap)
+    _heap_line("user", &uheap)
+
+
+def mon_cat(path: Ptr[uint8]):
+    fd: int32 = vfs_open(path, OREAD)
+    if fd < 0:
+        _perr("cat", cast[int64](fd))
+        return
+    n: int64 = vfs_read(fd, &mon_iobuf[0], 511, 0)
+    while n > 0:
+        vfs_write(1, &mon_iobuf[0], cast[uint64](n))
+        n = vfs_read(fd, &mon_iobuf[0], 511, 0)
+    vfs_close(fd)
+
+
+def mon_write(path: Ptr[uint8], text: Ptr[uint8], mode: uint32):
+    fd: int32 = vfs_open(path, mode)
+    if fd < 0:
+        _perr("write", cast[int64](fd))
+        return
+    n: uint64 = 0
+    while text[n] != 0:
+        n = n + 1
+    w: int64 = vfs_write(fd, text, n)
+    if w >= 0:
+        nl: Ptr[uint8] = "\n"
+        vfs_write(fd, nl, 1)
+        printk2("wrote %d bytes to %s\n", cast[uint64](w + 1), cast[uint64](path))
+    else:
+        _perr("write", w)
+    vfs_close(fd)
+
+
+def _u32at(b: Ptr[uint8], off: uint32) -> uint64:
+    return cast[uint64](b[off]) | (cast[uint64](b[off + 1]) << 8) | (cast[uint64](b[off + 2]) << 16) | (cast[uint64](b[off + 3]) << 24)
+
+
+def mon_stat(path: Ptr[uint8]):
+    st: Array[128, uint8]
+    n: int64 = vfs_stat(path, &st[0], 128)
+    if n < 0:
+        _perr("stat", n)
+        return
+    kind: Ptr[uint8] = "file"
+    if (st[8] & 0x80) != 0:
+        kind = "directory"
+    elif (_u32at(&st[0], 21) & 0x00800000) != 0:
+        kind = "device"
+    printk4("%s: %s, %d bytes, mode %x", cast[uint64](path), cast[uint64](kind), _u32at(&st[0], 33), _u32at(&st[0], 21) & 0x1FF)
+    printk1(", mtime %d\n", _u32at(&st[0], 29))
+
+
+def mon_fault(what: Ptr[uint8]):
+    entry: uint64 = 0
+    arg: uint64 = 0
+    flags: uint32 = TF_USER
+    if _streq(what, "stack") != 0:
+        entry = cast[uint64](&fault_stack_overflow)
+    elif _streq(what, "kstack") != 0:
+        entry = cast[uint64](&fault_stack_overflow)
+        flags = 0
+    elif _streq(what, "kread") != 0:
+        entry = cast[uint64](&fault_read)
+        arg = cast[uint64](&mon_secret)
+    elif _streq(what, "kwrite") != 0:
+        entry = cast[uint64](&fault_write)
+        arg = cast[uint64](&mon_secret)
+    elif _streq(what, "null") != 0:
+        entry = cast[uint64](&fault_read)
+    elif _streq(what, "jump0") != 0:
+        entry = cast[uint64](&fault_jump)
+    elif _streq(what, "udf") != 0:
+        entry = cast[uint64](&fault_udf)
+    else:
+        printk0("fault: stack | kstack | kread | kwrite | null | jump0 | udf\n")
+        return
+    t: Ptr[Thread] = thread_create(what, entry, arg, 3, 4096, flags)
+    if t == cast[Ptr[Thread]](0):
+        printk0("fault: cannot create a thread\n")
+        return
+    code: int64 = 0
+    thread_join(t[0].tid, &code)
+    printk2("thread '%s' exited with code %d; the system carries on\n", cast[uint64](what), cast[uint64](code))
+
+
+def mon_help():
+    printk0("commands:\n")
+    printk0("  ps                 threads: state, priority, stack high-water mark, CPU ticks\n")
+    printk0("  heap               kernel and user heap statistics\n")
+    printk0("  ls [dir]           list a directory        cat FILE     print a file\n")
+    printk0("  write FILE TEXT    create/replace a file   append FILE TEXT\n")
+    printk0("  mkdir DIR   rm PATH   mv OLD NEW   stat PATH   cd DIR   pwd\n")
+    printk0("  fault KIND         provoke a fault in a new thread (stack kstack kread kwrite null jump0 udf)\n")
+    printk0("  info               counters            halt [N]     end the emulator run\n")
+
+
+def mon_exec() -> uint32:
+    c: Ptr[uint8] = _arg(0)
+    if _streq(c, "help") != 0 or _streq(c, "?") != 0:
+        mon_help()
+    elif _streq(c, "ps") != 0:
+        mon_ps()
+    elif _streq(c, "heap") != 0:
+        mon_heap()
+    elif _streq(c, "ls") != 0:
+        if mon_argc > 1:
+            mon_cat(_arg(1))
+        else:
+            mon_cat(".")
+    elif _streq(c, "cat") != 0 and mon_argc > 1:
+        mon_cat(_arg(1))
+    elif _streq(c, "write") != 0 and mon_argc > 2:
+        mon_write(_arg(1), _arg(2), OWRITE | OTRUNC | OCREATE)
+    elif _streq(c, "append") != 0 and mon_argc > 2:
+        mon_write(_arg(1), _arg(2), OWRITE | OAPPEND | OCREATE)
+    elif _streq(c, "mkdir") != 0 and mon_argc > 1:
+        rc: int32 = vfs_mkdir(_arg(1))
+        if rc < 0:
+            _perr("mkdir", cast[int64](rc))
+    elif _streq(c, "rm") != 0 and mon_argc > 1:
+        rc2: int32 = vfs_unlink(_arg(1))
+        if rc2 < 0:
+            _perr("rm", cast[int64](rc2))
+    elif _streq(c, "mv") != 0 and mon_argc > 2:
+        rc3: int32 = vfs_rename(_arg(1), _arg(2))
+        if rc3 < 0:
+            _perr("mv", cast[int64](rc3))
+    elif _streq(c, "stat") != 0 and mon_argc > 1:
+        mon_stat(_arg(1))
+    elif _streq(c, "cd") != 0 and mon_argc > 1:
+        rc4: int32 = vfs_chdir(_arg(1))
+        if rc4 < 0:
+            _perr("cd", cast[int64](rc4))
+    elif _streq(c, "pwd") != 0:
+        vfs_getcwd(&mon_iobuf[0], 256)
+        printk1("%s\n", cast[uint64](&mon_iobuf[0]))
+    elif _streq(c, "fault") != 0 and mon_argc > 1:
+        mon_fault(_arg(1))
+    elif _streq(c, "info") != 0:
+        printk4("system calls %d  thread faults %d  console bytes in %d  open files %d\n", sys_count, cast[uint64](trap_count), con_rx_bytes, cast[uint64](vfs_open_count()))
+    elif _streq(c, "halt") != 0:
+        code: uint32 = 0
+        if mon_argc > 1:
+            d: Ptr[uint8] = _arg(1)
+            k: uint32 = 0
+            while d[k] >= 48 and d[k] <= 57:
+                code = code * 10 + cast[uint32](d[k]) - 48
+                k = k + 1
+        printk1("halt %d\n", cast[uint64](code))
+        hackos_exit(code)
+    else:
+        printk1("unknown or incomplete command: %s (try help)\n", cast[uint64](c))
+    return 0
+
+
+def monitor_main(arg: uint64) -> int64:
+    vfs_open_stdio()
+    printk0("HackOS monitor.  Type help.\n")
+    while 1 == 1:
+        printk0("hackos> ")
+        n: int64 = vfs_read(0, &mon_line[0], 255, 0)
+        if n <= 0:
+            printk0("\n[end of input]\n")
+            thread_sleep(100)
+            continue
+        if mon_line[n - 1] == 10:
+            n = n - 1
+        mon_line[n] = 0
+        # `write`/`append` keep the text after the file name as one argument
+        rest: uint32 = 0
+        if (mon_line[0] == 119 and mon_line[1] == 114) or (mon_line[0] == 97 and mon_line[1] == 112):
+            rest = 2
+        _split(rest)
+        if mon_argc > 0:
+            mon_exec()
+    return 0
