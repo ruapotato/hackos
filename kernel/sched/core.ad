@@ -61,9 +61,14 @@ PF_DIRTY: uint32 = 4               # ended by a fault; its resources are not rel
 PF_VFDONE: uint32 = 8              # has exec'ed or ended: the rfork parent may resume
 PF_CLEANING: uint32 = 16           # resources are being released right now
 PF_REAPING: uint32 = 32            # somebody is collecting this zombie
+PF_KILL: uint32 = 64               # to be ended at the next opportunity (Ctrl-C)
+
+KILL_EXIT_CODE: int64 = 130        # 128 + SIGINT, as a shell would show it
+KILL_KIND: uint32 = 5              # fault_kind of a thread ended this way
 
 WAKE_OK: uint32 = 0
 WAKE_TIMEOUT: uint32 = 1
+WAKE_KILLED: uint32 = 2
 WAIT_FOREVER: uint64 = 0xFFFFFFFFFFFFFFFF
 
 
@@ -155,6 +160,10 @@ sched_spawn_hook_set: uint32 = 0
 sched_deadlock_hook: Fn[int64, uint64]
 sched_deadlock_hook_set: uint32 = 0
 reaper_wq: WaitQueue
+# The process group that has the terminal (tcsetpgrp); 0 = none.  Ctrl-C at
+# the console ends the processes of this group (sched_kill_group).
+tty_fg_pgid: uint32 = 0
+sched_kills: uint32 = 0             # processes ended that way so far
 
 extern def sched_launch()
 extern def uthread_exit_stub()
@@ -442,6 +451,15 @@ def systick_handler():
     thr(cur)[0].cpu_ticks = thr(cur)[0].cpu_ticks + 1
     while timer_head != 0 and thr(timer_head)[0].wake_tick <= now:
         _wake(timer_head, WAKE_TIMEOUT)
+    # A process that is to be ended and is running its own code right now
+    # (usp == 0: not inside a system call, so it holds nothing of the
+    # kernel's) is ended here; one that is inside a system call ends itself
+    # when the call returns (kernel/syscall.ad).
+    if (thr(cur)[0].pflags & PF_KILL) != 0 and thr(cur)[0].usp == 0 and (thr(cur)[0].flags & TF_PROC) != 0 and thr(cur)[0].state == T_RUNNING:
+        sched_kills = sched_kills + 1
+        thread_kill_current_from_fault(KILL_EXIT_CODE, KILL_KIND, 0)
+        cpu_irq_restore(irq)
+        return
     if thr(cur)[0].slice > 0:
         thr(cur)[0].slice = thr(cur)[0].slice - 1
     if thr(cur)[0].slice == 0:
@@ -457,6 +475,34 @@ def sched_now() -> uint64:
     t: uint64 = sched_ticks
     cpu_irq_restore(irq)
     return t
+
+
+# Ask every process of group `pgid` to end.  Safe from interrupt handlers.
+# A blocked one is woken so that its wait can give up (the waits a process
+# can be in check thread_killed()).  Returns how many were asked.
+def sched_kill_group(pgid: uint32) -> uint32:
+    if pgid == 0:
+        return 0
+    n: uint32 = 0
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        t: Ptr[Thread] = &threads[i]
+        if (t[0].flags & TF_PROC) != 0 and t[0].pgid == pgid and t[0].state != T_UNUSED and t[0].state != T_ZOMBIE:
+            t[0].pflags = t[0].pflags | PF_KILL
+            if t[0].state == T_BLOCKED:
+                _wake(cast[uint64](t), WAKE_KILLED)
+            n = n + 1
+        i = i + 1
+    cpu_irq_restore(irq)
+    return n
+
+
+# Has the calling thread been asked to end?
+def thread_killed() -> uint32:
+    if sched_current != 0 and (thr(sched_current)[0].pflags & PF_KILL) != 0:
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------- thread API
@@ -775,6 +821,9 @@ def thread_wait(tid: uint32, nohang: uint32, code_out: Ptr[int64]) -> int32:
         if t[0].state == T_UNUSED or t[0].tid != tid:
             cpu_irq_restore(irq)
             return -3
+        if thread_killed() != 0:
+            cpu_irq_restore(irq)
+            return -4
     if (t[0].pflags & PF_REAPING) != 0 or t[0].tid != tid:
         cpu_irq_restore(irq)
         return -22

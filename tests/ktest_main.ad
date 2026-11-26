@@ -16,7 +16,7 @@ from kernel.exit import hackos_exit
 from kernel.print import kputs
 from kernel.printk.printk import printk0, printk1, printk2, printk3, printk4
 from kernel.mpu import mpu_regions
-from kernel.sched.core import Thread, thr, threads, thread_create, thread_join, thread_sleep, thread_yield, thread_exit, thread_by_tid, sched_start, sched_now, sched_current, sched_switches, reap_switches, reap_cpu_ticks, reap_stack_used, TF_USER, T_UNUSED, THREAD_MAX, WAIT_FOREVER
+from kernel.sched.core import sched_kill_group, T_ZOMBIE, Thread, thr, threads, thread_create, thread_join, thread_sleep, thread_yield, thread_exit, thread_by_tid, sched_start, sched_now, sched_current, sched_switches, reap_switches, reap_cpu_ticks, reap_stack_used, TF_USER, T_UNUSED, THREAD_MAX, WAIT_FOREVER
 from kernel.sync import Mutex, mutex_init, mutex_lock, mutex_unlock, mutex_trylock, mutex_lock_timeout, Semaphore, sem_init, sem_wait, sem_wait_timeout, sem_post, Cond, cond_init, cond_wait, cond_wait_timeout, cond_signal, cond_broadcast, MsgQueue, mq_init, mq_destroy, mq_send, mq_recv, SYNC_OK, SYNC_TIMEOUT, SYNC_EPERM, SYNC_EDEADLK
 from kernel.trap import trap_count, trap_last_tid, trap_last_kind, trap_last_addr, FAULT_STACK_OVERFLOW, FAULT_ACCESS, FAULT_USAGE
 from kernel.syscall import sys_count, sys_bad_ptr
@@ -1110,6 +1110,21 @@ def test_proc():
     thread_sleep(120)
     check(cast[uint32](code == 60 and live_mid == thr0 + 1 and threads_in_use() == thr0 and pheap.n_live == plive0), "proc: a child that outlives its parent is collected by the reaper")
     check(cast[uint32](proc_waitpid(9999, 0) == -10 and proc_waitpid_jc(9999, cast[Ptr[int64]](0)) == -10), "proc: waiting for a process that does not exist is ECHILD")
+
+    # ending a process group from outside (what Ctrl-C at the console does)
+    pargv[0] = cast[uint64]("/bin/ptest")
+    pargv[1] = cast[uint64]("loop")
+    pk1: int32 = proc_spawn("/bin/ptest", 2, &pargv[0], 4)
+    pargv[1] = cast[uint64]("block")
+    pk2: int32 = proc_spawn("/bin/ptest", 2, &pargv[0], 4)
+    thread_by_tid(cast[uint32](pk1))[0].pgid = 4242
+    thread_by_tid(cast[uint32](pk2))[0].pgid = 4242
+    thread_sleep(30)
+    alive: uint32 = cast[uint32](thread_by_tid(cast[uint32](pk1))[0].state != T_ZOMBIE and thread_by_tid(cast[uint32](pk2))[0].state != T_ZOMBIE)
+    nk: uint32 = sched_kill_group(4242)
+    ck1: int64 = proc_waitpid(pk1, 0)
+    ck2: int64 = proc_waitpid(pk2, 0)
+    check(cast[uint32](alive != 0 and nk == 2 and ck1 == 130 and ck2 == 130 and sched_kill_group(4242) == 0), "proc: ending a process group stops a process that loops in its own code and one that waits in the kernel (130)")
 
     # a thread that faults while it holds a kernel lock
     md0: uint32 = mutex_dead_released

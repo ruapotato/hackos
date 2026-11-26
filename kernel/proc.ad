@@ -44,7 +44,7 @@
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.rt import rt_memcpy, rt_memset
 from kernel.mpu import mpu_proc_rasr, mpu_proc_rbar
-from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, WAIT_FOREVER
+from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, thread_killed, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, WAIT_FOREVER
 from mm.slab import kmalloc, kfree, palloc_aligned, pfree
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, OREAD, ENOMEM, EFAULT, EINVAL
 from kernel.pipe import EAGAIN
@@ -408,6 +408,7 @@ def _spawn_args(path: Ptr[uint8], a: Ptr[Args], prio: uint32, flags: uint32) -> 
         pfree(img.base)
         return _fail(EAGAIN, "spawn: out of process slots or memory")
     _adopt(t, &img)
+    t[0].pgid = current_thread()[0].pgid
     # the first switch to the thread pops r4-r11 and returns through the frame
     rt_memset(cast[uint64](frame - 32), 0, 32)
     t[0].sp = frame - 32
@@ -533,7 +534,7 @@ def proc_exec(path: Ptr[uint8], argv: uint64, envp: uint64) -> int32:
             wq_wake_all(&par[0].vf_wq)
             t[0].pflags = t[0].pflags | PF_HELD
             par[0].held_children = par[0].held_children + 1
-            while (t[0].pflags & PF_HELD) != 0:
+            while (t[0].pflags & PF_HELD) != 0 and thread_killed() == 0:
                 wq_wait(&t[0].hold_wq, WAIT_FOREVER)
         cpu_irq_restore(irq)
     return 0
@@ -636,6 +637,8 @@ def proc_waitpid(pid: int32, flags: uint32) -> int64:
     rc: int32 = thread_wait(cast[uint32](pid), flags & 1, &code)
     if rc == -11:
         return cast[int64](EAGAIN)
+    if rc == -4:
+        return -4
     if rc != 0:
         set_current_errstr("wait: no such child")
         return cast[int64](ECHILD)

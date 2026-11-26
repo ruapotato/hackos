@@ -93,8 +93,8 @@ Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
 | 256 | `sys_rfork(flags)` | **vfork**: needs `RFPROC`; the child runs on the parent's memory with its own descriptors and `/fd` names, and the parent is suspended until the child calls `exec` or `exit`. `RFNOWAIT` (0x100) detaches the child. Other flag bits are ignored | Hamnix copies the address space (copy on write) and can also change namespaces; see below |
 | 288, 289 | `sys_getuid()`, `sys_getgid()` | 1: there is one user, the owner | same value for Hamnix's hostowner |
 | 290 | `sys_setuid(uid)` | succeeds for the current uid only | |
-| 297 | `sys_setpgid(pid, pgid)` | recorded; nothing acts on process groups | Hamnix routes Ctrl-C and Ctrl-Z by them |
-| 298 | `sys_tcsetpgrp(pgid)` | accepted, no effect | |
+| 297 | `sys_setpgid(pid, pgid)` | puts a process in a group (`pgid` 0: its own); children inherit it | same |
+| 298 | `sys_tcsetpgrp(pgid)` | names the group that has the console: Ctrl-C ends every process in it with exit code 130 | Hamnix posts SIGINT, which a program may catch; also Ctrl-Z |
 | 299 | `sys_waitpid_jc(pid, &status)` | never waits: `pid` when the process has ended (`status = (code & 0xFF) << 8 \| 1`, and it is gone), 0 while it runs, `-ECHILD` | no stopped or continued states |
 | 308 | `nanosleep({sec, nsec})` | rounded up to scheduler ticks (1 ms) | same structure |
 | 516 | `sys_sleep_ms(ms)` | | HackOS only |
@@ -174,8 +174,12 @@ the error string `unknown syscall` (Hamnix returns -1).
 * **Open modes.** As in Hamnix, `open` is read-only and `open_write` creates or
   truncates. The kernel-internal `vfs_open(path, mode)` also has read-write
   and append; only `create` exposes read-write to programs so far.
-* **No signals or notes.** Nothing can end or interrupt another process;
-  Ctrl-C reaches the shell's line editor as a byte and nothing else.
+* **No signals or notes.** The one way to end another process is Ctrl-C at
+  the console, which ends the foreground group outright (a process running
+  its own code is ended at the next timer tick, one inside a system call when
+  the call returns; a wait on the console, a pipe or a child gives up at
+  once). A program cannot catch it. With no foreground group, or an empty
+  one, Ctrl-C is a byte for whoever reads the console (the shell's editor).
 
 ## Not implemented (Hamnix has them)
 

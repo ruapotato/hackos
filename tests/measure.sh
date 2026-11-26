@@ -38,11 +38,32 @@ done
 echo "sizeof(Item {uint32 key; Item *next; uint8 *data}):"
 echo "  Adder: $(awk '/^define .*@sizeof_item\(/{f=1} f&&/ret i64/{print $3} /^}/{f=0}' <($CLANG $CF -O2 -S -emit-llvm $B/cost_ad.ll -o -)) bytes   C: $(awk '/<sizeof_item>:/{f=1;next} f&&/movs/{print strtonum(substr($4,2)); exit}' $B/cost_c-O2.dis) bytes"
 echo
-if [ -f build/hackos.elf ]; then
-    echo "Kernel image (kernel + monitor), -O2:"; $SIZE build/hackos.elf
-    # the same image with the size attribute
+if [ -f build/hackos.elf ] && [ -f build/romfs.o ]; then
+    rom="$($SIZE -A build/romfs.o | awk '$1==".rodata.romfs"{print $2}')"
+    echo "System image (kernel, init, and the programs under /bin as ROM files), -O2:"; $SIZE build/hackos.elf
+    echo "  of that text, $rom bytes are the ROM files; the kernel itself is $(( $($SIZE build/hackos.elf | awk 'NR==2{print $1}') - rom )) bytes"
+    # the same kernel with the size attribute (the ROM files unchanged)
     "$ADDER/build/cutover/host_ac.elf" --backend=llvm --target=thumbv7em-none-eabihf --llvm-optsize init/main.ad $B/hackos_os.ll >/dev/null
     $CLANG $CF -Os -ffunction-sections -fdata-sections -c $B/hackos_os.ll -o $B/hackos_os.o
-    ld.lld -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static -o $B/hackos_os.elf build/startup.o build/cpu.o build/switch.o $B/hackos_os.o
-    echo "The same image with --llvm-optsize and clang -Os:"; $SIZE $B/hackos_os.elf
+    ld.lld -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static -o $B/hackos_os.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/romfs.o $B/hackos_os.o
+    echo "The same with the kernel built --llvm-optsize and clang -Os:"; $SIZE $B/hackos_os.elf
+    echo "  kernel alone: $(( $($SIZE $B/hackos_os.elf | awk 'NR==2{print $1}') - rom )) bytes"
+    echo
+    echo "Programs (position-independent, stripped): file size at -O2, and built --llvm-optsize / -Os"
+    printf '%-8s | %9s | %9s | %s\n' program "-O2" "-Os" "memory block when running (-O2: stack + image, rounded to eighths of an MPU region)"
+    UF="$CF -ffunction-sections -fdata-sections -fPIE"
+    "$ADDER/build/cutover/host_ac.elf" --backend=llvm --target=thumbv7em-none-eabihf --llvm-optsize user/rt/rt.ad $B/u_rt.ll >/dev/null
+    $CLANG $UF -Os -c $B/u_rt.ll -o $B/u_rt.o
+    for p in echo cat ls cp rm mkdir wc head grep hamsh hello ptest halt; do
+        src=user/hamnix/$p.ad; [ -f $src ] || src=user/progs/$p.ad
+        "$ADDER/build/cutover/host_ac.elf" --backend=llvm --target=thumbv7em-none-eabihf --llvm-optsize $src $B/u_$p.ll >/dev/null
+        $CLANG $UF -Os -c $B/u_$p.ll -o $B/u_$p.o
+        stack=$($OBJDUMP -p build/user/$p.elf | awk '/STACK/{getline; print strtonum("0x" substr($4,3))}')
+        ld.lld -pie --no-dynamic-linker --omagic -T user/rt/prog.ld --gc-sections -nostdlib -z norelro -z stack-size=$stack --defsym=__heap_size=0 -o $B/u_$p.elf build/user/crt.o build/user/aeabi.o $B/u_rt.o $B/u_$p.o
+        llvm-strip --strip-all -o $B/u_$p $B/u_$p.elf
+        img=$($OBJDUMP -p build/user/$p.elf | awk '/LOAD/{getline; print strtonum("0x" substr($4,3))}')
+        need=$(( stack + (img + 15) / 16 * 16 )); s=256; while [ $s -lt $need ]; do s=$((s*2)); done
+        blk=$(( (need + s/8 - 1) / (s/8) * (s/8) ))
+        printf '%-8s | %9s | %9s | %s\n' $p "$(stat -c %s build/user/$p)" "$(stat -c %s $B/u_$p)" "$blk"
+    done
 fi

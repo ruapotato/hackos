@@ -465,6 +465,19 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         return t_spawn(arg)
     if seq(cmd, "nop") != 0:
         return 0
+    if seq(cmd, "loop") != 0:
+        # never ends by itself and never enters the kernel
+        spin: uint64 = 0
+        while 1 == 1:
+            spin = spin + 1
+            counter = spin
+    if seq(cmd, "block") != 0:
+        # waits for ever in the kernel: a pipe with a writer that never writes
+        bs: int32 = sys_pipechan()
+        sys_fdbind(0, 5, 3, bs)
+        sys_fdbind(0, 6, 2, bs)
+        brfd: int32 = fdname_open(6)
+        return cast[int32](sys_read(brfd, &iobuf[0], 16))
     if seq(cmd, "pipe") != 0:
         return t_pipe()
     if seq(cmd, "pipewriter") != 0:

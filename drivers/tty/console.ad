@@ -12,12 +12,13 @@
 #     Ctrl-U            erase the line
 #     Ctrl-C            drop the line (an empty line is delivered)
 #     Ctrl-D            end of file when the line is empty, else flush it
+# (in raw mode Ctrl-C ends the foreground process group, see console_input)
 #     CR or LF          deliver the line, terminated by "\n"
 # In raw mode every byte is delivered at once, unechoed (what Hamnix's shell
 # expects from its console).
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, mmio_read32, mmio_write32, mmio_write8
-from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, sched_running, sched_in_handler, WAIT_FOREVER
+from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, sched_running, sched_in_handler, sched_kill_group, thread_killed, tty_fg_pgid, WAIT_FOREVER
 from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock
 from boards.mps2_an500.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack
 
@@ -105,6 +106,13 @@ def console_input(ch: uint32):
     c: uint32 = ch & 255
     con_rx_bytes = con_rx_bytes + 1
     if con_mode == CON_RAW:
+        # Ctrl-C ends the foreground process group, if a shell has named one
+        # and it has members; otherwise it is a byte for whoever reads.
+        if c == 3 and sched_kill_group(tty_fg_pgid) != 0:
+            _con_out(94)
+            _con_out(67)
+            _con_out(10)
+            return
         _ring_put(c)
         wq_wake_all(&con_wq)
         return
@@ -182,6 +190,9 @@ def console_read(buf: Ptr[uint8], n: uint64, nonblock: uint32) -> int64:
             cpu_irq_restore(irq)
             return 0
         wq_wait(&con_wq, WAIT_FOREVER)
+        if thread_killed() != 0:
+            cpu_irq_restore(irq)
+            return -4
     got: uint64 = 0
     while got < n and con_count > 0:
         c: uint8 = con_ring[con_head]

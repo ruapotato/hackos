@@ -357,6 +357,11 @@ if wait_for "hamsh\$ "; then
     sh 'cat /tmp/err'
     shn 'ptest peek 20000000'
     sh 'echo after the fault $status'
+    # Ctrl-C: a program that loops for ever, then one that waits for input
+    shn 'ptest loop'; sleep 1; say '\x03'
+    sh 'echo interrupted $status'
+    shn 'cat'; sleep 0.5; say 'typed to cat\r'; sleep 0.5; say '\x03'
+    sh 'echo again $status'
     # the card
     sh 'ls /sd'
     sh 'cat /sd/README.TXT'
@@ -420,6 +425,8 @@ expect "shell: script: for loop" $S '^script word beta$'
 expect "shell: script: arithmetic and if" $S '^script n is 42$'
 expect "shell: script: built-in into a pipe" $S '^1 2 13$'
 expect "shell: script: exit status" $S '^script status 5$'
+expect "shell: Ctrl-C ends a looping foreground program (status 130)" $S '^interrupted 130$'
+expect "shell: Ctrl-C ends a program that waits for console input" $S '^again 130$'
 expect "shell: ls /sd shows the files of the FAT volume" $S '^PATTERN\.BIN$'
 expect "shell: cat a file from the card" $S '^HackOS reads it through Hamnix fs/fat.ad\.$'
 n40k="$(grep -c '^157 627 40000$' $S)"

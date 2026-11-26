@@ -19,7 +19,7 @@
 # Pointers from an unprivileged caller are checked against what the MPU lets
 # that caller touch before the kernel uses them.
 
-from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, TF_USER, TF_PROC, T_UNUSED
+from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, thread_killed, tty_fg_pgid, KILL_EXIT_CODE, TF_USER, TF_PROC, T_UNUSED
 from kernel.uaccess import uok, ustr
 from kernel.proc import proc_sys_spawn, proc_exec, proc_rfork, proc_waitpid, proc_waitpid_jc, proc_release_held
 from kernel.rt import rt_memcpy
@@ -70,8 +70,8 @@ SYS_GETUID: uint32 = 288
 SYS_GETGID: uint32 = 289
 SYS_SETUID: uint32 = 290            # accepted for the current uid only
 SYS_SVC_CTL: uint32 = 296           # verb 0 (poll): nothing pending; else ENOSYS
-SYS_SETPGID: uint32 = 297           # recorded only
-SYS_TCSETPGRP: uint32 = 298         # accepted, no effect
+SYS_SETPGID: uint32 = 297           # a process's group
+SYS_TCSETPGRP: uint32 = 298         # the group Ctrl-C at the console ends
 SYS_WAITPID_JC: uint32 = 299        # (pid, status*): never waits
 SYS_MMAP: uint32 = 302
 SYS_MUNMAP: uint32 = 304
@@ -299,6 +299,7 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
             tp[0].pgid = tp[0].tid
         return 0
     if nr == SYS_TCSETPGRP:
+        tty_fg_pgid = cast[uint32](a0)
         return 0
     if nr == SYS_SVC_CTL:
         if a0 == 0:
@@ -384,6 +385,10 @@ def syscall_dispatch(frame: uint64):
             a[i] = sp[i]
             i = i + 1
         r = sys_call(nr, a0, a[0], a[1], a[2], a[3], a[4])
+    # Asked to end (Ctrl-C) while inside the call: this is the place, with
+    # every kernel lock released.
+    if thread_killed() != 0 and (t[0].flags & TF_PROC) != 0:
+        thread_exit(KILL_EXIT_CODE)
     if nr == SYS_EXECVE and r == 0:
         # the caller's frame belongs to a program that no longer exists; the
         # return goes through the new program's first frame (kernel/proc.ad)
