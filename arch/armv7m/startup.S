@@ -184,15 +184,20 @@ hackos_fault_entry:
         add     sp, #16
         pop     {r4, pc}
 
-/* void *memcpy(dst=r0, src=r1, n=r2) -> rt_memcpy(dst, src, n)         */
-        func    memcpy
-        .global __aeabi_memcpy
+/* The C names `memcpy`, `memmove` and `memset` are deliberately NOT defined:
+ * on an EABI target LLVM calls the __aeabi_* forms, and Adder code (Hamnix
+ * sources in particular) defines and calls functions named memcpy/memset with
+ * the Adder convention (64-bit argument slots).  One symbol cannot serve both
+ * conventions; a C-convention `memcpy` here would silently bind to those
+ * calls and copy from the wrong address.
+ *
+ * void __aeabi_memcpy(dst=r0, src=r1, n=r2) -> rt_memcpy(dst, src, n)  */
+        func    __aeabi_memcpy
         .global __aeabi_memcpy4
         .global __aeabi_memcpy8
-        .thumb_set __aeabi_memcpy, memcpy
-        .thumb_set __aeabi_memcpy4, memcpy
-        .thumb_set __aeabi_memcpy8, memcpy
-        push    {r0, lr}                /* memcpy returns dst              */
+        .thumb_set __aeabi_memcpy4, __aeabi_memcpy
+        .thumb_set __aeabi_memcpy8, __aeabi_memcpy
+        push    {r4, lr}
         sub     sp, #8
         str     r2, [sp]                /* arg2 = n                        */
         movs    r3, #0
@@ -201,16 +206,14 @@ hackos_fault_entry:
         movs    r1, #0                  /* arg0 = dst (r0:r1)              */
         bl      rt_memcpy
         add     sp, #8
-        pop     {r0, pc}
+        pop     {r4, pc}
 
-        func    memmove
-        .global __aeabi_memmove
+        func    __aeabi_memmove
         .global __aeabi_memmove4
         .global __aeabi_memmove8
-        .thumb_set __aeabi_memmove, memmove
-        .thumb_set __aeabi_memmove4, memmove
-        .thumb_set __aeabi_memmove8, memmove
-        push    {r0, lr}
+        .thumb_set __aeabi_memmove4, __aeabi_memmove
+        .thumb_set __aeabi_memmove8, __aeabi_memmove
+        push    {r4, lr}
         sub     sp, #8
         str     r2, [sp]
         movs    r3, #0
@@ -219,20 +222,7 @@ hackos_fault_entry:
         movs    r1, #0
         bl      rt_memmove
         add     sp, #8
-        pop     {r0, pc}
-
-/* void *memset(dst=r0, c=r1, n=r2) -> rt_memset(dst, c, n)             */
-        func    memset
-        push    {r0, lr}
-        sub     sp, #8
-        str     r2, [sp]
-        movs    r3, #0
-        str     r3, [sp, #4]
-        mov     r2, r1
-        movs    r1, #0
-        bl      rt_memset
-        add     sp, #8
-        pop     {r0, pc}
+        pop     {r4, pc}
 
 /* void __aeabi_memset(dst=r0, n=r1, c=r2)   (note the argument order)  */
         func    __aeabi_memset
