@@ -47,7 +47,7 @@ Works, and is checked by `make test`:
 - **Hamnix's shell and nine of its programs**, copied from Hamnix: `echo cat
   ls cp rm mkdir wc head grep` under `/bin`, which is a read-only table of
   files inside the kernel image, read in place. The shell's source differs
-  from Hamnix's by a 40-line patch that makes its static tables smaller.
+  from Hamnix's by a patch of 41 lines that makes its static tables smaller.
 - **Files.** Hamnix's RAM file system at `/` (now 8 KiB for a small file
   instead of 128 KiB), devices at `/dev`, and Hamnix's FAT32 code at `/sd`
   over a RAM disk that the emulator preloads with an image: read, create,

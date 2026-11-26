@@ -24,7 +24,7 @@ from kernel.uaccess import uok, ustr
 from kernel.proc import proc_sys_spawn, proc_exec, proc_rfork, proc_waitpid, proc_waitpid_jc, proc_release_held
 from kernel.rt import rt_memcpy
 from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
-from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
 from kernel.exit import hackos_exit
 
@@ -145,6 +145,9 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
     if nr == SYS_WRITE:
         if uok(a1, a2, 0) == 0:
             return _bad()
+        # a write to a pipe may have to wait for a child to read it
+        if current_thread()[0].held_children != 0 and vfs_fd_is_pipe(cast[int32](a0)) != 0:
+            proc_release_held()
         return vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
     if nr == SYS_READ or nr == SYS_READ_NB:
         if uok(a1, a2, 1) == 0:

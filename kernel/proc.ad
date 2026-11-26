@@ -32,7 +32,8 @@
 #     parent's globals stays.  spawn(path, argv) is the native call and needs
 #     none of this.
 #   * A child that came from rfork is not started the moment it has exec'ed:
-#     it is held until its parent next yields, waits, sleeps or reads.
+#     it is held until its parent next yields, waits, sleeps, reads, forks
+#     again or writes to a pipe.
 #     Hamnix's shell binds a child's standard streams AFTER the spawn and
 #     relies on Hamnix's cooperative scheduler not running the child before
 #     the parent gives up the processor; the hold gives it the same order.
