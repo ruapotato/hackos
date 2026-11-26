@@ -154,3 +154,7 @@ the compiler tree, `docs/cortex_m7.md`.
 ## Licence
 
 AGPL-3.0-or-later. See `LICENSE`.
+
+Files copied from Hamnix (`fs/HAMNIX_ORIGIN`) are GPL-3.0-or-later by the same
+author. `third_party/` holds code under its own licences (currently
+BSD-3-Clause), each with its licence file and an `UPSTREAM` record.
