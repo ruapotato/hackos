@@ -42,6 +42,27 @@ COBJS_ktest := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common
 
 SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/mps2_an500/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
 
+# ---- user programs -----------------------------------------------------------
+# Each is its own Adder translation unit, compiled position-independent and
+# linked with the user run-time (user/rt/) into a PIE that the kernel loads
+# from /bin.  $(B)/user/NAME.elf keeps its symbols; $(B)/user/NAME is the
+# stripped file that goes into the image's ROM file table.
+#   user/progs/NAME.ad    HackOS's own (tests, examples)
+#   user/hamnix/NAME.ad   copied from Hamnix (fs/HAMNIX_ORIGIN)
+# Per program: STACK_NAME (bytes of stack, default 8192) and HEAP_NAME
+# (bytes of heap for sys_mmap, default 0).
+PROGS_OWN    := hello ptest crel
+HEAP_ptest   := 8192
+PROGS_HAMNIX :=
+PROGS        := $(PROGS_OWN) $(PROGS_HAMNIX)
+PROG_BINS    := $(PROGS:%=$(B)/user/%)
+SRC_USER     := $(wildcard user/progs/*.ad user/hamnix/*.ad user/rt/*.ad lib/*.ad lib/*/*.ad kernel/rt.ad)
+UFLAGS  := $(CPUFLAGS) $(OPT) -ffreestanding -fPIE -ffunction-sections -fdata-sections -Wno-override-module
+UAFLAGS := $(CPUFLAGS) -ffreestanding -fPIE
+ULDFLAGS := -pie --no-dynamic-linker --omagic -T user/rt/prog.ld --gc-sections -nostdlib -z norelro
+URT     := $(B)/user/crt.o $(B)/user/aeabi.o $(B)/user/rt.o
+STRIP   ?= llvm-strip
+
 .SECONDARY:
 .PHONY: all test run size measure clean compiler
 all: $(B)/hackos.elf
@@ -74,6 +95,44 @@ ROOT_faulttest := tests/fault_main.ad
 $(B)/%.o: $(B)/%.ll
 	$(CLANG) $(LLFLAGS) -c $< -o $@
 
+$(B)/user:
+	mkdir -p $(B)/user
+
+$(B)/user/rt.ll: user/rt/rt.ad kernel/rt.ad $(HOST_AC) | $(B)/user
+	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $< $@
+
+$(B)/user/%.ll: user/progs/%.ad $(SRC_USER) $(HOST_AC) | $(B)/user
+	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $< $@
+
+$(B)/user/%.ll: user/hamnix/%.ad $(SRC_USER) $(HOST_AC) | $(B)/user
+	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $< $@
+
+$(B)/user/%.o: $(B)/user/%.ll
+	$(CLANG) $(UFLAGS) -c $< -o $@
+
+# A C program: natural C code, position-independent, no C library.
+$(B)/user/%.o: user/progs/%.c | $(B)/user
+	$(CLANG) $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fPIE -ffunction-sections -fdata-sections -Wall -Wextra -c $< -o $@
+
+$(B)/user/crt.o: user/rt/crt.S | $(B)/user
+	$(CLANG) $(UAFLAGS) -c $< -o $@
+
+$(B)/user/aeabi.o: arch/armv7m/aeabi.S | $(B)/user
+	$(CLANG) $(UAFLAGS) -c $< -o $@
+
+$(B)/user/%.elf: $(B)/user/%.o $(URT) user/rt/prog.ld
+	$(LLD) $(ULDFLAGS) -z stack-size=$(or $(STACK_$*),8192) --defsym=__heap_size=$(or $(HEAP_$*),0) -Map=$(B)/user/$*.map -o $@ $(URT) $<
+
+$(B)/user/%: $(B)/user/%.elf
+	$(STRIP) --strip-all -o $@ $<
+
+# The ROM file table: every program, under /bin.
+$(B)/romfs.S: $(PROG_BINS) scripts/mkromfs.sh
+	bash scripts/mkromfs.sh $@ $(PROG_BINS)
+
+$(B)/romfs.o: $(B)/romfs.S
+	$(CLANG) $(ASFLAGS) -c $< -o $@
+
 $(B)/%.o: arch/armv7m/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
@@ -92,8 +151,8 @@ $(B)/c/%.o: lib/cshim/%.c | $(B)
 $(B)/%.o: tests/arch/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(COBJS_ktest) boards/mps2_an500/link.ld
-	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $<
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(B)/romfs.o $(COBJS_ktest) boards/mps2_an500/link.ld
+	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(B)/romfs.o $<
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 
 run: $(B)/hackos.elf

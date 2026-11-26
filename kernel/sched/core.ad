@@ -117,7 +117,7 @@ class Thread:
     mpu_rbar: uint32                # MPU region 5 for it
     mpu_rasr: uint32
     held_children: uint32           # children with PF_HELD
-    pad1: uint32
+    stack_top: uint32               # end of the stack area = start of the image
     vf_wq: WaitQueue                # waits here for its rfork child to exec or end
     hold_wq: WaitQueue              # PF_HELD: waits here for its parent
     # /fd names (fs/hvfs.ad): what /fd/N means for this process
@@ -677,10 +677,12 @@ def _proc_release(t: uint64):
 # one), process memory.  Thread context; `t` is the calling thread on its way
 # out, or a zombie that a fault made.
 def _thread_release(t: uint64):
-    if sched_exit_hook_set != 0:
-        sched_exit_hook(t)
+    # locks first: closing the files needs the file-system lock, which the
+    # dead thread may be the holder of
     if thr(t)[0].fault_kind != 0 and sched_deadlock_hook_set != 0:
         sched_deadlock_hook(t)
+    if sched_exit_hook_set != 0:
+        sched_exit_hook(t)
     if (thr(t)[0].flags & TF_PROC) != 0:
         _proc_release(t)
 

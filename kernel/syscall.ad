@@ -19,10 +19,12 @@
 # Pointers from an unprivileged caller are checked against what the MPU lets
 # that caller touch before the kernel uses them.
 
-from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, TF_USER, T_UNUSED
+from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, TF_USER, TF_PROC, T_UNUSED
+from kernel.uaccess import uok, ustr
+from kernel.proc import proc_sys_spawn, proc_exec, proc_rfork, proc_waitpid, proc_waitpid_jc, proc_release_held
 from kernel.rt import rt_memcpy
 from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
-from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
 
 extern def __text_end()
@@ -38,6 +40,8 @@ SYS_READ: uint32 = 6
 SYS_CLOSE: uint32 = 7
 SYS_WRITE: uint32 = 8
 SYS_LSEEK: uint32 = 9
+SYS_EXECVE: uint32 = 10             # (path, argv, envp); does not return on success
+SYS_WAITPID: uint32 = 12            # (pid, flags); bit 0 of flags = do not wait
 SYS_OPEN_WRITE: uint32 = 13
 SYS_DUP: uint32 = 16
 SYS_DUP2: uint32 = 17
@@ -47,53 +51,41 @@ SYS_UNLINK: uint32 = 21
 SYS_MKDIR: uint32 = 22
 SYS_READ_NB: uint32 = 23
 SYS_YIELD: uint32 = 24
+SYS_RFORK: uint32 = 256             # (flags); vfork semantics, see kernel/proc.ad
+SYS_BIND: uint32 = 257              # not implemented: no namespaces
+SYS_MOUNT: uint32 = 258             # not implemented
+SYS_UNMOUNT: uint32 = 259           # not implemented
 SYS_CREATE: uint32 = 260
 SYS_STAT_P9: uint32 = 261
 SYS_FSTAT_P9: uint32 = 262
 SYS_REMOVE: uint32 = 263
 SYS_ERRSTR: uint32 = 265
+SYS_FDBIND: uint32 = 278            # (pid, fdnum, kind, arg): bind an /fd name
+SYS_PIPECHAN: uint32 = 280          # () -> pipe slot
+SYS_OPENCHAN: uint32 = 281          # (path, mode) -> channel for fdbind
+SYS_NSID: uint32 = 282              # () -> 1: there is one namespace
+SYS_FDSLOT_KIND: uint32 = 287       # (pid, fdnum)
+SYS_GETUID: uint32 = 288
+SYS_GETGID: uint32 = 289
+SYS_SETUID: uint32 = 290            # accepted for the current uid only
+SYS_SVC_CTL: uint32 = 296           # verb 0 (poll): nothing pending; else ENOSYS
+SYS_SETPGID: uint32 = 297           # recorded only
+SYS_TCSETPGRP: uint32 = 298         # accepted, no effect
+SYS_WAITPID_JC: uint32 = 299        # (pid, status*): never waits
 SYS_MMAP: uint32 = 302
 SYS_MUNMAP: uint32 = 304
 SYS_NANOSLEEP: uint32 = 308
+SYS_FDSLOT_ARG: uint32 = 324        # (pid, fdnum)
 # ---- HackOS only ----
 SYS_THREAD_SPAWN: uint32 = 512
 SYS_THREAD_JOIN: uint32 = 513
 SYS_RENAME: uint32 = 514
 SYS_GETTID: uint32 = 515
 SYS_SLEEP_MS: uint32 = 516
+SYS_SPAWN: uint32 = 517             # (path, argv) -> pid: a new process, no fork involved
 
 sys_count: uint64 = 0               # system calls dispatched so far
 sys_bad_ptr: uint64 = 0             # calls refused for a bad user pointer
-
-
-# May the system-call caller access [addr, addr+len)?  A privileged caller
-# may pass anything.  An unprivileged one may read and write the user arena
-# and read the image's text and constants (string literals live there).
-def _uok(addr: uint64, len: uint64, write: uint32) -> uint32:
-    if thr(sched_current)[0].svc_ctrl == 0:
-        return 1
-    end: uint64 = addr + len
-    if end < addr or addr > 0xFFFFFFFF or end > 0x100000000:
-        return 0
-    if addr >= user_arena_start() and end <= user_arena_end():
-        return 1
-    if write == 0 and addr >= cast[uint64](&__vectors_start) and end <= cast[uint64](&__text_end):
-        return 1
-    return 0
-
-
-# A NUL-terminated string of at most 255 bytes, readable by the caller.
-def _ustr(addr: uint64) -> uint32:
-    if thr(sched_current)[0].svc_ctrl == 0:
-        return 1
-    i: uint64 = 0
-    while i < 256:
-        if _uok(addr + i, 1, 0) == 0:
-            return 0
-        if cast[Ptr[uint8]](addr + i)[0] == 0:
-            return 1
-        i = i + 1
-    return 0
 
 
 def _bad() -> int64:
@@ -103,6 +95,9 @@ def _bad() -> int64:
 
 
 def _sys_thread_spawn(entry: uint64, arg: uint64, prio: uint64, stack: uint64) -> int64:
+    if (current_thread()[0].flags & TF_PROC) != 0:
+        set_current_errstr("thread_spawn: a process has one thread")
+        return cast[int64](ENOSYS)
     # the entry point must be code in the image
     if (entry & 0xFFFFFFFE) < cast[uint64](&__vectors_start) or entry >= cast[uint64](&__text_end):
         return _bad()
@@ -146,26 +141,27 @@ def _sys_nanosleep(req: uint64) -> int64:
 
 def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64:
     if nr == SYS_WRITE:
-        if _uok(a1, a2, 0) == 0:
+        if uok(a1, a2, 0) == 0:
             return _bad()
         return vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
     if nr == SYS_READ or nr == SYS_READ_NB:
-        if _uok(a1, a2, 1) == 0:
+        if uok(a1, a2, 1) == 0:
             return _bad()
+        proc_release_held()
         nb: uint32 = 0
         if nr == SYS_READ_NB:
             nb = 1
         return vfs_read(cast[int32](a0), cast[Ptr[uint8]](a1), a2, nb)
     if nr == SYS_OPEN:
-        if _ustr(a0) == 0:
+        if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_open(cast[Ptr[uint8]](a0), OREAD))
     if nr == SYS_OPEN_WRITE:
-        if _ustr(a0) == 0:
+        if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_open(cast[Ptr[uint8]](a0), OWRITE | OTRUNC | OCREATE))
     if nr == SYS_CREATE:
-        if _ustr(a0) == 0:
+        if ustr(a0) == 0:
             return _bad()
         if (a2 & cast[uint64](DMDIR)) != 0:
             return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
@@ -181,41 +177,42 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
             return cast[int64](EINVAL)
         return cast[int64](vfs_dup2(cast[int32](a0), cast[int32](a1)))
     if nr == SYS_UNLINK or nr == SYS_REMOVE:
-        if _ustr(a0) == 0:
+        if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_unlink(cast[Ptr[uint8]](a0)))
     if nr == SYS_MKDIR:
-        if _ustr(a0) == 0:
+        if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
     if nr == SYS_RENAME:
-        if _ustr(a0) == 0 or _ustr(a1) == 0:
+        if ustr(a0) == 0 or ustr(a1) == 0:
             return _bad()
         return cast[int64](vfs_rename(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1)))
     if nr == SYS_STAT_P9:
-        if _ustr(a0) == 0 or _uok(a1, a2, 1) == 0:
+        if ustr(a0) == 0 or uok(a1, a2, 1) == 0:
             return _bad()
         return vfs_stat(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1), a2)
     if nr == SYS_FSTAT_P9:
-        if _uok(a1, a2, 1) == 0:
+        if uok(a1, a2, 1) == 0:
             return _bad()
         return vfs_fstat(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
     if nr == SYS_CHDIR:
-        if _ustr(a0) == 0:
+        if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_chdir(cast[Ptr[uint8]](a0)))
     if nr == SYS_GETCWD:
-        if _uok(a0, a1, 1) == 0:
+        if uok(a0, a1, 1) == 0:
             return _bad()
         return vfs_getcwd(cast[Ptr[uint8]](a0), a1)
     if nr == SYS_ERRSTR:
-        if _uok(a0, a1, 1) == 0:
+        if uok(a0, a1, 1) == 0:
             return _bad()
         return _sys_errstr(a0, a1)
     if nr == SYS_EXIT:
         thread_exit(cast[int64](a0))
         return 0
     if nr == SYS_YIELD:
+        proc_release_held()
         thread_yield()
         return 0
     if nr == SYS_GETPID or nr == SYS_GETTID:
@@ -223,11 +220,13 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
     if nr == SYS_GET_JIFFIES:
         return cast[int64](sched_now() / 10)        # 100 Hz, as in Hamnix
     if nr == SYS_SLEEP_MS:
+        proc_release_held()
         thread_sleep(a0)
         return 0
     if nr == SYS_NANOSLEEP:
-        if _uok(a0, 16, 0) == 0 or (a1 != 0 and _uok(a1, 16, 1) == 0):
+        if uok(a0, 16, 0) == 0 or (a1 != 0 and uok(a1, 16, 1) == 0):
             return _bad()
+        proc_release_held()
         rs: int64 = _sys_nanosleep(a0)
         if a1 != 0:
             cast[Ptr[int64]](a1)[0] = 0     # never interrupted: nothing remains
@@ -241,11 +240,75 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
     if nr == SYS_THREAD_SPAWN:
         return _sys_thread_spawn(a0, a1, a2, a3)
     if nr == SYS_THREAD_JOIN:
-        if a1 != 0 and _uok(a1, 8, 1) == 0:
+        if a1 != 0 and uok(a1, 8, 1) == 0:
             return _bad()
         return cast[int64](thread_join(cast[uint32](a0), cast[Ptr[int64]](a1)))
+    if nr == SYS_EXECVE:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](proc_exec(cast[Ptr[uint8]](a0), a1, a2))
+    if nr == SYS_SPAWN:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](proc_sys_spawn(cast[Ptr[uint8]](a0), a1))
+    if nr == SYS_RFORK:
+        return cast[int64](proc_rfork(cast[uint32](a0)))
+    if nr == SYS_WAITPID:
+        proc_release_held()
+        return proc_waitpid(cast[int32](a0), cast[uint32](a1))
+    if nr == SYS_WAITPID_JC:
+        if a1 != 0 and uok(a1, 8, 1) == 0:
+            return _bad()
+        proc_release_held()
+        return proc_waitpid_jc(cast[int32](a0), cast[Ptr[int64]](a1))
+    if nr == SYS_FDBIND:
+        return cast[int64](vfs_fdbind(cast[int32](a0), cast[int32](a1), cast[int32](a2), cast[int32](a3)))
+    if nr == SYS_FDSLOT_KIND:
+        return cast[int64](vfs_fdslot_kind(cast[int32](a0), cast[int32](a1)))
+    if nr == SYS_FDSLOT_ARG:
+        return cast[int64](vfs_fdslot_arg(cast[int32](a0), cast[int32](a1)))
+    if nr == SYS_PIPECHAN:
+        return cast[int64](vfs_pipechan())
+    if nr == SYS_OPENCHAN:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_openchan(cast[Ptr[uint8]](a0), cast[int32](a1)))
+    if nr == SYS_NSID:
+        return 1
+    if nr == SYS_GETUID or nr == SYS_GETGID:
+        return cast[int64](current_thread()[0].uid)
+    if nr == SYS_SETUID:
+        if cast[uint32](a0) == current_thread()[0].uid:
+            return 0
+        set_current_errstr("setuid: there is one user")
+        return -1
+    if nr == SYS_SETPGID:
+        tp: Ptr[Thread] = current_thread()
+        if a0 != 0:
+            tp = thread_by_tid(cast[uint32](a0))
+        if tp == cast[Ptr[Thread]](0):
+            set_current_errstr("setpgid: no such pid")
+            return -3
+        tp[0].pgid = cast[uint32](a1)
+        if a1 == 0:
+            tp[0].pgid = tp[0].tid
+        return 0
+    if nr == SYS_TCSETPGRP:
+        return 0
+    if nr == SYS_SVC_CTL:
+        if a0 == 0:
+            return 0
+        set_current_errstr("svc: no service supervisor")
+        return cast[int64](ENOSYS)
+    if nr == SYS_BIND or nr == SYS_MOUNT or nr == SYS_UNMOUNT:
+        set_current_errstr("no namespaces on this system: bind and mount are not available")
+        return cast[int64](ENOSYS)
     if nr == SYS_MMAP:
         # anonymous memory only: (addr ignored, len, prot, flags, fd, off)
+        if (current_thread()[0].flags & TF_PROC) != 0:
+            # a process's heap is inside its own block (user/rt/rt.ad)
+            set_current_errstr("mmap: a process allocates from its own heap")
+            return cast[int64](ENOMEM)
         if a1 == 0 or cast[int32](a4) != -1:
             set_current_errstr("mmap: only anonymous mappings")
             return cast[int64](EINVAL)
@@ -272,6 +335,12 @@ def _stack_args(nr: uint32) -> uint32:
         return 2
     if nr == SYS_DUP2 or nr == SYS_GETCWD or nr == SYS_ERRSTR or nr == SYS_RENAME or nr == SYS_THREAD_JOIN or nr == SYS_MUNMAP or nr == SYS_NANOSLEEP:
         return 1
+    if nr == SYS_WAITPID or nr == SYS_WAITPID_JC or nr == SYS_SPAWN or nr == SYS_OPENCHAN or nr == SYS_FDSLOT_KIND or nr == SYS_FDSLOT_ARG or nr == SYS_SETPGID:
+        return 1
+    if nr == SYS_EXECVE:
+        return 2
+    if nr == SYS_FDBIND:
+        return 3
     if nr == SYS_THREAD_SPAWN:
         return 3
     if nr == SYS_MMAP:
@@ -301,7 +370,7 @@ def syscall_dispatch(frame: uint64):
         i = i + 1
     n: uint32 = _stack_args(nr)
     r: int64 = 0
-    if n != 0 and _uok(args, cast[uint64](n) * 8, 0) == 0:
+    if n != 0 and uok(args, cast[uint64](n) * 8, 0) == 0:
         r = _bad()
     else:
         sp: Ptr[uint64] = cast[Ptr[uint64]](args)
@@ -310,5 +379,9 @@ def syscall_dispatch(frame: uint64):
             a[i] = sp[i]
             i = i + 1
         r = sys_call(nr, a0, a[0], a[1], a[2], a[3], a[4])
+    if nr == SYS_EXECVE and r == 0:
+        # the caller's frame belongs to a program that no longer exists; the
+        # return goes through the new program's first frame (kernel/proc.ad)
+        return
     f[0] = cast[uint32](cast[uint64](r))
     f[1] = cast[uint32](cast[uint64](r) >> 32)

@@ -37,11 +37,13 @@ def _in_guard(addr: uint32, base: uint64) -> uint32:
 
 
 # A process's stack is the bottom of its block: running off it lands just
-# below the block, in memory the process has no right to.
-def _below_block(addr: uint32, t: Ptr[Thread]) -> uint32:
-    if (t[0].flags & TF_PROC) == 0 or t[0].mem_lo == 0 or cpu_control() & 1 == 0:
+# below the block, in memory the process has no right to.  What tells an
+# overflow from a wild pointer that happens to point there is the stack
+# pointer: at an overflow it is at the very bottom of the block or below it.
+def _below_block(addr: uint32, psp: uint32, t: Ptr[Thread]) -> uint32:
+    if (t[0].flags & TF_PROC) == 0 or t[0].mem_lo == 0 or (cpu_control() & 1) == 0:
         return 0
-    if addr < t[0].mem_lo and addr + 0x10000 >= t[0].mem_lo:
+    if addr < t[0].mem_lo and psp < t[0].mem_lo + 128:
         return 1
     return 0
 
@@ -73,9 +75,9 @@ def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint
             stacking = 1
         # A stack overflow shows up either as an access inside a guard, or as
         # the exception frame not fitting above the guard.
-        if addr_valid != 0 and (_in_guard(addr, t[0].kstack_base) != 0 or _in_guard(addr, t[0].ustack_base) != 0 or _below_block(addr, t) != 0):
+        if addr_valid != 0 and (_in_guard(addr, t[0].kstack_base) != 0 or _in_guard(addr, t[0].ustack_base) != 0 or _below_block(addr, psp, t) != 0):
             what = FAULT_STACK_OVERFLOW
-        elif stacking != 0 and (_below_block(psp, t) != 0 or _below_block(psp + 104, t) != 0):
+        elif stacking != 0 and _below_block(psp, psp, t) != 0:
             what = FAULT_STACK_OVERFLOW
             addr = psp
             addr_valid = 1

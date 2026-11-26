@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- pipes.
+#
+# The interface follows Hamnix's fs/pipe.ad as its shell uses it: a pipe is a
+# SLOT (pipe_alloc_chan), not a pair of descriptors, and whoever binds an end
+# at an /fd name holds a reader or a writer reference (pipe_inc_* /
+# pipe_close_*).  A reader sees end of file when no writer is left and the
+# ring is empty; a writer gets EPIPE when no reader is left.  A slot is freed
+# when both counts have dropped back to zero.
+#
+# The code is new.  Hamnix's file was not copied: a quarter of it is a
+# self-test written against Hamnix's task structure, its blocking paths use
+# five wait-queue calls HackOS does not have (prepare/cancel/commit) plus a
+# yield loop on the write side, and its ring is a fixed 128 KiB per pipe.
+# Here both sides sleep on wait queues, the ring is PIPE_CAP bytes from the
+# kernel heap, and every operation is a short critical section (the copy is
+# done in pieces of at most PIPE_COPY bytes with interrupts masked).
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, WAIT_FOREVER
+from mm.slab import kmalloc, kfree
+
+PIPE_MAX: uint32 = 16
+PIPE_CAP: uint32 = 4096
+PIPE_COPY: uint32 = 256
+EPIPE: int32 = -32
+EAGAIN: int32 = -11
+
+
+class Pipe:
+    buf: uint64                     # ring, or 0 when the slot is free
+    head: uint32                    # next byte to read
+    count: uint32                   # bytes in the ring
+    readers: uint32
+    writers: uint32
+    used: uint32
+    owner: uint32                   # id of the thread that created it
+    bytes: uint64                   # bytes that went through (statistics)
+    rd_wq: WaitQueue                # readers waiting for data or end of file
+    wr_wq: WaitQueue                # writers waiting for room or for EPIPE
+
+
+pipe_table: Array[16, Pipe]
+pipe_live: uint32 = 0               # slots in use
+
+
+def pipe_init():
+    i: uint32 = 0
+    while i < PIPE_MAX:
+        pipe_table[i].used = 0
+        pipe_table[i].buf = 0
+        i = i + 1
+    pipe_live = 0
+
+
+def pipe_valid(slot: int32) -> uint32:
+    if slot < 0 or slot >= cast[int32](PIPE_MAX):
+        return 0
+    return pipe_table[slot].used
+
+
+# A new pipe with no reader and no writer yet; the binds take the
+# references.  Returns the slot, -1 when out of slots or memory.
+def pipe_alloc_chan(owner: uint32) -> int32:
+    b: uint64 = kmalloc(cast[uint64](PIPE_CAP))
+    if b == 0:
+        return -1
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < PIPE_MAX and pipe_table[i].used != 0:
+        i = i + 1
+    if i == PIPE_MAX:
+        cpu_irq_restore(irq)
+        kfree(b)
+        return -1
+    p: Ptr[Pipe] = &pipe_table[i]
+    p[0].buf = b
+    p[0].head = 0
+    p[0].count = 0
+    p[0].readers = 0
+    p[0].writers = 0
+    p[0].owner = owner
+    p[0].bytes = 0
+    wq_init(&p[0].rd_wq)
+    wq_init(&p[0].wr_wq)
+    p[0].used = 1
+    pipe_live = pipe_live + 1
+    cpu_irq_restore(irq)
+    return cast[int32](i)
+
+
+def _pipe_free(slot: int32):
+    irq: uint32 = cpu_irq_save()
+    b: uint64 = 0
+    if pipe_table[slot].used != 0:
+        b = pipe_table[slot].buf
+        pipe_table[slot].buf = 0
+        pipe_table[slot].used = 0
+        pipe_live = pipe_live - 1
+    cpu_irq_restore(irq)
+    if b != 0:
+        kfree(b)
+
+
+def pipe_inc_reader(slot: int32):
+    if pipe_valid(slot) != 0:
+        irq: uint32 = cpu_irq_save()
+        pipe_table[slot].readers = pipe_table[slot].readers + 1
+        cpu_irq_restore(irq)
+
+
+def pipe_inc_writer(slot: int32):
+    if pipe_valid(slot) != 0:
+        irq: uint32 = cpu_irq_save()
+        pipe_table[slot].writers = pipe_table[slot].writers + 1
+        cpu_irq_restore(irq)
+
+
+def pipe_close_reader(slot: int32):
+    if pipe_valid(slot) == 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    p: Ptr[Pipe] = &pipe_table[slot]
+    if p[0].readers > 0:
+        p[0].readers = p[0].readers - 1
+    gone: uint32 = 0
+    if p[0].readers == 0:
+        wq_wake_all(&p[0].wr_wq)                # writers must see EPIPE
+        if p[0].writers == 0:
+            gone = 1
+    cpu_irq_restore(irq)
+    if gone != 0:
+        _pipe_free(slot)
+
+
+def pipe_close_writer(slot: int32):
+    if pipe_valid(slot) == 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    p: Ptr[Pipe] = &pipe_table[slot]
+    if p[0].writers > 0:
+        p[0].writers = p[0].writers - 1
+    gone: uint32 = 0
+    if p[0].writers == 0:
+        wq_wake_all(&p[0].rd_wq)                # readers must see end of file
+        if p[0].readers == 0:
+            gone = 1
+    cpu_irq_restore(irq)
+    if gone != 0:
+        _pipe_free(slot)
+
+
+# The thread `owner` ends: pipes it created that nobody ever bound would
+# otherwise stay allocated for good.
+def pipe_release_unbound(owner: uint32):
+    i: int32 = 0
+    while i < cast[int32](PIPE_MAX):
+        if pipe_table[i].used != 0 and pipe_table[i].owner == owner and pipe_table[i].readers == 0 and pipe_table[i].writers == 0:
+            _pipe_free(i)
+        i = i + 1
+
+
+# Read up to n bytes.  Blocks while the ring is empty and a writer exists.
+# Returns the byte count, 0 at end of file.  Non-blocking form (Hamnix's
+# read_nb contract): > 0 bytes, 0 = nothing yet, -1 = end of file.
+def pipe_read(slot: int32, dst: Ptr[uint8], n: uint64, nonblock: uint32) -> int64:
+    if pipe_valid(slot) == 0:
+        return -9
+    if n == 0:
+        return 0
+    p: Ptr[Pipe] = &pipe_table[slot]
+    irq: uint32 = cpu_irq_save()
+    while p[0].count == 0:
+        if p[0].writers == 0:
+            cpu_irq_restore(irq)
+            if nonblock != 0:
+                return -1
+            return 0
+        if nonblock != 0:
+            cpu_irq_restore(irq)
+            return 0
+        wq_wait(&p[0].rd_wq, WAIT_FOREVER)
+        if p[0].used == 0:
+            cpu_irq_restore(irq)
+            return 0
+    got: uint64 = 0
+    while got < n and p[0].count > 0:
+        buf: Ptr[uint8] = cast[Ptr[uint8]](p[0].buf)
+        k: uint32 = 0
+        while k < PIPE_COPY and got < n and p[0].count > 0:
+            dst[got] = buf[p[0].head]
+            p[0].head = (p[0].head + 1) % PIPE_CAP
+            p[0].count = p[0].count - 1
+            got = got + 1
+            k = k + 1
+        # let interrupts in between pieces
+        cpu_irq_restore(irq)
+        irq = cpu_irq_save()
+        if p[0].used == 0:
+            break
+    wq_wake_all(&p[0].wr_wq)
+    cpu_irq_restore(irq)
+    return cast[int64](got)
+
+
+# Write n bytes; blocks while the ring is full and a reader exists.  Returns
+# n, or the bytes written before every reader went away, or EPIPE when none
+# were.  With `noblock` (a caller that must not sleep on a full pipe, see
+# kernel/proc.ad) a full ring ends the write early: the count so far, or
+# EAGAIN when it is zero.
+def pipe_write(slot: int32, src: Ptr[uint8], n: uint64, noblock: uint32) -> int64:
+    if pipe_valid(slot) == 0:
+        return -9
+    p: Ptr[Pipe] = &pipe_table[slot]
+    done: uint64 = 0
+    irq: uint32 = cpu_irq_save()
+    while done < n:
+        if p[0].used == 0 or p[0].readers == 0:
+            cpu_irq_restore(irq)
+            if done > 0:
+                return cast[int64](done)
+            return cast[int64](EPIPE)
+        if p[0].count == PIPE_CAP:
+            if noblock != 0:
+                cpu_irq_restore(irq)
+                if done > 0:
+                    return cast[int64](done)
+                return cast[int64](EAGAIN)
+            wq_wait(&p[0].wr_wq, WAIT_FOREVER)
+            continue
+        buf: Ptr[uint8] = cast[Ptr[uint8]](p[0].buf)
+        k: uint32 = 0
+        while k < PIPE_COPY and done < n and p[0].count < PIPE_CAP:
+            buf[(p[0].head + p[0].count) % PIPE_CAP] = src[done]
+            p[0].count = p[0].count + 1
+            done = done + 1
+            k = k + 1
+        p[0].bytes = p[0].bytes + cast[uint64](k)
+        wq_wake_all(&p[0].rd_wq)
+        cpu_irq_restore(irq)
+        irq = cpu_irq_save()
+    cpu_irq_restore(irq)
+    return cast[int64](done)
+
+
+def pipe_readers(slot: int32) -> uint32:
+    if pipe_valid(slot) == 0:
+        return 0
+    return pipe_table[slot].readers
+
+
+def pipe_writers(slot: int32) -> uint32:
+    if pipe_valid(slot) == 0:
+        return 0
+    return pipe_table[slot].writers

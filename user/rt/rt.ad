@@ -1,0 +1,328 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the run-time every user program is linked with.
+#
+# It plays the part of Hamnix's user/runtime.S: Hamnix programs declare the
+# system calls they use as `extern def sys_xxx(...)` and expect the link to
+# supply them, together with the entry point that calls main(argc, argv).
+# The names and signatures below are Hamnix's; the numbers are Hamnix's
+# wherever HackOS implements the call (docs/syscalls.md).  A call HackOS does
+# not have still links: the kernel answers -ENOSYS (38) with an error string.
+#
+# Everything here runs unprivileged inside the program's own memory block.
+# The 64-bit divide and the memory copy helpers the compiler calls come from
+# kernel/rt.ad through arch/armv7m/aeabi.S; each program carries its own copy.
+
+from kernel.rt import rt_memcpy, rt_memmove, rt_memset, rt_udivmod64, rt_sdivmod64, rt_u64_to_f64, rt_i64_to_f64, rt_f64_to_u64, rt_f64_to_i64
+
+extern def hackos_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64
+extern def main(argc: int32, argv: Ptr[uint64]) -> int32
+extern def __heap_start()
+extern def __heap_end()
+
+# The environment the program was started with: a NULL-terminated vector of
+# "NAME=value" strings (8-byte entries), or an empty vector.
+hackos_envp: uint64 = 0
+
+
+# The kernel enters a new program here with (argc, argv, envp).
+def hackos_crt_start(argc: uint64, argv: uint64, envp: uint64):
+    hackos_envp = envp
+    rc: int32 = main(cast[int32](argc), cast[Ptr[uint64]](argv))
+    hackos_syscall(1, cast[uint64](cast[int64](rc)), 0, 0, 0, 0, 0)
+    while 1 == 1:
+        rc = rc
+
+
+# ---- files -------------------------------------------------------------------
+def sys_putc(c: uint32) -> int32:
+    return cast[int32](hackos_syscall(0, cast[uint64](c), 0, 0, 0, 0, 0))
+
+
+def sys_exit(code: uint64):
+    hackos_syscall(1, code, 0, 0, 0, 0, 0)
+
+
+def sys_get_jiffies() -> uint64:
+    return cast[uint64](hackos_syscall(2, 0, 0, 0, 0, 0, 0))
+
+
+def sys_getpid() -> int32:
+    return cast[int32](hackos_syscall(4, 0, 0, 0, 0, 0, 0))
+
+
+def sys_open(path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(5, cast[uint64](path), 0, 0, 0, 0, 0))
+
+
+def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    return hackos_syscall(6, cast[uint64](fd), cast[uint64](buf), count, 0, 0, 0)
+
+
+def sys_close(fd: int32) -> int32:
+    return cast[int32](hackos_syscall(7, cast[uint64](fd), 0, 0, 0, 0, 0))
+
+
+def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    return hackos_syscall(8, cast[uint64](fd), cast[uint64](buf), count, 0, 0, 0)
+
+
+def sys_lseek(fd: int32, off: int64, whence: int32) -> int64:
+    return hackos_syscall(9, cast[uint64](fd), cast[uint64](off), cast[uint64](whence), 0, 0, 0)
+
+
+def sys_open_write(path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(13, cast[uint64](path), 0, 0, 0, 0, 0))
+
+
+def sys_dup(fd: int32) -> int32:
+    return cast[int32](hackos_syscall(16, cast[uint64](fd), 0, 0, 0, 0, 0))
+
+
+def sys_dup2(oldfd: int32, newfd: int32) -> int32:
+    return cast[int32](hackos_syscall(17, cast[uint64](oldfd), cast[uint64](newfd), 0, 0, 0, 0))
+
+
+def sys_chdir(path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(19, cast[uint64](path), 0, 0, 0, 0, 0))
+
+
+def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64:
+    return hackos_syscall(20, cast[uint64](buf), count, 0, 0, 0, 0)
+
+
+def sys_unlink(path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(21, cast[uint64](path), 0, 0, 0, 0, 0))
+
+
+def sys_mkdir(path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(22, cast[uint64](path), 0, 0, 0, 0, 0))
+
+
+def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    return hackos_syscall(23, cast[uint64](fd), cast[uint64](buf), count, 0, 0, 0)
+
+
+def sys_yield() -> int32:
+    return cast[int32](hackos_syscall(24, 0, 0, 0, 0, 0, 0))
+
+
+def sys_create(path: Ptr[uint8], flags: uint32, mode: uint32) -> int32:
+    return cast[int32](hackos_syscall(260, cast[uint64](path), cast[uint64](flags), cast[uint64](mode), 0, 0, 0))
+
+
+def sys_stat_p9(path: Ptr[uint8], buf: Ptr[uint8], nbuf: uint64) -> int64:
+    return hackos_syscall(261, cast[uint64](path), cast[uint64](buf), nbuf, 0, 0, 0)
+
+
+def sys_fstat_p9(fd: int32, buf: Ptr[uint8], nbuf: uint64) -> int64:
+    return hackos_syscall(262, cast[uint64](fd), cast[uint64](buf), nbuf, 0, 0, 0)
+
+
+def sys_remove(path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(263, cast[uint64](path), 0, 0, 0, 0, 0))
+
+
+def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32:
+    return cast[int32](hackos_syscall(265, cast[uint64](buf), nbuf, 0, 0, 0, 0))
+
+
+# req and rem point at {int64 seconds, int64 nanoseconds}; rem may be null.
+def sys_nanosleep(req: Ptr[int64], rem: Ptr[int64]) -> int64:
+    return hackos_syscall(308, cast[uint64](req), cast[uint64](rem), 0, 0, 0, 0)
+
+
+def sys_rename(oldpath: Ptr[uint8], newpath: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(514, cast[uint64](oldpath), cast[uint64](newpath), 0, 0, 0, 0))
+
+
+def sys_sleep_ms(ms: uint64) -> int32:
+    return cast[int32](hackos_syscall(516, ms, 0, 0, 0, 0, 0))
+
+
+# ---- processes ---------------------------------------------------------------
+# A new process running the program at `path`; argv is a NULL-terminated
+# vector of strings (8-byte entries).  Returns its id.  HackOS only.
+def sys_spawn(path: Ptr[uint8], argv: Ptr[uint64]) -> int32:
+    return cast[int32](hackos_syscall(517, cast[uint64](path), cast[uint64](argv), 0, 0, 0, 0))
+
+
+# vfork semantics on HackOS: the parent is suspended until the child calls
+# exec or exit, and the child runs on the parent's memory until then.
+def sys_rfork(flags: int32) -> int32:
+    return cast[int32](hackos_syscall(256, cast[uint64](flags), 0, 0, 0, 0, 0))
+
+
+def sys_execve_env(path: Ptr[uint8], argv: Ptr[uint64], envp: Ptr[uint64]) -> int32:
+    return cast[int32](hackos_syscall(10, cast[uint64](path), cast[uint64](argv), cast[uint64](envp), 0, 0, 0))
+
+
+def sys_waitpid(pid: int32) -> int64:
+    return hackos_syscall(12, cast[uint64](pid), 0, 0, 0, 0, 0)
+
+
+def sys_waitpid_nb_raw(pid: int32, flags: int64) -> int64:
+    return hackos_syscall(12, cast[uint64](pid), cast[uint64](flags), 0, 0, 0, 0)
+
+
+def sys_waitpid_jc(pid: int32, status: Ptr[int64]) -> int64:
+    return hackos_syscall(299, cast[uint64](pid), cast[uint64](status), 0, 0, 0, 0)
+
+
+def sys_setpgid(pid: int32, pgid: int32) -> int32:
+    return cast[int32](hackos_syscall(297, cast[uint64](pid), cast[uint64](pgid), 0, 0, 0, 0))
+
+
+def sys_tcsetpgrp(pgid: int32) -> int32:
+    return cast[int32](hackos_syscall(298, cast[uint64](pgid), 0, 0, 0, 0, 0))
+
+
+def sys_getuid() -> uint32:
+    return cast[uint32](hackos_syscall(288, 0, 0, 0, 0, 0, 0))
+
+
+def sys_getgid() -> uint32:
+    return cast[uint32](hackos_syscall(289, 0, 0, 0, 0, 0, 0))
+
+
+def sys_setuid(uid: uint32) -> int32:
+    return cast[int32](hackos_syscall(290, cast[uint64](uid), 0, 0, 0, 0, 0))
+
+
+# ---- /fd names: pipes and redirections (Hamnix's model) ----------------------
+def sys_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
+    return cast[int32](hackos_syscall(278, cast[uint64](pid), cast[uint64](fdnum), cast[uint64](kind), cast[uint64](arg), 0, 0))
+
+
+def sys_fdslot_kind(pid: int32, fdnum: int32) -> int32:
+    return cast[int32](hackos_syscall(287, cast[uint64](pid), cast[uint64](fdnum), 0, 0, 0, 0))
+
+
+def sys_fdslot_arg(pid: int32, fdnum: int32) -> int32:
+    return cast[int32](hackos_syscall(324, cast[uint64](pid), cast[uint64](fdnum), 0, 0, 0, 0))
+
+
+def sys_pipechan() -> int32:
+    return cast[int32](hackos_syscall(280, 0, 0, 0, 0, 0, 0))
+
+
+def sys_openchan(path: Ptr[uint8], mode: int32) -> int32:
+    return cast[int32](hackos_syscall(281, cast[uint64](path), cast[uint64](mode), 0, 0, 0, 0))
+
+
+def sys_nsid() -> uint64:
+    return cast[uint64](hackos_syscall(282, 0, 0, 0, 0, 0, 0))
+
+
+# ---- Hamnix calls HackOS does not implement ----------------------------------
+# They reach the kernel so that the error string says why (or, for svc_ctl's
+# poll, so that the answer is "nothing pending").
+def sys_bind(new: Ptr[uint8], old: Ptr[uint8], flag: int32) -> int32:
+    return cast[int32](hackos_syscall(257, cast[uint64](new), 0, 0, 0, 0, 0))
+
+
+def sys_mount(srvfd: int32, afd: int32, old: Ptr[uint8], flag: int32, spec: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(258, cast[uint64](srvfd), 0, 0, 0, 0, 0))
+
+
+def sys_unmount(new: Ptr[uint8], old: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(259, cast[uint64](new), 0, 0, 0, 0, 0))
+
+
+def sys_svc_ctl(verb: int32, name: Ptr[uint8], cap: uint64) -> int64:
+    return hackos_syscall(296, cast[uint64](verb), 0, 0, 0, 0, 0)
+
+
+def sys_svc_publish(name: Ptr[uint8], payload: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(291, 0, 0, 0, 0, 0, 0))
+
+
+def sys_nslabel(op: int32, label: Ptr[uint8], to_path: Ptr[uint8], from_path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(285, 0, 0, 0, 0, 0, 0))
+
+
+def sys_srv_open(name: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(276, 0, 0, 0, 0, 0, 0))
+
+
+def sys_setuid_auth(authfd: int32) -> int32:
+    return cast[int32](hackos_syscall(300, 0, 0, 0, 0, 0, 0))
+
+
+def sys_pgrp_kill(pgid: uint32, sig: int32) -> int32:
+    return cast[int32](hackos_syscall(15, 0, 0, 0, 0, 0, 0))
+
+
+def sys_waitfds(fds: Ptr[int32], n: int32, timeout: int64) -> int32:
+    return cast[int32](hackos_syscall(313, 0, 0, 0, 0, 0, 0))
+
+
+def sys_chan_dir_mode(fd: int32, mode: int32, path: Ptr[uint8]) -> int32:
+    return cast[int32](hackos_syscall(319, 0, 0, 0, 0, 0, 0))
+
+
+def sys_listdir_records(path: Ptr[uint8], buf: Ptr[uint8], count: uint64) -> int64:
+    return hackos_syscall(318, 0, 0, 0, 0, 0, 0)
+
+
+# ---- the heap ----------------------------------------------------------------
+# A process cannot be given more memory after it has started (its block is
+# what the MPU region covers), so its heap is a part of its own image:
+# __heap_size bytes after .bss, chosen at link time (user/rt/prog.ld).
+# sys_mmap(anonymous) and sys_munmap hand it out: first fit over a list of
+# blocks, each with a 16-byte header {size, in use}, neighbours merged on
+# free.  A program that never calls sys_mmap does not carry this code.
+heap_ready: uint32 = 0
+
+
+def _hsize(b: uint64) -> uint64:
+    return cast[Ptr[uint64]](b)[0]
+
+
+def _hused(b: uint64) -> uint64:
+    return cast[Ptr[uint64]](b)[1]
+
+
+def _hset(b: uint64, size: uint64, used: uint64):
+    cast[Ptr[uint64]](b)[0] = size
+    cast[Ptr[uint64]](b)[1] = used
+
+
+# Anonymous memory only: fd must be -1.  Returns the address or -12.
+def sys_mmap(addr: uint64, length: uint64, prot: int32, flags: int32, fd: int32, off: int64) -> int64:
+    lo: uint64 = cast[uint64](&__heap_start)
+    hi: uint64 = cast[uint64](&__heap_end)
+    if fd != -1 or length == 0 or hi - lo < 32:
+        return -12
+    if heap_ready == 0:
+        _hset(lo, hi - lo, 0)
+        heap_ready = 1
+    need: uint64 = ((length + 15) & 0xFFFFFFFFFFFFFFF0) + 16
+    b: uint64 = lo
+    while b < hi:
+        size: uint64 = _hsize(b)
+        if size < 16 or b + size > hi:
+            return -12                                  # the list is damaged
+        if _hused(b) == 0:
+            # merge the free blocks that follow
+            while b + size < hi and _hused(b + size) == 0:
+                size = size + _hsize(b + size)
+            _hset(b, size, 0)
+            if size >= need:
+                if size - need >= 32:
+                    _hset(b + need, size - need, 0)
+                    size = need
+                _hset(b, size, 1)
+                rt_memset(b + 16, 0, size - 16)
+                return cast[int64](b + 16)
+        b = b + size
+    return -12
+
+
+def sys_munmap(addr: uint64, length: uint64) -> int64:
+    lo: uint64 = cast[uint64](&__heap_start)
+    hi: uint64 = cast[uint64](&__heap_end)
+    if addr < lo + 16 or addr >= hi or (addr & 15) != 0 or _hused(addr - 16) != 1:
+        return -22
+    _hset(addr - 16, _hsize(addr - 16), 0)
+    return 0

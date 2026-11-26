@@ -110,7 +110,7 @@ while read -r sum name; do
     [ "$have" = "$sum" ] || bad "third_party/sensirion-sht4x/$name differs from the recorded upstream file"
 done < third_party/sensirion-sht4x/UPSTREAM
 [ "$nthird" = 9 ] && ok "9 Sensirion files match the hashes in UPSTREAM" || bad "$nthird Sensirion files listed in UPSTREAM, expected 9"
-KO="$B/startup.o $B/cpu.o $B/switch.o $B/fptest.o"
+KO="$B/startup.o $B/aeabi.o $B/cpu.o $B/switch.o $B/fptest.o"
 if bash tests/check_c_link.sh $B/ktest.ll $B/ktest.o $KO -- $B/c/*.o > $B/clink.log 2>&1; then
     ok "link rule: $(sed 's/^ok: //' $B/clink.log)"
 else
@@ -169,7 +169,7 @@ nfail="$(grep -c '^FAIL ' $B/selftest.out)"; npass="$(grep -c '^PASS ' $B/selfte
 [ "$npass" = "$EXPECTED_SELF" ] && ok "$npass PASS lines (all $EXPECTED_SELF checks ran)" || bad "$npass PASS lines, expected $EXPECTED_SELF"
 expect "RESULT: PASS" $B/selftest.out '^RESULT: PASS'
 
-echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, console)"
+echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, processes, console)"
 EXPECTED_K="$(grep -cE '^ +check\(' tests/ktest_main.ad)"
 qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT"
 if wait_for "-- 9. console"; then

@@ -1,0 +1,346 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the process test program.  The kernel test image runs it from
+# /bin with a sub-command in argv[1]; the exit code carries the result (a
+# bit per sub-check where there are several).
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[uint8]) -> int32
+extern def sys_open_write(path: Ptr[uint8]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_getpid() -> int32
+extern def sys_sleep_ms(ms: uint64) -> int32
+extern def sys_yield() -> int32
+extern def sys_spawn(path: Ptr[uint8], argv: Ptr[uint64]) -> int32
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_execve_env(path: Ptr[uint8], argv: Ptr[uint64], envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+extern def sys_waitpid_jc(pid: int32, status: Ptr[int64]) -> int64
+extern def sys_mmap(addr: uint64, length: uint64, prot: int32, flags: int32, fd: int32, off: int64) -> int64
+extern def sys_munmap(addr: uint64, length: uint64) -> int64
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+extern def sys_chdir(path: Ptr[uint8]) -> int32
+extern def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32
+extern def sys_pipechan() -> int32
+extern def sys_get_jiffies() -> uint64
+extern def hackos_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64
+
+counter: uint64 = 1000              # initialised data
+zeroed: Array[64, uint32]           # bss
+big: Array[6000, uint8]
+names: Array[4, Ptr[uint8]]
+child_argv: Array[4, uint64]
+
+
+def slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def puts(s: Ptr[uint8]):
+    sys_write(1, s, slen(s))
+
+
+def seq(a: Ptr[uint8], b: Ptr[uint8]) -> uint32:
+    i: uint64 = 0
+    while a[i] != 0 and a[i] == b[i]:
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+def put_hex(v: uint64):
+    d: Array[18, uint8]
+    i: uint32 = 0
+    while i < 8:
+        n: uint64 = (v >> cast[uint64](28 - i * 4)) & 15
+        if n < 10:
+            d[i] = cast[uint8](48 + n)
+        else:
+            d[i] = cast[uint8](87 + n)
+        i = i + 1
+    sys_write(1, &d[0], 8)
+
+
+def parse_hex(s: Ptr[uint8]) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint64 = cast[uint64](s[i])
+        if c >= 48 and c <= 57:
+            v = v * 16 + c - 48
+        elif c >= 97 and c <= 102:
+            v = v * 16 + c - 87
+        i = i + 1
+    return v
+
+
+def twice(x: uint64) -> uint64:
+    return x * 2
+
+
+def thrice(x: uint64) -> uint64:
+    return x * 3
+
+
+op: Fn[uint64, uint64]
+
+
+# Each level reads its caller's frame and hands its own on, so the frames
+# cannot be optimised away.
+def deep(n: uint64, prev: Ptr[uint8]) -> uint64:
+    pad: Array[64, uint8]
+    pad[n & 63] = cast[uint8](cast[uint64](prev[(n + 1) & 63]) + n)
+    if n == 0:
+        return cast[uint64](pad[0])
+    return deep(n - 1, &pad[0]) + cast[uint64](pad[n & 63])
+
+
+# One frame much larger than any guard region would be.
+def huge_frame(n: uint64, prev: Ptr[uint8]) -> uint64:
+    pad: Array[6000, uint8]
+    pad[n % 6000] = cast[uint8](cast[uint64](prev[(n + 1) % 6000]) + n)
+    if n == 0:
+        return cast[uint64](pad[0])
+    return huge_frame(n - 1, &pad[0]) + cast[uint64](pad[n % 6000])
+
+
+# What the program sees of its own image after loading.
+def t_image() -> int32:
+    r: int32 = 0
+    if counter == 1000:
+        r = r | 1                       # .data arrived
+    z: uint32 = 0
+    i: uint32 = 0
+    while i < 64:
+        z = z | zeroed[i]
+        i = i + 1
+    if z == 0:
+        r = r | 2                       # .bss is zero
+    names[0] = "alpha"
+    names[3] = "delta"
+    if seq(names[0], "alpha") != 0 and seq(names[3], "delta") != 0 and cast[uint64](names[0]) > cast[uint64](&t_image):
+        r = r | 4                       # addresses of constants, formed PC-relative
+    op = twice
+    a: uint64 = op(21)
+    op = thrice
+    if a == 42 and op(14) == 42:
+        r = r | 8                       # calls through function pointers
+    x: uint64 = 1000000007
+    if (x * x) / 1000000007 == 1000000007 and (x * x + 5) % 1000000007 == 5:
+        r = r | 16                      # 64-bit divide helper, this program's own copy
+    f: float64 = 1.5
+    g: float64 = f * 4.0 + cast[float64](x)
+    if cast[uint64](g) == 1000000013:
+        r = r | 32                      # floating point and its conversions
+    counter = counter + 1
+    if counter == 1001:
+        r = r | 64                      # .data is writable
+    return r
+
+
+def t_heap() -> int32:
+    r: int32 = 0
+    a: int64 = sys_mmap(0, 1000, 3, 0x22, -1, 0)
+    b: int64 = sys_mmap(0, 2000, 3, 0x22, -1, 0)
+    if a > 0 and b > 0 and a != b:
+        r = r | 1
+        pa: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](a))
+        pb: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](b))
+        pa[999] = 7
+        pb[1999] = 9
+        if pa[0] == 0 and pb[0] == 0 and pa[999] == 7:
+            r = r | 2
+        if sys_munmap(cast[uint64](a), 1000) == 0 and sys_munmap(cast[uint64](a), 1000) != 0:
+            r = r | 4
+        c: int64 = sys_mmap(0, 500, 3, 0x22, -1, 0)
+        if c == a:
+            r = r | 8                   # the freed block is used again
+    # more than the heap holds
+    if sys_mmap(0, 1000000, 3, 0x22, -1, 0) == -12:
+        r = r | 16
+    return r
+
+
+# rfork + exec + wait, the way Hamnix's spawn() does it.
+def t_fork(path: Ptr[uint8]) -> int32:
+    r: int32 = 0
+    local: Array[4, uint64]
+    local[0] = 0x1111222233334444
+    local[1] = 0x5555666677778888
+    keep: float64 = 2.25
+    before: uint64 = counter
+    child_argv[0] = cast[uint64](path)
+    child_argv[1] = cast[uint64]("from-rfork")
+    child_argv[2] = 0
+    pid: int32 = sys_rfork(0x00D)               # RFPROC | RFFDG | RFNAMEG
+    if pid == 0:
+        # the child, on the parent's memory: scribble on the stack frame and
+        # on a global, close a descriptor, then become another program
+        local[0] = 0
+        local[1] = 0
+        counter = counter + 100
+        sys_close(1)
+        sys_open("/dev/console")                # becomes its descriptor 1 again
+        sys_execve_env(path, &child_argv[0], cast[Ptr[uint64]](0))
+        sys_exit(127)
+    if pid > 0:
+        r = r | 1
+    if local[0] == 0x1111222233334444 and local[1] == 0x5555666677778888:
+        r = r | 2                       # the stack is as it was
+    if keep * 2.0 == 4.5:
+        r = r | 4                       # so is the floating-point state
+    if counter == before + 100:
+        r = r | 8                       # globals are shared until exec (vfork)
+    if sys_write(1, "", 0) == 0:
+        r = r | 16                      # the child's close(1) was its own
+    code: int64 = sys_waitpid(pid)
+    if code == 2:
+        r = r | 32                      # /bin/hello with one argument returns 2
+    if sys_waitpid(pid) == -10:
+        r = r | 64                      # it is gone
+    return r
+
+
+def t_forkfail() -> int32:
+    r: int32 = 0
+    child_argv[0] = cast[uint64]("/bin/no-such-program")
+    child_argv[1] = 0
+    pid: int32 = sys_rfork(0x00D)
+    if pid == 0:
+        rc: int32 = sys_execve_env("/bin/no-such-program", &child_argv[0], cast[Ptr[uint64]](0))
+        if rc == -2:
+            sys_exit(127)
+        sys_exit(1)
+    if pid > 0 and sys_waitpid(pid) == 127:
+        r = r | 1
+    # not a program at all
+    fd: int32 = sys_open_write("/tmp/notelf")
+    sys_write(fd, "#!/bin/hamsh\necho no\n", 21)
+    sys_close(fd)
+    child_argv[0] = cast[uint64]("/tmp/notelf")
+    pid = sys_rfork(0x00D)
+    if pid == 0:
+        rc2: int32 = sys_execve_env("/tmp/notelf", &child_argv[0], cast[Ptr[uint64]](0))
+        if rc2 == -8:
+            sys_exit(126)
+        sys_exit(1)
+    if pid > 0 and sys_waitpid(pid) == 126:
+        r = r | 2
+    # a child that neither execs nor fails: it just exits
+    pid = sys_rfork(0x00D)
+    if pid == 0:
+        sys_exit(55)
+    if pid > 0 and sys_waitpid(pid) == 55:
+        r = r | 4
+    return r
+
+
+def t_spawn(path: Ptr[uint8]) -> int32:
+    r: int32 = 0
+    child_argv[0] = cast[uint64](path)
+    child_argv[1] = cast[uint64]("a")
+    child_argv[2] = cast[uint64]("b")
+    child_argv[3] = 0
+    pid: int32 = sys_spawn(path, &child_argv[0])
+    if pid > 0:
+        r = r | 1
+    st: Array[1, int64]
+    st[0] = -1
+    polls: uint32 = 0
+    got: int64 = 0
+    while got == 0 and polls < 1000:
+        got = sys_waitpid_jc(pid, &st[0])
+        if got == 0:
+            sys_sleep_ms(1)
+        polls = polls + 1
+    if got == cast[int64](pid) and st[0] == ((3 << 8) | 1):
+        r = r | 2
+    if sys_waitpid_jc(pid, &st[0]) == -10:
+        r = r | 4
+    if sys_spawn("/bin/no-such-program", &child_argv[0]) == -2:
+        r = r | 8
+    return r
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        return 200
+    cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    arg: Ptr[uint8] = cast[Ptr[uint8]]("")
+    if argc > 2:
+        arg = cast[Ptr[uint8]](argv[2])
+    if seq(cmd, "image") != 0:
+        return t_image()
+    if seq(cmd, "heap") != 0:
+        return t_heap()
+    if seq(cmd, "fork") != 0:
+        return t_fork(arg)
+    if seq(cmd, "forkfail") != 0:
+        return t_forkfail()
+    if seq(cmd, "spawn") != 0:
+        return t_spawn(arg)
+    if seq(cmd, "where") != 0:
+        # print where this instance's data is, then stay alive for a while
+        puts("ptest: data at 0x")
+        put_hex(cast[uint64](&counter))
+        puts("\n")
+        counter = parse_hex(arg)
+        sys_sleep_ms(200)
+        if counter == parse_hex(arg):
+            return 77
+        return 78
+    if seq(cmd, "peek") != 0:
+        # read memory this process may or may not own
+        p: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](parse_hex(arg))
+        v: uint32 = p[0]
+        return cast[int32](v & 0x7F)
+    if seq(cmd, "poke") != 0:
+        q: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](parse_hex(arg))
+        q[0] = 0xDEADBEEF
+        return 0
+    if seq(cmd, "sysptr") != 0:
+        # hand the kernel an address that is not ours: it must refuse
+        r: int64 = sys_write(1, cast[Ptr[uint8]](parse_hex(arg)), 4)
+        if r == -14:
+            return 14
+        return 1
+    if seq(cmd, "deep") != 0:
+        return cast[int32](deep(1000000, &big[0]) & 0x7F)
+    if seq(cmd, "huge") != 0:
+        return cast[int32](huge_frame(100000, &big[0]) & 0x7F)
+    if seq(cmd, "orphan") != 0:
+        # start a child that outlives us
+        child_argv[0] = cast[uint64]("/bin/ptest")
+        child_argv[1] = cast[uint64]("sleep")
+        child_argv[2] = 0
+        if sys_spawn("/bin/ptest", &child_argv[0]) > 0:
+            return 60
+        return 1
+    if seq(cmd, "sleep") != 0:
+        sys_sleep_ms(50)
+        return 61
+    if seq(cmd, "cwd") != 0:
+        buf: Array[64, uint8]
+        sys_chdir("/tmp")
+        sys_getcwd(&buf[0], 64)
+        if seq(&buf[0], "/tmp") != 0:
+            return 5
+        return 1
+    if seq(cmd, "thread") != 0:
+        if hackos_syscall(512, 0, 0, 0, 4096, 0, 0) == -38:
+            return 38
+        return 1
+    if seq(cmd, "spin") != 0:
+        n: uint64 = 0
+        while n < 4000:
+            sys_yield()
+            n = n + 1
+        return 0
+    return 201

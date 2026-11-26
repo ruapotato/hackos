@@ -1,0 +1,658 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- processes: program loading, spawn, exec, rfork, wait.
+#
+# A process is a thread with TF_PROC (kernel/sched/core.ad) that runs a
+# program loaded from the file system into one block of the program arena.
+# There is no MMU, so:
+#
+#   * A program is a position-independent ELF executable (ET_DYN, built with
+#     `clang -fPIE` and `ld.lld -pie`, see user/rt/).  The loader copies its
+#     load segments to wherever the block happens to be, clears the rest and
+#     applies the R_ARM_RELATIVE relocations (add the load address).  Code
+#     reaches data PC-relative, so code and data move together.
+#   * One block holds everything the process may touch:
+#
+#         base                         load                      end
+#         | stack (grows down) | argv | image: text, data, bss, heap |
+#
+#     The stack is at the BOTTOM: running off it leaves the block, which is a
+#     fault whatever the size of the frame, and no guard region is needed.
+#     Its size comes from the program's PT_GNU_STACK header (`-z
+#     stack-size=N` at link time).  The heap is part of the program's bss
+#     (user/rt/prog.ld) and is managed by the program's own run-time.
+#   * The MPU opens exactly this block to the process (kernel/mpu.ad) and
+#     nothing else: not the kernel, not another process, not the kernel
+#     image's code.  The block is k/8 of a power-of-two region, k = 5..8.
+#   * fork cannot exist.  rfork(RFPROC) is vfork: the child runs on the
+#     parent's memory, with its own descriptors and /fd names, while the
+#     parent is suspended until the child calls exec or exit.  The kernel
+#     keeps a copy of the parent's stack for that time and puts it back, so
+#     whatever the child did to the stack is undone; what it did to the
+#     parent's globals stays.  spawn(path, argv) is the native call and needs
+#     none of this.
+#   * A child that came from rfork is not started the moment it has exec'ed:
+#     it is held until its parent next yields, waits, sleeps or reads.
+#     Hamnix's shell binds a child's standard streams AFTER the spawn and
+#     relies on Hamnix's cooperative scheduler not running the child before
+#     the parent gives up the processor; the hold gives it the same order.
+#
+# Not here: threads inside a process, signals, process groups that do
+# anything (setpgid/tcsetpgrp only record), an environment (envp is accepted
+# and handed to the new program, nothing more), shared libraries.
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.rt import rt_memcpy, rt_memset
+from kernel.mpu import mpu_proc_rasr, mpu_proc_rbar
+from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, WAIT_FOREVER
+from mm.slab import kmalloc, kfree, palloc_aligned, pfree
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, OREAD, ENOMEM, EFAULT, EINVAL
+from kernel.pipe import EAGAIN
+from kernel.uaccess import uok, ustr
+
+E2BIG: int32 = -7
+ENOEXEC: int32 = -8
+ECHILD: int32 = -10
+
+RFPROC: uint32 = 0x001
+RFNOWAIT: uint32 = 0x100
+
+PROC_STACK_DEFAULT: uint32 = 8192
+PROC_STACK_MIN: uint32 = 1024
+PROC_STACK_MAX: uint32 = 0x100000
+PROC_ARG_MAX: uint32 = 4096         # argv and envp strings plus their pointer arrays
+PROC_ARGC_MAX: uint32 = 64
+PROC_PRIO: uint32 = 4
+
+PT_LOAD: uint32 = 1
+PT_DYNAMIC: uint32 = 2
+PT_GNU_STACK: uint32 = 0x6474E551
+DT_REL: uint32 = 17
+DT_RELSZ: uint32 = 18
+DT_RELA: uint32 = 7
+R_ARM_RELATIVE: uint32 = 23
+
+# statistics
+proc_spawned: uint64 = 0            # processes created (spawn and rfork)
+proc_execs: uint64 = 0              # successful exec calls
+proc_last_block: uint32 = 0         # bytes of the block the last load used
+proc_last_image: uint32 = 0         # of them: the image (text, data, bss)
+proc_last_stack: uint32 = 0         # the stack
+proc_last_relocs: uint32 = 0        # relocations applied
+
+
+# What a load produced.
+class Image:
+    base: uint64                    # the block (palloc)
+    lo: uint32
+    hi: uint32
+    rbar: uint32
+    rasr: uint32
+    load: uint32                    # where the image's address 0 is
+    entry: uint32
+    stack_top: uint32               # == load: the stack lies below the image
+
+
+def _rd16(p: Ptr[uint8], off: uint32) -> uint32:
+    return cast[uint32](p[off]) | (cast[uint32](p[off + 1]) << 8)
+
+
+def _rd32(p: Ptr[uint8], off: uint32) -> uint32:
+    return _rd16(p, off) | (_rd16(p, off + 2) << 16)
+
+
+def _mem32(addr: uint32) -> uint32:
+    return cast[Ptr[uint32]](cast[uint64](addr))[0]
+
+
+def _fail(code: int32, msg: Ptr[uint8]) -> int32:
+    set_current_errstr(msg)
+    return code
+
+
+def _read_at(fd: int32, off: uint32, dst: uint64, n: uint32) -> int32:
+    if vfs_lseek(fd, cast[int64](off), 0) < 0:
+        return -1
+    got: uint64 = 0
+    while got < cast[uint64](n):
+        r: int64 = vfs_read(fd, cast[Ptr[uint8]](dst + got), cast[uint64](n) - got, 0)
+        if r <= 0:
+            return -1
+        got = got + cast[uint64](r)
+    return 0
+
+
+# Choose the MPU region for `need` bytes: the smallest power of two S >= 256
+# of which k eighths (k = 5..8, or fewer at the minimum size) hold them.
+# Returns S; k through k_out.
+def _region_for(need: uint32, k_out: Ptr[uint32]) -> uint32:
+    s: uint32 = 256
+    while s < need and s < 0x40000000:
+        s = s << 1
+    k: uint32 = (need + s / 8 - 1) / (s / 8)
+    if k == 0:
+        k = 1
+    k_out[0] = k
+    return s
+
+
+# Load the program at `path` into a new block.  Runs in the caller's context
+# (its descriptor table is used for the one open).  0 or a negative errno
+# with the error string set; on success `img` describes the block.
+def proc_load(path: Ptr[uint8], img: Ptr[Image]) -> int32:
+    hdr: Array[52, uint8]
+    ph: Array[32, uint8]
+    fd: int32 = vfs_open(path, OREAD)
+    if fd < 0:
+        return fd
+    rc: int32 = _load_fd(fd, &hdr[0], &ph[0], img)
+    vfs_close(fd)
+    return rc
+
+
+def _load_fd(fd: int32, hdr: Ptr[uint8], ph: Ptr[uint8], img: Ptr[Image]) -> int32:
+    if _read_at(fd, 0, cast[uint64](hdr), 52) != 0:
+        return _fail(ENOEXEC, "exec: not a program (too short)")
+    # 0x7F 'E' 'L' 'F', 32-bit, little-endian; ET_DYN (3); EM_ARM (40)
+    if _rd32(hdr, 0) != 0x464C457F or hdr[4] != 1 or hdr[5] != 1:
+        return _fail(ENOEXEC, "exec: not a 32-bit little-endian ELF file")
+    if _rd16(hdr, 16) != 3 or _rd16(hdr, 18) != 40:
+        return _fail(ENOEXEC, "exec: not a position-independent ARM executable")
+    entry: uint32 = _rd32(hdr, 24)
+    phoff: uint32 = _rd32(hdr, 28)
+    phentsize: uint32 = _rd16(hdr, 42)
+    phnum: uint32 = _rd16(hdr, 44)
+    if phentsize != 32 or phnum == 0 or phnum > 16:
+        return _fail(ENOEXEC, "exec: bad program header table")
+    # pass 1: extent of the image, stack size
+    hi: uint32 = 0
+    stack: uint32 = PROC_STACK_DEFAULT
+    i: uint32 = 0
+    while i < phnum:
+        if _read_at(fd, phoff + i * 32, cast[uint64](ph), 32) != 0:
+            return _fail(ENOEXEC, "exec: truncated program headers")
+        ptype: uint32 = _rd32(ph, 0)
+        if ptype == PT_LOAD:
+            vaddr: uint32 = _rd32(ph, 8)
+            filesz: uint32 = _rd32(ph, 16)
+            memsz: uint32 = _rd32(ph, 20)
+            if filesz > memsz or vaddr > 0x4000000 or memsz > 0x4000000:
+                return _fail(ENOEXEC, "exec: bad load segment")
+            if vaddr + memsz > hi:
+                hi = vaddr + memsz
+        elif ptype == PT_GNU_STACK and _rd32(ph, 20) != 0:
+            stack = _rd32(ph, 20)
+        i = i + 1
+    if hi == 0:
+        return _fail(ENOEXEC, "exec: nothing to load")
+    if stack < PROC_STACK_MIN:
+        stack = PROC_STACK_MIN
+    if stack > PROC_STACK_MAX:
+        return _fail(ENOEXEC, "exec: stack size out of range")
+    stack = (stack + 15) & 0xFFFFFFF0
+    need: uint32 = stack + ((hi + 15) & 0xFFFFFFF0)
+    k: uint32 = 0
+    rsize: uint32 = _region_for(need, &k)
+    bsize: uint32 = (rsize / 8) * k
+    base: uint64 = palloc_aligned(cast[uint64](bsize), cast[uint64](rsize))
+    if base == 0:
+        return _fail(ENOMEM, "exec: out of program memory")
+    # A new program must never see what the block held before.
+    rt_memset(base, 0, cast[uint64](bsize))
+    load: uint32 = cast[uint32](base) + stack
+    # pass 2: the segments, and where the dynamic section is
+    dyn: uint32 = 0
+    dynsz: uint32 = 0
+    i = 0
+    while i < phnum:
+        if _read_at(fd, phoff + i * 32, cast[uint64](ph), 32) != 0:
+            pfree(base)
+            return _fail(ENOEXEC, "exec: truncated program headers")
+        ptype = _rd32(ph, 0)
+        if ptype == PT_LOAD and _rd32(ph, 16) != 0:
+            if _read_at(fd, _rd32(ph, 4), cast[uint64](load + _rd32(ph, 8)), _rd32(ph, 16)) != 0:
+                pfree(base)
+                return _fail(ENOEXEC, "exec: truncated load segment")
+        elif ptype == PT_DYNAMIC:
+            dyn = _rd32(ph, 8)
+            dynsz = _rd32(ph, 20)
+        i = i + 1
+    # relocations: DT_REL / DT_RELSZ name a table of {offset, info}; the only
+    # kind a static PIE needs is R_ARM_RELATIVE (the word holds an address
+    # relative to the image; add where the image is).
+    rel: uint32 = 0
+    relsz: uint32 = 0
+    if dyn != 0:
+        if dyn + dynsz > hi or (dyn & 3) != 0:
+            pfree(base)
+            return _fail(ENOEXEC, "exec: dynamic section outside the image")
+        d: uint32 = 0
+        while d + 8 <= dynsz:
+            tag: uint32 = _mem32(load + dyn + d)
+            val: uint32 = _mem32(load + dyn + d + 4)
+            if tag == 0:
+                break
+            if tag == DT_REL:
+                rel = val
+            elif tag == DT_RELSZ:
+                relsz = val
+            elif tag == DT_RELA:
+                pfree(base)
+                return _fail(ENOEXEC, "exec: RELA relocations are not supported")
+            d = d + 8
+    nrel: uint32 = 0
+    if relsz != 0:
+        if rel + relsz > hi or (rel & 3) != 0:
+            pfree(base)
+            return _fail(ENOEXEC, "exec: relocation table outside the image")
+        r: uint32 = 0
+        while r + 8 <= relsz:
+            off: uint32 = _mem32(load + rel + r)
+            info: uint32 = _mem32(load + rel + r + 4)
+            if (info & 0xFF) != R_ARM_RELATIVE:
+                pfree(base)
+                return _fail(ENOEXEC, "exec: unsupported relocation type (only R_ARM_RELATIVE)")
+            if off + 4 > hi:
+                pfree(base)
+                return _fail(ENOEXEC, "exec: relocation outside the image")
+            w: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](load + off))
+            v: uint32 = _rd32(w, 0) + load
+            w[0] = cast[uint8](v)
+            w[1] = cast[uint8](v >> 8)
+            w[2] = cast[uint8](v >> 16)
+            w[3] = cast[uint8](v >> 24)
+            nrel = nrel + 1
+            r = r + 8
+    if (entry & 0xFFFFFFFE) >= hi:
+        pfree(base)
+        return _fail(ENOEXEC, "exec: entry point outside the image")
+    img[0].base = base
+    img[0].lo = cast[uint32](base)
+    img[0].hi = cast[uint32](base) + bsize
+    img[0].rbar = mpu_proc_rbar(cast[uint32](base))
+    img[0].rasr = mpu_proc_rasr(rsize, k)
+    img[0].load = load
+    img[0].entry = load + (entry & 0xFFFFFFFE)
+    img[0].stack_top = load
+    proc_last_block = bsize
+    proc_last_image = hi
+    proc_last_stack = stack
+    proc_last_relocs = nrel
+    return 0
+
+
+# ---------------------------------------------------------------- arguments
+# argv and envp travel through a kernel buffer, because the caller's memory
+# is not the new program's.  Layout of the buffer:
+#   uint32 argc, envc; then argc+envc NUL-terminated strings.
+class Args:
+    buf: uint64
+    len: uint32
+    argc: uint32
+    envc: uint32
+    pad: uint32
+
+
+# Append a string; -1 when the buffer is full.
+def _args_add(a: Ptr[Args], s: Ptr[uint8]) -> int32:
+    n: uint32 = 0
+    while s[n] != 0:
+        n = n + 1
+    if a[0].len + n + 1 > PROC_ARG_MAX:
+        return -1
+    rt_memcpy(a[0].buf + cast[uint64](a[0].len), cast[uint64](s), cast[uint64](n) + 1)
+    a[0].len = a[0].len + n + 1
+    return 0
+
+
+# Copy a NULL-terminated vector of string pointers (8-byte entries, the
+# Adder layout of Ptr[uint64]) from the caller, checking every address
+# (kernel/uaccess.ad).  Returns the count or a negative errno.
+def _args_vec(a: Ptr[Args], vec: uint64) -> int32:
+    n: uint32 = 0
+    if vec == 0:
+        return 0
+    while n < PROC_ARGC_MAX:
+        if uok(vec + cast[uint64](n) * 8, 8, 0) == 0:
+            return EFAULT
+        p: uint64 = cast[Ptr[uint64]](vec)[n]
+        if p == 0:
+            return cast[int32](n)
+        if ustr(p) == 0:
+            return EFAULT
+        if _args_add(a, cast[Ptr[uint8]](p)) != 0:
+            return E2BIG
+        n = n + 1
+    return E2BIG
+
+
+# Build argv/envp below `top` in the new block and the first exception frame
+# below that.  Returns the address of the frame, or 0 when the stack is too
+# small.  The frame enters `entry` with (argc, argv, envp) as its three
+# Adder-convention arguments: r0:r1, r2:r3 and the 8-byte slot at [sp].
+def _proc_stack(img: Ptr[Image], a: Ptr[Args]) -> uint32:
+    nptr: uint32 = a[0].argc + 1 + a[0].envc + 1
+    need: uint32 = ((a[0].len + 7) & 0xFFFFFFF8) + nptr * 8 + 8 + 32 + 64
+    if need + 256 > img[0].stack_top - img[0].lo:
+        return 0
+    strs: uint32 = img[0].stack_top - ((a[0].len + 7) & 0xFFFFFFF8)
+    vecs: uint32 = strs - nptr * 8
+    rt_memcpy(cast[uint64](strs), a[0].buf, cast[uint64](a[0].len))
+    v: Ptr[uint64] = cast[Ptr[uint64]](cast[uint64](vecs))
+    s: uint32 = strs
+    i: uint32 = 0
+    k: uint32 = 0
+    while i < a[0].argc + a[0].envc:
+        if i == a[0].argc:
+            v[k] = 0
+            k = k + 1
+        v[k] = cast[uint64](s)
+        k = k + 1
+        while cast[Ptr[uint8]](cast[uint64](s))[0] != 0:
+            s = s + 1
+        s = s + 1
+        i = i + 1
+    if a[0].envc == 0:
+        v[k] = 0
+        k = k + 1
+    v[k] = 0
+    envp: uint32 = vecs + (a[0].argc + 1) * 8
+    f: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](vecs - 8 - 32))
+    f[0] = a[0].argc                    # r0:r1 = argc
+    f[1] = 0
+    f[2] = vecs                         # r2:r3 = argv
+    f[3] = 0
+    f[4] = 0                            # r12
+    f[5] = 0                            # lr: the entry function does not return
+    f[6] = img[0].entry                 # pc
+    f[7] = 0x01000000                   # xPSR: Thumb
+    f[8] = envp                         # third argument, at [sp] after the return
+    f[9] = 0
+    return vecs - 8 - 32
+
+
+def _basename(path: Ptr[uint8]) -> Ptr[uint8]:
+    n: uint32 = 0
+    last: uint32 = 0
+    while path[n] != 0:
+        if path[n] == 47:
+            last = n + 1
+        n = n + 1
+    return cast[Ptr[uint8]](cast[uint64](path) + cast[uint64](last))
+
+
+def _adopt(t: Ptr[Thread], img: Ptr[Image]):
+    t[0].stack_top = img[0].stack_top
+    t[0].mem_base = img[0].base
+    t[0].mem_lo = img[0].lo
+    t[0].mem_hi = img[0].hi
+    t[0].mpu_rbar = img[0].rbar
+    t[0].mpu_rasr = img[0].rasr
+
+
+# ---------------------------------------------------------------- spawn
+# Start the program at `path` as a new process with the caller's descriptors,
+# /fd names and directory.  `a` holds its arguments.  Returns the process id
+# or a negative errno.
+def _spawn_args(path: Ptr[uint8], a: Ptr[Args], prio: uint32, flags: uint32) -> int32:
+    img: Image
+    rc: int32 = proc_load(path, &img)
+    if rc < 0:
+        return rc
+    frame: uint32 = _proc_stack(&img, a)
+    if frame == 0:
+        pfree(img.base)
+        return _fail(E2BIG, "exec: arguments do not fit on the program's stack")
+    t: Ptr[Thread] = thread_create_proc(_basename(path), prio, flags)
+    if t == cast[Ptr[Thread]](0):
+        pfree(img.base)
+        return _fail(EAGAIN, "spawn: out of process slots or memory")
+    _adopt(t, &img)
+    # the first switch to the thread pops r4-r11 and returns through the frame
+    rt_memset(cast[uint64](frame - 32), 0, 32)
+    t[0].sp = frame - 32
+    proc_spawned = proc_spawned + 1
+    pid: int32 = cast[int32](t[0].tid)
+    thread_start(t)
+    return pid
+
+
+# Kernel-side spawn: argv is an array of `argc` string pointers (8-byte
+# entries).  Used to start the first process and by the tests.
+def proc_spawn(path: Ptr[uint8], argc: uint32, argv: Ptr[uint64], prio: uint32) -> int32:
+    a: Args
+    a.buf = kmalloc(cast[uint64](PROC_ARG_MAX))
+    if a.buf == 0:
+        return _fail(ENOMEM, "spawn: out of memory")
+    a.len = 0
+    a.argc = 0
+    a.envc = 0
+    rc: int32 = 0
+    i: uint32 = 0
+    while i < argc and rc == 0:
+        rc = _args_add(&a, cast[Ptr[uint8]](argv[i]))
+        i = i + 1
+    if rc != 0:
+        rc = _fail(E2BIG, "spawn: argument list too long")
+    else:
+        a.argc = argc
+        rc = _spawn_args(path, &a, prio, 0)
+    kfree(a.buf)
+    return rc
+
+
+# The system call: spawn(path, argv) from a process or an in-image thread.
+def proc_sys_spawn(path: Ptr[uint8], argv: uint64) -> int32:
+    a: Args
+    a.buf = kmalloc(cast[uint64](PROC_ARG_MAX))
+    if a.buf == 0:
+        return _fail(ENOMEM, "spawn: out of memory")
+    a.len = 0
+    a.argc = 0
+    a.envc = 0
+    rc: int32 = _args_vec(&a, argv)
+    if rc == EFAULT:
+        rc = _fail(EFAULT, "bad address")
+    elif rc < 0:
+        rc = _fail(E2BIG, "spawn: argument list too long")
+    else:
+        a.argc = cast[uint32](rc)
+        rc = _spawn_args(path, &a, current_thread()[0].base_prio, 0)
+    kfree(a.buf)
+    return rc
+
+
+# ---------------------------------------------------------------- exec
+# Replace the calling process's program.  On success the caller's system
+# call returns into the new program (the dispatcher writes no result then);
+# on failure a negative errno, and nothing has changed.
+
+
+def proc_exec(path: Ptr[uint8], argv: uint64, envp: uint64) -> int32:
+    t: Ptr[Thread] = current_thread()
+    if (t[0].flags & TF_PROC) == 0 or t[0].svc_ctrl == 0:
+        return _fail(EINVAL, "exec: only a process can exec")
+    a: Args
+    a.buf = kmalloc(cast[uint64](PROC_ARG_MAX))
+    if a.buf == 0:
+        return _fail(ENOMEM, "exec: out of memory")
+    a.len = 0
+    a.argc = 0
+    a.envc = 0
+    rc: int32 = _args_vec(&a, argv)
+    if rc >= 0:
+        a.argc = cast[uint32](rc)
+        rc = _args_vec(&a, envp)
+        if rc >= 0:
+            a.envc = cast[uint32](rc)
+    if rc == EFAULT:
+        kfree(a.buf)
+        return _fail(EFAULT, "bad address")
+    if rc < 0:
+        kfree(a.buf)
+        return _fail(E2BIG, "exec: argument list too long")
+    name: Array[16, uint8]
+    bn: Ptr[uint8] = _basename(path)
+    i: uint32 = 0
+    while i < 15 and bn[i] != 0:
+        name[i] = bn[i]
+        i = i + 1
+    name[i] = 0
+    img: Image
+    rc = proc_load(path, &img)
+    if rc < 0:
+        kfree(a.buf)
+        return rc
+    frame: uint32 = _proc_stack(&img, &a)
+    kfree(a.buf)
+    if frame == 0:
+        pfree(img.base)
+        return _fail(E2BIG, "exec: arguments do not fit on the program's stack")
+    # Point of no return.  From here the caller's old memory is not touched
+    # again: the path and the arguments have been copied.
+    old: uint64 = t[0].mem_base
+    irq: uint32 = cpu_irq_save()
+    _adopt(t, &img)
+    t[0].usp = frame                    # svc #1 returns through this frame
+    t[0].svc_exc = 0xFFFFFFFD           # thread mode, process stack, no FP context
+    t[0].svc_ctrl = 1
+    was_vfork: uint32 = t[0].pflags & PF_VFORK
+    t[0].pflags = (t[0].pflags & (0xFFFFFFFF ^ PF_VFORK)) | PF_VFDONE
+    sched_mpu_apply(cast[uint64](t))
+    cpu_irq_restore(irq)
+    thread_set_name(t, &name[0])
+    if old != 0:
+        pfree(old)
+    proc_execs = proc_execs + 1
+    if was_vfork != 0:
+        # let the parent out of rfork, then wait for it to give up the
+        # processor (see the note at the top)
+        irq = cpu_irq_save()
+        par: Ptr[Thread] = thread_by_tid(t[0].ppid)
+        if t[0].ppid != 0 and par != cast[Ptr[Thread]](0):
+            wq_wake_all(&par[0].vf_wq)
+            t[0].pflags = t[0].pflags | PF_HELD
+            par[0].held_children = par[0].held_children + 1
+            while (t[0].pflags & PF_HELD) != 0:
+                wq_wait(&t[0].hold_wq, WAIT_FOREVER)
+        cpu_irq_restore(irq)
+    return 0
+
+
+# The calling process is about to give up the processor (it yields, waits,
+# sleeps, reads or ends): its held children may run now.
+def proc_release_held():
+    me: Ptr[Thread] = current_thread()
+    if me[0].held_children == 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        c: Ptr[Thread] = &threads[i]
+        if c[0].state != T_UNUSED and c[0].ppid == me[0].tid and (c[0].pflags & PF_HELD) != 0:
+            c[0].pflags = c[0].pflags & (0xFFFFFFFF ^ PF_HELD)
+            wq_wake_all(&c[0].hold_wq)
+        i = i + 1
+    me[0].held_children = 0
+    cpu_irq_restore(irq)
+
+
+# ---------------------------------------------------------------- rfork
+# rfork(RFPROC [| RFNOWAIT | other bits, ignored]): vfork.  Returns the
+# child's id to the parent once the child has exec'ed or ended; the child
+# continues from the same system call with the result 0, on the parent's
+# memory.  Descriptors and /fd names are always copied (RFFDG and RFNAMEG
+# are what Hamnix's callers pass; sharing them is not offered).
+def proc_rfork(flags: uint32) -> int32:
+    p: Ptr[Thread] = current_thread()
+    if (flags & RFPROC) == 0:
+        return _fail(EINVAL, "rfork: only RFPROC is supported (no namespace to change)")
+    if (p[0].flags & TF_PROC) == 0 or p[0].svc_ctrl == 0 or p[0].usp == 0:
+        return _fail(EINVAL, "rfork: only a process can fork")
+    if (p[0].pflags & PF_VFORK) != 0:
+        return _fail(EAGAIN, "rfork: a child that has not exec'ed cannot fork")
+    proc_release_held()
+    frame: uint32 = p[0].usp
+    fp: uint32 = 0
+    if (p[0].svc_exc & 0x10) == 0:
+        fp = 1
+    # The child's saved context goes right below the parent's frame:
+    # r4-r11, then d8-d15 if there is an FP context.
+    csp: uint32 = frame - 32 - fp * 64
+    if csp < p[0].mem_lo + 64 or frame >= p[0].mem_hi:
+        return _fail(ENOMEM, "rfork: no room on the stack")
+    # The parent's stack, from the frame to the top of the stack area, is
+    # saved here and put back when the parent resumes.
+    top: uint32 = p[0].stack_top
+    if top <= frame:
+        return _fail(EINVAL, "rfork: the caller is not running on its own stack")
+    slen: uint32 = top - frame
+    snap: uint64 = kmalloc(cast[uint64](slen))
+    if snap == 0:
+        return _fail(ENOMEM, "rfork: out of memory for the stack copy")
+    dflag: uint32 = 0
+    if (flags & RFNOWAIT) != 0:
+        dflag = TF_DETACHED
+    c: Ptr[Thread] = thread_create_proc(&p[0].name[0], p[0].base_prio, dflag)
+    if c == cast[Ptr[Thread]](0):
+        kfree(snap)
+        return _fail(EAGAIN, "rfork: out of process slots or memory")
+    rt_memcpy(snap, cast[uint64](frame), cast[uint64](slen))
+    c[0].mem_base = 0                   # borrowed, never freed by the child
+    c[0].mem_lo = p[0].mem_lo
+    c[0].mem_hi = p[0].mem_hi
+    c[0].mpu_rbar = p[0].mpu_rbar
+    c[0].mpu_rasr = p[0].mpu_rasr
+    c[0].stack_top = p[0].stack_top
+    c[0].pgid = p[0].pgid
+    c[0].pflags = PF_VFORK
+    rt_memcpy(cast[uint64](csp), cast[uint64](&p[0].svc_regs[0]), 32)
+    if fp != 0:
+        rt_memcpy(cast[uint64](csp + 32), cast[uint64](p[0].kstack_top - 64), 64)
+    f: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](frame))
+    f[0] = 0                            # the child's result: 0
+    f[1] = 0
+    c[0].sp = csp
+    c[0].exc_return = p[0].svc_exc
+    c[0].control = 1
+    proc_spawned = proc_spawned + 1
+    ctid: uint32 = c[0].tid
+    thread_start(c)
+    irq: uint32 = cpu_irq_save()
+    while c[0].state != T_UNUSED and c[0].tid == ctid and (c[0].pflags & PF_VFDONE) == 0:
+        wq_wait(&p[0].vf_wq, WAIT_FOREVER)
+    cpu_irq_restore(irq)
+    rt_memcpy(cast[uint64](frame), snap, cast[uint64](slen))
+    kfree(snap)
+    return cast[int32](ctid)
+
+
+# ---------------------------------------------------------------- wait
+# waitpid(pid, flags): the exit code of process `pid` once it has ended, and
+# the process is gone.  flags bit 0 (WNOHANG): -EAGAIN instead of waiting.
+# -ECHILD when there is no such process (or it is detached, or the caller).
+def proc_waitpid(pid: int32, flags: uint32) -> int64:
+    code: int64 = 0
+    rc: int32 = thread_wait(cast[uint32](pid), flags & 1, &code)
+    if rc == -11:
+        return cast[int64](EAGAIN)
+    if rc != 0:
+        set_current_errstr("wait: no such child")
+        return cast[int64](ECHILD)
+    return code
+
+
+# waitpid_jc(pid, status): never waits.  pid when the process has ended
+# (status = (code & 0xFF) << 8 | 1, and it is gone), 0 while it runs,
+# -ECHILD for an unknown pid.  Stopped and continued states do not exist.
+def proc_waitpid_jc(pid: int32, status: Ptr[int64]) -> int64:
+    code: int64 = 0
+    rc: int32 = thread_wait(cast[uint32](pid), 1, &code)
+    if rc == -11:
+        return 0
+    if rc != 0:
+        set_current_errstr("waitjc: no such child")
+        return cast[int64](ECHILD)
+    if status != cast[Ptr[int64]](0):
+        status[0] = ((code & 0xFF) << 8) | 1
+    return cast[int64](pid)
