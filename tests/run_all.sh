@@ -185,6 +185,14 @@ if [ -n "$cyc" ]; then
 else
     bad "no benchmark line"
 fi
+cyc="$(sed -n 's/^BENCH system call: \([0-9]*\) calls in \([0-9]*\) timer cycles (thread start and exit alone: \([0-9]*\)).*/\1 \2 \3/p' $B/ktest.txt)"
+if [ -n "$cyc" ]; then
+    set -- $cyc
+    echo "[test] info: $(( ($2 - $3) * 40 / 32 / $1 )) instructions per system-call round trip (gettid from an unprivileged thread, $1 calls)"
+    ok "system-call benchmark ran"
+else
+    bad "no system-call benchmark line"
+fi
 
 echo "[test] === 6. monitor session over the UART (real-time clock, commands typed by the harness)"
 qemu_start $B/hackos.elf $B/monitor.out

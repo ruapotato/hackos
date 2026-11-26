@@ -25,7 +25,7 @@ from mm.heap import Heap, heap_free, heap_check, heap_free_blocks, heap_largest_
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_mkdir, vfs_unlink, vfs_rename, vfs_open_stdio, vfs_open_count, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, OAPPEND
 from drivers.tty.console import console_rx_enable, console_input, console_set_mode, console_read, con_rx_bytes, con_rx_dropped, con_rx_irqs, CON_RAW, CON_COOKED
 from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf, fault_badsvc
-from tests.kt_user import stress_mix, u_stress, u_fphold, u_syscalls, u_child, f64_bits
+from tests.kt_user import stress_mix, u_stress, u_fphold, u_syscalls, u_child, f64_bits, u_bench_sys, u_bench_loop
 
 from tests.kt_cinterop import ci_scalars, ci_callback, ci_structs, ci_sht_serial, ci_sht_measure, ci_sht_negative, ci_sht_errors, ci_dt, ci_t, ci_rh, fk_writes, fk_reads
 from drivers.i2c.sensirion_hal import hal_calls
@@ -936,9 +936,9 @@ def cycles_now() -> uint64:
 
 def bench_switch():
     # Two threads that only yield to each other: 2 x N switches.  The figure is
-    # CPU-clock cycles of the emulated 25 MHz timer; under `-icount shift=0`
-    # QEMU advances that clock 1 ns per instruction, i.e. 40 instructions per
-    # cycle (see `make measure-switch`).  Without -icount it is only wall time.
+    # cycles of the emulated 25 MHz timer (40 ns).  The harness runs QEMU with
+    # -icount shift=5, which advances the clock 32 ns per instruction, so
+    # instructions = cycles * 40 / 32.  Without -icount it is only wall time.
     c0: uint64 = cycles_now()
     sw0: uint64 = sched_switches
     a: uint32 = spawn("ping", cast[uint64](&w_ping), 2000, 4, 0)
@@ -946,7 +946,16 @@ def bench_switch():
     join(a)
     join(b)
     c1: uint64 = cycles_now()
-    printk3("BENCH yield ping-pong: %d context switches in %d timer cycles (x40 = instructions under -icount shift=0)\n", sched_switches - sw0, c1 - c0, 0)
+    printk3("BENCH yield ping-pong: %d context switches in %d timer cycles\n", sched_switches - sw0, c1 - c0, 0)
+    # 4000 system calls from an unprivileged thread, against the same thread
+    # start/exit overhead without them.
+    c0 = cycles_now()
+    join(spawn("sysbench", cast[uint64](&u_bench_sys), 4000, 3, TF_USER))
+    c1 = cycles_now()
+    join(spawn("sysbase", cast[uint64](&u_bench_sys), 0, 3, TF_USER))
+    c2: uint64 = cycles_now()
+    printk3("BENCH system call: %d calls in %d timer cycles (thread start and exit alone: %d)\n", 4000, c1 - c0, c2 - c1)
+    printk2("BENCH sizes: Thread %d bytes, %d thread slots\n", sizeof(Thread), cast[uint64](THREAD_MAX))
 
 
 def runner(arg: uint64) -> int64:
