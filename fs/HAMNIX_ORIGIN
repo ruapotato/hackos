@@ -5,9 +5,12 @@
 # the combination.
 #
 # Each copy is the original file with a 3-line "# HackOS: copied from ..."
-# header in front and no other change.  `make test` checks that: the sha256 of
-# each file without its first three lines must equal the value below.  To take
-# a Hamnix fix, copy the new file, keep the header, update commit and hash.
+# header in front.  A copy is otherwise byte-identical, unless a file named
+# <path>.patch sits next to it: that patch (a unified diff with the reason at
+# its top) is then the complete difference.  `make test` checks both cases:
+# the copy minus its header, with the patch reverse-applied if there is one,
+# must have the sha256 below.  To take a Hamnix fix, copy the new file, keep
+# the header, re-apply the patch, update commit and hash.
 #
 # sha256 of the original                                            path
 d62d59631138e21d0d6059d8d58b59305609938c51fcb4e89ad6b455ca354989  fs/tmpfs.ad

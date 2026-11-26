@@ -79,19 +79,27 @@ else
     bad "compiler regression test (see $B/compiler_test.log)"; grep -v '   ok:' $B/compiler_test.log
 fi
 
-echo "[test] === 2. files copied from Hamnix are unmodified (fs/HAMNIX_ORIGIN)"
-ncopies=0
+echo "[test] === 2. files copied from Hamnix are unmodified, or differ only by a recorded patch (fs/HAMNIX_ORIGIN)"
+ncopies=0; npatched=0
 while read -r sum path; do
     case "$sum" in \#*|"") continue;; esac
     ncopies=$((ncopies+1))
-    have="$(tail -n +4 "$path" | sha256sum | cut -d' ' -f1)"
-    if [ "$have" = "$sum" ] && head -1 "$path" | grep -q '^# HackOS: copied from Hamnix'; then
-        ok "$path matches its Hamnix original"
+    head -1 "$path" | grep -q '^# HackOS: copied from Hamnix' || { bad "$path has no origin header"; continue; }
+    if [ -f "$path.patch" ]; then
+        # the copy minus its header, with the recorded patch taken out again,
+        # must be the Hamnix original
+        npatched=$((npatched+1))
+        tail -n +4 "$path" > $B/origin_check.tmp
+        have="$(patch -R -s -o - $B/origin_check.tmp "$path.patch" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+        nlines="$(grep -c '^[-+][^-+]' "$path.patch")"
+        [ "$have" = "$sum" ] && ok "$path is its Hamnix original plus $path.patch ($nlines changed lines)" \
+            || bad "$path is not its Hamnix original plus $path.patch"
     else
-        bad "$path differs from the recorded Hamnix original"
+        have="$(tail -n +4 "$path" | sha256sum | cut -d' ' -f1)"
+        [ "$have" = "$sum" ] && ok "$path matches its Hamnix original" || bad "$path differs from the recorded Hamnix original"
     fi
 done < fs/HAMNIX_ORIGIN
-[ "$ncopies" = 4 ] && ok "4 copied files listed" || bad "$ncopies copied files listed, expected 4"
+[ "$ncopies" -ge 4 ] && ok "$ncopies copied files listed, $npatched of them with a patch file" || bad "$ncopies copied files listed, expected at least 4"
 
 echo "[test] === 2b. third-party C code is unmodified, and C and Adder only meet through extern \"C\""
 nthird=0
