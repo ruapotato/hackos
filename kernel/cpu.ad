@@ -2,16 +2,35 @@
 # Copyright (C) 2026 David Hamner
 # HackOS -- Cortex-M7 core access from Adder.
 #
-# Inline assembly on the thumbv7em target is `asm_volatile("...")`: the text is
-# passed to the assembler verbatim; it takes no operands.  The compiler tells
-# LLVM the statement clobbers r0-r3, r12, lr, flags and memory, so a body may
-# use those as scratch and must preserve r4-r11, sp and the FP registers.
-# Values are exchanged with Adder through globals, addressed with
-# movw/movt (no literal pool is needed).
+# Special registers are read and written by the leaf routines in
+# arch/armv7m/cpu.S.  Adder's inline assembly takes no operands, so a value
+# could only leave an `asm_volatile` body through a global, and that is not
+# re-entrant (an interrupt between the store and the load corrupts the result).
+# RULE for kernel code: `asm_volatile` may be used only for instructions that
+# exchange no value with Adder (cpsid, cpsie, wfi, svc, udf, bkpt with fixed
+# registers); anything that produces or consumes a value goes through cpu.S.
 
-# Scratch cells for the inline-asm bodies below.  `volatile` because they are
-# written behind the compiler's back.
-cpu_reg_scratch: volatile uint32 = 0
+# Interrupts with a priority value >= KERNEL_BASEPRI may use kernel services
+# and are masked by a critical section; 0x00..0x3F stay enabled and must not
+# touch kernel data.  Keep in step with arch/armv7m/cpu.S and switch.S.
+KERNEL_BASEPRI: uint32 = 0x40
+
+# Critical sections: prev = cpu_irq_save() ... cpu_irq_restore(prev).  Nestable.
+extern def cpu_irq_save() -> uint32
+extern def cpu_irq_restore(prev: uint32)
+extern def cpu_basepri() -> uint32
+extern def cpu_set_basepri(v: uint32)
+extern def cpu_primask() -> uint32
+# Interrupt Program Status Register: 0 in thread mode, else the active
+# exception number (15 = SysTick, 11 = SVCall, ...).
+extern def cpu_ipsr() -> uint32
+extern def cpu_control() -> uint32
+extern def cpu_psp() -> uint32
+extern def cpu_set_psp(v: uint32)
+extern def cpu_msp() -> uint32
+extern def cpu_sp() -> uint32
+extern def cpu_wfi()
+extern def cpu_isb()
 
 
 def cpu_irq_disable():
@@ -23,35 +42,7 @@ def cpu_irq_enable():
 
 
 def cpu_wait_for_interrupt():
-    asm_volatile("wfi")
-
-
-def cpu_primask() -> uint32:
-    asm_volatile("mrs r0, primask\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
-    return cpu_reg_scratch
-
-
-# Interrupt Program Status Register: 0 in thread mode, else the active
-# exception number (15 = SysTick, 11 = SVCall, ...).
-def cpu_ipsr() -> uint32:
-    asm_volatile("mrs r0, ipsr\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
-    return cpu_reg_scratch
-
-
-def cpu_control() -> uint32:
-    asm_volatile("mrs r0, control\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
-    return cpu_reg_scratch
-
-
-# BASEPRI := v (priority mask; 0 = no masking).
-def cpu_set_basepri(v: uint32):
-    cpu_reg_scratch = v
-    asm_volatile("movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n ldr r0, [r1]\n msr basepri, r0")
-
-
-def cpu_basepri() -> uint32:
-    asm_volatile("mrs r0, basepri\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
-    return cpu_reg_scratch
+    cpu_wfi()
 
 
 # 32-bit memory-mapped register access.  The pointee type is `volatile`, so
@@ -63,3 +54,7 @@ def mmio_read32(addr: uint64) -> uint32:
 
 def mmio_write32(addr: uint64, v: uint32):
     cast[Ptr[volatile uint32]](addr)[0] = v
+
+
+def mmio_write8(addr: uint64, v: uint32):
+    cast[Ptr[volatile uint8]](addr)[0] = cast[uint8](v)

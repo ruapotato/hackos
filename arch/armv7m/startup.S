@@ -28,9 +28,29 @@
         .thumb
 
 /* ------------------------------------------------------------------ */
-/* 1. Vector table                                                    */
+/* 1. Vector tables                                                   */
 /* ------------------------------------------------------------------ */
+/* Address 0 holds only what reset needs: the core reads the initial MSP and
+ * the reset vector from there before any code runs.  The rest of the first
+ * 4 KB of the image is empty and becomes an MPU no-access region (the null
+ * pointer guard, kernel/mpu.ad), so the real vector table lives behind it and
+ * hackos_start() points VTOR at it.  Until then interrupts are masked; a fault
+ * that early still finds a handler through the copies below.              */
+        .section .boot_vectors, "a", %progbits
+        .global hackos_boot_vectors
+        .type hackos_boot_vectors, %object
+hackos_boot_vectors:
+        .word   __stack_top             /*  0 initial MSP                 */
+        .word   Reset_Handler           /*  1 reset                       */
+        .word   nmi_handler             /*  2 NMI                         */
+        .word   HardFault_Handler       /*  3                             */
+        .word   MemManage_Handler       /*  4                             */
+        .word   BusFault_Handler        /*  5                             */
+        .word   UsageFault_Handler      /*  6                             */
+        .size hackos_boot_vectors, . - hackos_boot_vectors
+
         .section .vectors, "a", %progbits
+        .balign 128                     /* VTOR bits [6:0] are zero       */
         .global hackos_vectors
         .type hackos_vectors, %object
 hackos_vectors:
@@ -42,12 +62,13 @@ hackos_vectors:
         .word   BusFault_Handler        /*  5                             */
         .word   UsageFault_Handler      /*  6                             */
         .word   0, 0, 0, 0              /*  7..10 reserved                */
-        .word   svc_handler             /* 11 SVCall     (Adder, weak)    */
+        .word   svc_handler             /* 11 SVCall     (weak)           */
         .word   debugmon_handler        /* 12                             */
         .word   0                       /* 13 reserved                    */
-        .word   pendsv_handler          /* 14 PendSV     (Adder, weak)    */
+        .word   pendsv_handler          /* 14 PendSV     (weak)           */
         .word   systick_handler         /* 15 SysTick    (Adder, weak)    */
-        .rept   32                      /* 16.. external interrupts 0..31 */
+        .word   uart0_rx_handler        /* 16 IRQ 0: UART0 receive (weak) */
+        .rept   31                      /* 17.. external interrupts 1..31 */
         .word   irq_default_handler
         .endr
         .size hackos_vectors, . - hackos_vectors
@@ -75,6 +96,7 @@ hackos_vectors:
         weak_handler pendsv_handler, 14
         weak_handler systick_handler, 15
         weak_handler irq_default_handler, 16
+        weak_handler uart0_rx_handler, 16
 
 /* ------------------------------------------------------------------ */
 /* 2. Reset stub                                                      */
@@ -121,11 +143,46 @@ Reset_Handler:
         fault_handler BusFault_Handler, 5
         fault_handler UsageFault_Handler, 6
 
+/* A kernel may define hackos_thread_fault(kind, frame, exc_return) -> uint64
+ * in Adder.  It is offered every fault that was taken from THREAD mode on the
+ * PROCESS stack: the handler stack is intact in that case, so the kernel can
+ * end the offending thread and carry on.  Returning 0 means "handled, return
+ * from the exception" (the kernel has made another thread runnable and pended
+ * PendSV); anything else falls through to the fatal report.  Without a kernel
+ * the weak default below declines everything.                              */
+        .section .text.hackos_thread_fault, "ax", %progbits
+        .weak   hackos_thread_fault
+        .thumb_func
+        .type   hackos_thread_fault, %function
+hackos_thread_fault:
+        movs    r0, #1
+        movs    r1, #0
+        bx      lr
+        .size   hackos_thread_fault, . - hackos_thread_fault
+
         .section .text.hackos_fault_entry, "ax", %progbits
+        .global hackos_fault_entry
         .thumb_func
         .type   hackos_fault_entry, %function
 hackos_fault_entry:
-        cpsid   i
+        and     r1, lr, #0xC            /* EXC_RETURN: thread mode + PSP?  */
+        cmp     r1, #0xC
+        bne     2f
+        push    {r0, lr}                /* kind, EXC_RETURN                */
+        mov     r12, lr
+        movs    r1, #0                  /* arg0 = kind (r0:r1)             */
+        mrs     r2, psp                 /* arg1 = stacked frame (r2:r3)    */
+        movs    r3, #0
+        sub     sp, #8
+        str     r12, [sp]               /* arg2 = EXC_RETURN (stack, 64b)  */
+        str     r3, [sp, #4]
+        bl      hackos_thread_fault
+        add     sp, #8
+        cmp     r0, #0
+        pop     {r0, lr}
+        it      eq
+        bxeq    lr                      /* handled: PendSV takes over      */
+2:      cpsid   i
         movs    r1, #0                  /* arg0 = kind (r0:r1)             */
         tst     lr, #4                  /* EXC_RETURN bit 2: 0=MSP 1=PSP   */
         ite     eq
