@@ -1,0 +1,16 @@
+# Files in this tree that are copies of Hamnix sources.
+# Origin: https://github.com/HamnixOS/Hamnix (read from a local checkout),
+# commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9, licence GPL-3.0-or-later,
+# Copyright David Hamner.  HackOS is AGPL-3.0-or-later; GPLv3 section 13 allows
+# the combination.
+#
+# Each copy is the original file with a 3-line "# HackOS: copied from ..."
+# header in front and no other change.  `make test` checks that: the sha256 of
+# each file without its first three lines must equal the value below.  To take
+# a Hamnix fix, copy the new file, keep the header, update commit and hash.
+#
+# sha256 of the original                                            path
+d62d59631138e21d0d6059d8d58b59305609938c51fcb4e89ad6b455ca354989  fs/tmpfs.ad
+2329fecb449d9a9726b7dd6a12598662c17caff45de20f33aa77fe012b00c0a9  fs/vfs_mount.ad
+e8a51b3d9aaca88fb224f72bc8543a96a7163fb9253173511ad1607cfc376ac2  lib/p9dir.ad
+e1058e80bd19ffa153684a4ba904569e7386d3b447c3b478e2506ee8796e36f4  lib/9p/9p.ad

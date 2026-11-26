@@ -1,0 +1,2213 @@
+# HackOS: copied from Hamnix fs/tmpfs.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
+# see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
+# fs/tmpfs.ad
+#
+# In-memory writable filesystem — Hamnix's tmpfs. Backs any path
+# under /tmp/ with a fixed-capacity kmalloc'd buffer per file. Entries
+# persist across opens, so:
+#
+#     /echo hello > /tmp/x
+#     /cat /tmp/x          → "hello\n"
+#
+# works the way the user expects.
+#
+# V1 (nested dirs): tmpfs is now a real tree, not a flat name table.
+# Each entry has a `kind` (0 = file, 1 = directory) and a
+# `parent_idx` (the slot index of the containing directory, or -1 for
+# a synthetic mount root). `name` holds a SINGLE path component, not
+# the whole absolute path. Path lookup walks component-by-component
+# from the root, matching `name` within the current parent. So:
+#
+#     mkdir /tmp/a
+#     mkdir /tmp/a/b
+#     /echo hi > /tmp/a/b/hello
+#     /cat /tmp/a/b/hello   → "hi\n"
+#
+# all work. `/tmp/foo` is just a file whose parent is the root dir —
+# the flat case is the depth-1 special case of the tree.
+#
+# V2 (/var): this single tmpfs instance now owns TWO writable subtrees,
+# /tmp/* AND /var/*. Rather than a second tmpfs instance plus a second
+# VFS mount route, the cleaner fit for Hamnix's prefix-keyed dispatch
+# (vfs.ad just calls is_tmpfs_path / is_tmpfs_dir_path) is to give the
+# ONE tmpfs two synthetic mount roots. Slot 0 is the /tmp root; slot 1
+# is the /var root. Both have parent_idx = -1, kind = directory. Every
+# entry's parent chain terminates at whichever root it belongs to, so
+# /tmp and /var are sibling forests in the same slot table that never
+# alias each other. /var contents are RAM-backed and volatile (lost on
+# reboot) — correct for a cache, and a real-disk-backed /var is a later
+# concern. The standard /var skeleton (/var/lib/dpkg, /var/cache/apt,
+# /var/www, ...) is pre-created at boot by tmpfs_var_skeleton_init().
+#
+# Slot 0 / slot 1 are reserved as the synthetic /tmp and /var root
+# directories (parent_idx = -1, kind = 1). They are created lazily by
+# _tmpfs_ensure_root() the first time any tmpfs entry point runs, so
+# there is no ordering dependency on vfs_init().
+#
+# Caps (V2):
+#   TMPFS_MAX_FILES   = 8192   total entries (files + directories), incl.
+#                              the two reserved roots → 8190 usable.
+#   TMPFS_CHUNK_SIZE  = 65536  one storage chunk (64 KiB).
+#   TMPFS_MAX_CHUNKS  = 256    chunks per file (16 MiB per file cap).
+#   TMPFS_FILE_CAP    = TMPFS_CHUNK_SIZE * TMPFS_MAX_CHUNKS = 16 MiB.
+#   TMPFS_NAME_LEN    = 32     bytes per path COMPONENT (NUL-terminated).
+#                              Full absolute paths may be longer; only a
+#                              single component between two '/' is capped.
+#
+# V2 (chunked storage): a file's bytes are stored in a *chain of 64 KiB
+# chunks* rather than one fixed-size allocation. `TmpfsEntry.data` now
+# points to a kmalloc'd chunk-pointer table (Array[TMPFS_MAX_CHUNKS,
+# uint64]); each entry is either 0 (chunk not yet materialised) or the
+# kmalloc'd address of one 64 KiB chunk. The chunk table itself is
+# allocated lazily on the first write to a file; each chunk is also
+# allocated lazily, so a small file pays at most one chunk-table (2 KiB)
+# + one 64 KiB chunk. The lifted per-file cap (was 512 KiB) is the fix
+# that lets dpkg unpack real Debian packages — e.g. `gcc-14-base`'s
+# 552 KiB copyright doc and `libc6`'s ~3 MiB binary used to truncate
+# under the single-allocation 512 KiB cap.
+#
+# When the chunk chain cannot be extended (out of chunks in the
+# TMPFS_MAX_CHUNKS table, or kmalloc fails), `tmpfs_write` short-writes
+# — the caller's `_write_full` loop sees a sub-count return, the next
+# attempt past the cap returns 0, and the calling user code surfaces a
+# short-write error rather than silently truncating. The contract was
+# already there before chunking; what changed is that the cap is now
+# 16 MiB per file (real Debian package range) rather than 512 KiB.
+#
+# WHY 8192 SLOTS (was 64 → 256 → 1024 → 8192): the `#t` tmpfs is SHARED
+# system-wide (DE + every `spawn linux` app + apt/dpkg). A real Firefox at
+# -m 6G creates hundreds of /tmp + profile/cache entries on top of the DE's,
+# and 1024 total slots ran out mid-startup → an intermittent `mkdir` ENOSPC
+# on the throwaway profile dirs (the "per-spawn inconsistent" mkdir failure),
+# which aborts Firefox's font-init worker and wedges startup. 8192 gives real
+# headroom for a browser-class client sharing tmpfs with the desktop.
+# Historical motivations preserved below:
+# (was 64 → 256 → 1024): two motivations.
+# (1) a live `apt update` of Debian stable/main/binary-amd64 inflates
+# to ~56 MiB across 68,755 packages, persisted as ~114 shard-related
+# entries (256 was sized to fit). (2) the post-split installer drives
+# `hpm install hamnix-base` (a metapackage pulling ~16 components) at
+# install time with `--target-prefix=/tmp/newroot/`, so the whole OS
+# closure (~150 files + ~10 dirs across init / hamsh / coreutils /
+# net / sshd / hpm / fs-tools / drivers / installer-tools) lands in
+# tmpfs in one shot. 256 ran out at the coreutils boundary
+# (`hpm: cannot create /tmp/newroot/bin/whoami`). 1024 gives ~8x
+# headroom for future growth in the component count.
+# A slot itself is only ~64 bytes of BSS (TmpfsEntry) so 768 extra
+# slots cost ~48 KiB of zero-init BSS, the kmalloc'd backing buffer
+# is still lazy-allocated per slot.
+#
+# Not in V1: O_APPEND, rename of directories with children moved,
+# hard links, permissions/ownership, mmap of tmpfs files. The backing
+# buffer of an unlinked file is deliberately NOT kfreed (reused on the
+# next create into the same slot) — see tmpfs_unlink.
+
+from mm.slab import kmalloc, kfree, km_set_site, KM_SITE_TMPFS
+# §shared-mmap coherence: tmpfs DATA chunks are allocated PAGE-ALIGNED via
+# the buddy allocator (alloc_pages) — NOT kmalloc, whose large path returns
+# base+8 — so a MAP_SHARED writable mmap of a tmpfs file can map the chunk's
+# physical pages DIRECTLY into user space. A store through the mapping then
+# lands in the SAME physical page tmpfs_read()/tmpfs_write() touch, giving
+# genuine POSIX MAP_SHARED page coherence (apt writes its pkgcache through
+# the mapping and read()s it back without msync). The chunk-pointer TABLE
+# stays kmalloc'd (it is never mapped to user space). TMPFS_CHUNK_SIZE
+# (64 KiB) is order-4 — comfortably within MAX_ORDER.
+from mm.page_alloc import alloc_pages, free_pages, pa_set_site, PA_SITE_TMPFS
+from kernel.printk.printk import printk0, printk1
+from kernel.sched.core import set_current_errstr, current_task_uid
+# §stat-mtime: tmpfs files carry a STABLE stored mtime (Unix epoch
+# seconds) stamped at creation and refreshed only on a real content
+# change (write / truncate / rename). The RTC is the wall-clock source,
+# shared with ext4's _ext4_now_epoch. WHY THIS MATTERS: without a stored
+# mtime the stat path reported get_jiffies()/100 — an EVER-ADVANCING
+# value, so two stats of the SAME unchanged file returned DIFFERENT
+# mtimes. apt records the Packages list file's mtime in pkgcache.bin on
+# `apt-get update`; a later `apt-get install` re-stats it, sees a newer
+# mtime, judges the index file stale, and DROPS it as a download source
+# -> "Can't find a source to download version". A stable mtime fixes the
+# cross-invocation index<->source binding.
+from drivers.rtc.cmos import rtc_read_unix_time
+# Per-backend errstr: tmpfs failure sites pass a literal "tmpfs: <reason>"
+# to set_current_errstr so SYS_ERRSTR consumers (errstr(2), userland
+# perror) can identify the failing backend.
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+
+# §SMP coherence: a single global lock serialising tmpfs CHUNK + chunk-
+# table allocation. Without it two CPUs faulting the SAME tmpfs file
+# offset concurrently (a MAP_SHARED writer + reader, or two mmap faults)
+# could each see table[idx]==0, each alloc_pages a DIFFERENT chunk, and
+# each write table[idx] — so the two mappings resolve the same file
+# offset to DIFFERENT physical pages: incoherent, and the loser leaks.
+# apt hit this as a non-deterministic NX-exec / NULL-deref into its
+# mmap'd pkgcache under -smp 2. _tmpfs_get_chunk's allocate-and-publish
+# step now runs under this lock so a concurrent fault observes the
+# winner's published chunk.
+tmpfs_chunk_lock: uint32
+
+
+# F10-2 #455: server-boundary perm policy for the `#t` tmpfs server.
+# v1 tmpfs doesn't track per-file owners (every node is hostowner-owned
+# by construction), so world-r/w is the only defensible policy that
+# doesn't break the /tmp and /var contract. A tighter policy is a
+# future tmpfs-side change (when we plumb owner/mode through TmpfsEntry).
+#
+# Numeric contract matches the rest of the perm-check family (PERM_R=4
+# | PERM_W=2 | PERM_X=1, 0=grant, -1=deny). We don't import fs.vfs's
+# constants because the dispatcher imports US.
+def tmpfs_perm_check(name: Ptr[char], want: int32) -> int32:
+    # arch audit §2.2: real per-inode policy. TmpfsEntry now carries
+    # owner_uid + low-9-bit mode set at creation time. The rule:
+    #
+    #   * Hostowner (uid 1) bypasses — same shape as the rest of the
+    #     server-boundary family.
+    #   * If the path resolves to an existing entry, consult its mode
+    #     triple (owner-vs-other; no group enforcement at this milestone)
+    #     against the caller's uid. (No gid plumbing in the perm-check
+    #     family today — group bits go in when devproc plumbs gid.)
+    #   * If the path does NOT resolve (typical for vfs_open_write
+    #     CREATE), grant write under /tmp/* (the sticky world-writable
+    #     scratch), and deny write under /var/* for non-hostowner.
+    #
+    # Reads/exec of a missing path fall through to "grant" so the open
+    # path's own ENOENT can surface — we don't mask a missing-file error
+    # behind EPERM.
+    cu: uint32 = current_task_uid()
+    if cu == 1:
+        return 0
+    # Normalise an `#t<...>` form back to the literal mount path so
+    # _resolve_full's component walker (which expects "/tmp" / "/var"
+    # prefixes) can resolve it.
+    lookup: Ptr[char] = name
+    tmp_scratch: Array[256, uint8]
+    if name[0] == 35 and name[1] == 116:                # "#t"
+        if name[2] == 0:
+            # Bare "#t" — treat as the tmpfs surface root; default-allow
+            # reads, deny writes (a write to the bare server has nowhere
+            # to land).
+            if (want & 2) != 0:
+                return -1
+            return 0
+        # "#t/<rest>" → "/tmp/<rest>" (best-effort; we can't know whether
+        # the user meant /tmp or /var without a hint, and /tmp is the
+        # vastly more common consumer of the `#t` letter).
+        tmp_scratch[0] = 47                              # '/'
+        tmp_scratch[1] = 116                             # 't'
+        tmp_scratch[2] = 109                             # 'm'
+        tmp_scratch[3] = 112                             # 'p'
+        i: uint64 = 2                                    # skip "#t"
+        j: uint64 = 4
+        while name[i] != 0 and j < 255:
+            tmp_scratch[j] = cast[uint8](name[i] & 0xFF)
+            i = i + 1
+            j = j + 1
+        tmp_scratch[j] = 0
+        lookup = cast[Ptr[char]](&tmp_scratch[0])
+    slot: int32 = _resolve_full(lookup)
+    if slot < 0:
+        # Path doesn't exist. For a write/create probe, gate by mount root.
+        if (want & 2) != 0:                          # PERM_W
+            if _is_var_prefix(lookup) != 0:
+                return -1                             # /var is hostowner-only
+            # Also reject the bare "/var" root open-for-write.
+            if lookup[0] == 47 and lookup[1] == 118 and lookup[2] == 97 \
+                    and lookup[3] == 114 and lookup[4] == 0:
+                return -1
+        return 0
+    su: uint64 = cast[uint64](_tmpfs_canon(slot))
+    f_mode: uint32 = tmpfs_table[su].mode & 0x1FF
+    bits: int32 = 0
+    if tmpfs_table[su].owner_uid == cu:
+        bits = cast[int32]((f_mode >> 6) & 0x7)       # owner triple
+    else:
+        bits = cast[int32](f_mode & 0x7)              # other triple
+    if (bits & want) == want:
+        return 0
+    return -1
+
+
+TMPFS_MAX_FILES:  uint64 = 8192
+TMPFS_CHUNK_SIZE: uint64 = 65536              # 64 KiB per storage chunk
+TMPFS_CHUNK_ORDER: int32 = 4                  # 2^4 pages = 16 pages = 64 KiB
+TMPFS_MAX_CHUNKS: uint64 = 8192               # max chunks per file
+# BACKED-STORAGE cap: the highest file offset that can hold a real chunk
+# (= CHUNK_SIZE * MAX_CHUNKS = 512 MiB). Was 64 MiB, was 16 MiB. This bounds
+# the per-file chunk-pointer table (TMPFS_MAX_CHUNKS * 8 bytes = 64 KiB,
+# kmalloc'd on demand only for files that hold data — routes to alloc_pages
+# order-5, well under MAX_ORDER=10).
+#
+# §shm-coherence (foot black-window fix): a MAP_SHARED wl_shm pool is written
+# THROUGH the client's mmap and read by the in-kernel compositor via
+# tmpfs_page_phys (wl_shm_read). Coherence REQUIRES both to resolve the same
+# physical page — which only happens on the DIRECT tmpfs fault path
+# (_vma_demand_fault_file_shared), taken solely for offsets that
+# tmpfs_page_phys backs (< FILE_CAP). ABOVE the cap the client's write-fault
+# falls through to the COPY page-cache (a PRIVATE frame) while the compositor
+# still reads tmpfs_page_phys → a ZERO HOLE: the buffer arrives all-black.
+# The prior 64 MiB cap assumed clients "only touch the low few MiB", but foot
+# places its MAIN terminal-content buffer at file-offset 128 MiB (0x8000000)
+# inside its 512 MiB pool (its CSD subsurface pool stays at low offsets, which
+# masked the bug). Backing the whole 512 MiB pool keeps every buffer foot can
+# allocate on the coherent DIRECT path → the content renders instead of black.
+TMPFS_FILE_CAP:   uint64 = 536870912          # = CHUNK_SIZE * MAX_CHUNKS (512 MiB)
+# LOGICAL-SIZE cap: the largest size ftruncate(2) may set and the largest
+# mmap offset range a SPARSE file may span. DECOUPLED from the backed cap
+# above because real wl_shm clients (foot) ftruncate their shm buffer POOL
+# to a generous size (observed: 512 MiB) and rely on LAZY page allocation.
+# tmpfs chunks are already demand-allocated (tmpfs_page_phys /
+# _tmpfs_get_chunk allocate on first touch), so a large logical size costs
+# nothing until pages are written. FILE_CAP (512 MiB) now equals the pool
+# size, so every offset a wl_shm client can sub-allocate gets a real backing
+# chunk on the coherent DIRECT mmap path (see §shm-coherence above); the
+# [FILE_CAP, LOGICAL_CAP) band stays a genuine sparse hole for any file that
+# ftruncates beyond a 512 MiB pool but never writes there.
+# Without this cap, ftruncate(pool, 512 MiB) EINVAL'd and foot abort()ed
+# before committing a single frame. 1 GiB covers any realistic wl_shm pool.
+TMPFS_LOGICAL_CAP: uint64 = 1073741824        # 1 GiB sparse logical ceiling
+TMPFS_NAME_LEN:   uint64 = 256                # NUL-terminated path COMPONENT
+                                              # (Linux NAME_MAX 255 + NUL).
+                                              # Was 32 — too small for real
+                                              # filenames. apt escapes a
+                                              # source URI into a single flat
+                                              # /var/lib/apt/lists/<name>
+                                              # component (e.g.
+                                              # _opt_localrepo_dists_local_main_binary-amd64_Packages
+                                              # = 53 chars), which a 32-byte
+                                              # cap rejected with -ENAMETOOLONG
+                                              # → apt's copy method 400 URI
+                                              # Failure → index Ign'd → package
+                                              # not installable. Must hold a
+                                              # full POSIX NAME_MAX component.
+
+TMPFS_KIND_FILE: uint64 = 0
+TMPFS_KIND_DIR:  uint64 = 1
+TMPFS_KIND_SYMLINK: uint64 = 2        # symlink: `data` holds a kmalloc'd
+                                      # NUL-terminated target string;
+                                      # `size` is its strlen.
+
+TMPFS_ROOT_SLOT: uint64 = 0           # reserved synthetic /tmp root
+TMPFS_VAR_SLOT:  uint64 = 1           # reserved synthetic /var root
+
+# --- generic writable-overlay roots (V3) ----------------------------
+#
+# Originally tmpfs served only two synthetic roots, /tmp (slot 0) and
+# /var (slot 1). The `enter linux { apt/dpkg }` keystone needs a
+# WRITABLE filesystem layer over the read-only cpio for EVERY directory
+# a package install writes into — /usr, /etc, /bin, /sbin, /lib,
+# /lib64, /opt, /run, /srv as well as /var. Rather than a fixed pair of
+# reserved slots, tmpfs now serves a REGISTRY of top-level root names.
+# Each registered root gets a synthetic root slot (parent_idx == -1)
+# allocated LAZILY the first time a path under it is touched. The
+# namespace recipe union-binds the matching `#t/<root>` server key
+# MBEFORE+MCREATE over the cpio root, so reads of existing files fall
+# through to cpio while creates/writes land in this RAM-backed overlay.
+#
+# A synthetic root is identified solely by parent_idx == -1; slots 0
+# and 1 stay pinned to /tmp and /var for back-compat (tmpfs_slot_name,
+# the var skeleton, the reclaim guards). Any additional root is just an
+# ordinary used dir slot with parent_idx == -1 whose name[] holds the
+# top-level component ("usr", "etc", ...). _root_name_to_slot maps a
+# component to its (lazily-created) root slot; _mount_root / _path_
+# after_mount / is_tmpfs_dir_path are now registry-driven.
+TMPFS_MAX_ROOTS: uint64 = 16
+# The set of top-level component names tmpfs is willing to serve as a
+# writable overlay root. "tmp"/"var" keep their reserved slots; the
+# rest are created on demand. NUL-terminated component strings.
+_tmpfs_root_names: Array[16, Ptr[uint8]]
+_tmpfs_root_slots: Array[16, int32]    # parallel: slot id, or -1 if uncreated
+_tmpfs_nr_roots:   uint64 = 0
+_tmpfs_roots_ready: uint64 = 0
+
+
+class TmpfsEntry:
+    used:       uint64                # 0 = free slot
+    kind:       uint64                # 0 = file, 1 = dir, 2 = symlink
+    parent_idx: int64                 # containing dir slot, -1 = root
+    size:       uint64                # current bytes (files only)
+    data:       uint64                # for files: kmalloc'd chunk-pointer
+                                      # table (Array[TMPFS_MAX_CHUNKS,
+                                      # uint64]), or 0 if no write yet.
+                                      # Each table entry is either 0
+                                      # (chunk not yet allocated) or a
+                                      # kmalloc'd 64 KiB chunk address.
+                                      # For symlinks: a kmalloc'd
+                                      # NUL-terminated target string.
+    nlink:      uint64                # hard-link count on the data-owning
+                                      # slot (1 for a fresh file/dir/link).
+                                      # Decremented by tmpfs_unlink; the
+                                      # slot's storage is only freed when
+                                      # this hits 0. Alias slots (see
+                                      # link_to) carry nlink = 0; the count
+                                      # lives on the canonical slot.
+    link_to:    int64                 # -1 for a canonical (data-owning)
+                                      # entry. >= 0 for a hard-link alias:
+                                      # the slot index of the canonical
+                                      # entry whose data/size this name
+                                      # shares. The alias only stores its
+                                      # own name + parent_idx; size/data
+                                      # reads dereference through link_to.
+    seals:      uint64                # §memfd: F_SEAL_* bitmask in force on
+                                      # this file. 0 for an ordinary tmpfs
+                                      # entry (no sealing). Set only on
+                                      # memfd-created anonymous files via
+                                      # fcntl(F_ADD_SEALS). Enforced by
+                                      # tmpfs_write / tmpfs_ftruncate.
+    seal_allow: uint64                # §memfd: 1 if this file was created
+                                      # with MFD_ALLOW_SEALING (seals may be
+                                      # added). 0 otherwise — F_ADD_SEALS
+                                      # EPERMs. Ordinary tmpfs files are 0.
+    owner_uid:  uint32                # arch audit §2.2: the uid of the
+                                      # creating task. Set at every entry
+                                      # creation site. Consulted by
+                                      # tmpfs_perm_check for the owner /
+                                      # other triple selection.
+    mode:       uint32                # arch audit §2.2: low 9 bits are
+                                      # the rwx-triple per POSIX. Files
+                                      # default to 0644, directories to
+                                      # 0755. The synthetic /tmp and /var
+                                      # roots default to 01777 / 0755 so
+                                      # /tmp is the sticky world-writable
+                                      # scratch by default.
+    mtime:      uint64                # §stat-mtime: STABLE modification
+                                      # time (Unix epoch seconds). Stamped
+                                      # at creation, refreshed only on a
+                                      # real content change (write /
+                                      # truncate / rename), NEVER on a bare
+                                      # stat — so repeated stats of an
+                                      # unchanged file return the SAME
+                                      # mtime (apt cross-invocation index
+                                      # validity).
+    name:       Array[256, uint8]     # NUL-terminated path COMPONENT
+                                      # (TMPFS_NAME_LEN; Linux NAME_MAX+1)
+
+
+tmpfs_table: Array[8192, TmpfsEntry]
+_tmpfs_root_ready: uint64             # 0 until _tmpfs_ensure_root() has run
+
+
+def _tmpfs_ensure_root():
+    # Lazily install slot 0 as the synthetic /tmp root directory and
+    # slot 1 as the synthetic /var root directory. Idempotent: safe to
+    # call from every public entry point.
+    if _tmpfs_root_ready != 0:
+        return
+    tmpfs_table[TMPFS_ROOT_SLOT].used       = 1
+    tmpfs_table[TMPFS_ROOT_SLOT].kind       = TMPFS_KIND_DIR
+    tmpfs_table[TMPFS_ROOT_SLOT].parent_idx = -1
+    tmpfs_table[TMPFS_ROOT_SLOT].size       = 0
+    tmpfs_table[TMPFS_ROOT_SLOT].data       = 0
+    tmpfs_table[TMPFS_ROOT_SLOT].nlink      = 1
+    tmpfs_table[TMPFS_ROOT_SLOT].link_to    = -1
+    tmpfs_table[TMPFS_ROOT_SLOT].owner_uid  = 1                # hostowner
+    tmpfs_table[TMPFS_ROOT_SLOT].mode       = 0x3FF            # 01777 sticky
+    tmpfs_table[TMPFS_ROOT_SLOT].mtime      = _tmpfs_now()
+    tmpfs_table[TMPFS_ROOT_SLOT].name[0]    = 0
+    tmpfs_table[TMPFS_VAR_SLOT].used        = 1
+    tmpfs_table[TMPFS_VAR_SLOT].kind        = TMPFS_KIND_DIR
+    tmpfs_table[TMPFS_VAR_SLOT].parent_idx  = -1
+    tmpfs_table[TMPFS_VAR_SLOT].size        = 0
+    tmpfs_table[TMPFS_VAR_SLOT].data        = 0
+    tmpfs_table[TMPFS_VAR_SLOT].nlink       = 1
+    tmpfs_table[TMPFS_VAR_SLOT].link_to     = -1
+    tmpfs_table[TMPFS_VAR_SLOT].owner_uid   = 1                # hostowner
+    tmpfs_table[TMPFS_VAR_SLOT].mode        = 0x1ED            # 0755
+    tmpfs_table[TMPFS_VAR_SLOT].mtime       = _tmpfs_now()
+    tmpfs_table[TMPFS_VAR_SLOT].name[0]     = 0
+    # /tmp and /var keep their bare name[] empty (back-compat with
+    # tmpfs_slot_name which special-cases slots 0/1). The registry,
+    # however, keys roots by component name, so stamp the names there.
+    _tmpfs_init_root_registry()
+    _tmpfs_root_ready = 1
+
+
+def _set_root_name(idx: uint64, nm: Ptr[uint8]):
+    _tmpfs_root_names[idx] = nm
+    _tmpfs_root_slots[idx] = -1
+
+
+def _tmpfs_init_root_registry():
+    # Populate the writable-overlay root registry once. /tmp and /var
+    # pin to their reserved slots 0/1; the rest are created lazily by
+    # _root_name_to_slot. Idempotent.
+    if _tmpfs_roots_ready != 0:
+        return
+    _set_root_name(0, "tmp")
+    _tmpfs_root_slots[0] = cast[int32](TMPFS_ROOT_SLOT)
+    _set_root_name(1, "var")
+    _tmpfs_root_slots[1] = cast[int32](TMPFS_VAR_SLOT)
+    _set_root_name(2, "usr")
+    _set_root_name(3, "etc")
+    _set_root_name(4, "bin")
+    _set_root_name(5, "sbin")
+    _set_root_name(6, "lib")
+    _set_root_name(7, "lib64")
+    _set_root_name(8, "opt")
+    _set_root_name(9, "run")
+    _set_root_name(10, "srv")
+    # #67 live-writable root: the LIVE image unions `#t` MBEFORE the
+    # read-only cpio at `/` (etc/rc.boot LIVE branch), so a write ANYWHERE
+    # in the live session must land in a tmpfs overlay root. /home (the
+    # live user's writable home) and /root (the hostowner home) join the
+    # apt/dpkg set so `touch /home/live/x` and `touch /root/x` create in
+    # RAM instead of failing EROFS against the cpio.
+    _set_root_name(11, "home")
+    _set_root_name(12, "root")
+    _tmpfs_nr_roots = 13
+    _tmpfs_roots_ready = 1
+
+
+def _comp_str_eq_n(a: Ptr[uint8], b: Ptr[char], n: uint64) -> int32:
+    # True if NUL-terminated component string `a` equals the first `n`
+    # bytes of `b` AND a has exactly length n.
+    i: uint64 = 0
+    while i < n:
+        if a[i] == 0:
+            return 0
+        if cast[int32](a[i]) != b[i]:
+            return 0
+        i = i + 1
+    if a[n] == 0:
+        return 1
+    return 0
+
+
+def _toplevel_len(name: Ptr[char]) -> uint64:
+    # Length of the first path component of an absolute path (bytes
+    # after the leading '/', up to the next '/' or NUL). "/usr/bin" -> 3.
+    if name[0] != 47:
+        return 0
+    i: uint64 = 1
+    while name[i] != 0 and name[i] != 47:
+        i = i + 1
+    return i - 1
+
+
+def _root_idx_for(name: Ptr[char]) -> int32:
+    # Return the registry index whose root name matches `name`'s first
+    # path component, or -1 if `name`'s top-level dir is not a writable
+    # overlay root.
+    _tmpfs_init_root_registry()
+    tl: uint64 = _toplevel_len(name)
+    if tl == 0:
+        return -1
+    comp: Ptr[char] = cast[Ptr[char]](cast[uint64](name) + 1)
+    i: uint64 = 0
+    while i < _tmpfs_nr_roots:
+        if _comp_str_eq_n(_tmpfs_root_names[i], comp, tl) != 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _root_slot_for_idx(idx: uint64) -> int32:
+    # The synthetic root slot for registry entry `idx`, creating it
+    # lazily (parent_idx == -1 dir). Returns -1 if out of slots.
+    if _tmpfs_root_slots[idx] >= 0:
+        return _tmpfs_root_slots[idx]
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    nm: Ptr[uint8] = _tmpfs_root_names[idx]
+    j: uint64 = 0
+    while nm[j] != 0:
+        tmpfs_table[su].name[j] = nm[j]
+        j = j + 1
+    tmpfs_table[su].name[j]    = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_DIR
+    tmpfs_table[su].parent_idx = -1
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].data       = 0
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    tmpfs_table[su].owner_uid  = 1
+    tmpfs_table[su].mode       = 0x1ED                # 0755
+    tmpfs_table[su].mtime      = _tmpfs_now()
+    _tmpfs_root_slots[idx]     = slot
+    return slot
+
+
+def tmpfs_init():
+    # Optional explicit init hook (vfs_init may call this). The lazy
+    # _tmpfs_ensure_root() path makes it non-mandatory.
+    _tmpfs_ensure_root()
+
+
+def _comp_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # Compare two NUL-terminated path components for equality.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _comp_copy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64,
+               max: uint64) -> int32:
+    # Copy `n` bytes of src into dst and NUL-terminate. Returns 1 on
+    # success, 0 if the component is too long for the name slot
+    # (caller treats as -ENAMETOOLONG).
+    if n + 1 > max:
+        return 0
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return 1
+
+
+def _find_child(parent: int64, comp: Ptr[uint8], clen: uint64) -> int32:
+    # Find the slot of a child named `comp` (length `clen`) directly
+    # under directory slot `parent`. Returns the slot index or -1.
+    scratch: Array[256, uint8]        # TMPFS_NAME_LEN
+    if clen + 1 > TMPFS_NAME_LEN:
+        return -1
+    j: uint64 = 0
+    while j < clen:
+        scratch[j] = comp[j]
+        j = j + 1
+    scratch[clen] = 0
+    i: uint64 = 0
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used != 0:
+            if tmpfs_table[i].parent_idx == parent:
+                if _comp_eq(&tmpfs_table[i].name[0], &scratch[0]) != 0:
+                    return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _is_tmp_prefix(name: Ptr[char]) -> int32:
+    # True if `name` starts with "/tmp/" (a writable prefix). Shared
+    # by is_tmpfs_path and the resolve helpers.
+    prefix: Ptr[uint8] = "/tmp/"
+    i: int32 = 0
+    while True:
+        p: int32 = prefix[i]
+        if p == 0:
+            return 1
+        n: int32 = name[i]
+        if n != p:
+            return 0
+        i = i + 1
+
+
+def _is_var_prefix(name: Ptr[char]) -> int32:
+    # True if `name` starts with "/var/" (the second writable prefix).
+    # Same cheap prefix walk as _is_tmp_prefix.
+    prefix: Ptr[uint8] = "/var/"
+    i: int32 = 0
+    while True:
+        p: int32 = prefix[i]
+        if p == 0:
+            return 1
+        n: int32 = name[i]
+        if n != p:
+            return 0
+        i = i + 1
+
+
+def is_tmpfs_dir_path(name: Ptr[char]) -> int32:
+    # True if `name` is exactly a tmpfs mount point ("/tmp", "/var",
+    # "/usr", ... — any registered writable-overlay root). Used by the
+    # VFS so `ls /tmp` / `cd` route into tmpfs and so the bare root
+    # resolves to its synthetic slot. A path with no trailing component
+    # (name[1+toplevel] == 0) whose first component is a registered
+    # root is a mount point.
+    if name[0] != 47:                                  # '/'
+        return 0
+    ridx: int32 = _root_idx_for(name)
+    if ridx < 0:
+        return 0
+    tl: uint64 = _toplevel_len(name)
+    # Exact mount point: nothing after the first component.
+    if name[1 + tl] == 0:
+        return 1
+    return 0
+
+
+def _mount_root(name: Ptr[char]) -> int32:
+    # Return the synthetic root slot that `name` lives under, by
+    # matching its first path component against the writable-overlay
+    # registry and lazily materialising that root. Returns -1 if
+    # `name`'s top-level dir is not a registered tmpfs root (callers
+    # that already gated on vfs_fs_kind==TMPFS won't hit the -1 leg).
+    ridx: int32 = _root_idx_for(name)
+    if ridx < 0:
+        return -1
+    return _root_slot_for_idx(cast[uint64](ridx))
+
+
+# --- path resolution ------------------------------------------------
+#
+# A tmpfs path is "/tmp" (the root) or "/tmp/<comp>/<comp>/...".
+# _resolve_parent walks every component EXCEPT the last and returns
+# the slot of the directory that should contain the final component;
+# the final component itself is written into out_comp / out_len.
+# _resolve_full walks ALL components and returns the slot of the named
+# entry (file or dir), or a negative errno.
+
+TMPFS_ENOENT:  int32 = -2
+TMPFS_EEXIST:  int32 = -17
+TMPFS_ENOTDIR: int32 = -20
+TMPFS_ENAMETOOLONG: int32 = -36
+TMPFS_ENOSPC:  int32 = -28
+TMPFS_EPERM:   int32 = -1
+TMPFS_EBUSY:   int32 = -16
+TMPFS_EINVAL:  int32 = -22
+
+# §memfd: file-sealing bitmask (linux <uapi/linux/fcntl.h>).
+F_SEAL_SEAL:   uint64 = 1            # 0x0001 — no further seals may be set
+F_SEAL_SHRINK: uint64 = 2           # 0x0002 — file may not be made smaller
+F_SEAL_GROW:   uint64 = 4           # 0x0004 — file may not be made larger
+F_SEAL_WRITE:  uint64 = 8           # 0x0008 — no writes at all
+F_SEAL_ALL:    uint64 = 15          # SEAL|SHRINK|GROW|WRITE (the set we
+                                    # implement; future seals OR in here)
+
+
+def _path_after_mount(name: Ptr[char]) -> int32:
+    # Return the index of the first character AFTER the top-level mount
+    # component ("/tmp", "/usr", "/lib64", ...), i.e. of the '/' that
+    # begins the first sub-component, or of the terminating NUL if the
+    # path is exactly the mount point. The component length is computed
+    # from the path (no longer fixed at 4) so multi-length roots like
+    # "/lib64" work. Caller guarantees the path is a tmpfs path.
+    return cast[int32](1 + _toplevel_len(name))
+
+
+def _resolve_parent(name: Ptr[char], out_comp: Ptr[uint8],
+                    out_len: Ptr[uint64]) -> int32:
+    # Walk every component of `name` except the last. Returns the slot
+    # of the directory that should contain the last component, and
+    # writes the last component (NUL-terminated) + its length out.
+    # Returns a negative TMPFS_E* on error (missing intermediate dir,
+    # an intermediate that is a file, or a too-long component).
+    # Walks from whichever synthetic root (/tmp or /var) `name` is
+    # under, so /tmp/* and /var/* never cross-resolve.
+    _tmpfs_ensure_root()
+    cur: int32 = _mount_root(name)
+    i: uint64 = cast[uint64](_path_after_mount(name))   # at the '/'
+    # Skip the leading '/'.
+    if name[i] == 47:
+        i = i + 1
+    while True:
+        # Scan one component [start, end).
+        start: uint64 = i
+        while name[i] != 0 and name[i] != 47:
+            i = i + 1
+        clen: uint64 = i - start
+        if clen == 0:
+            # Empty component (trailing slash or "//") — skip it.
+            if name[i] == 0:
+                return TMPFS_ENOENT
+            i = i + 1
+            continue
+        if clen + 1 > TMPFS_NAME_LEN:
+            return TMPFS_ENAMETOOLONG
+        if name[i] == 0:
+            # This was the LAST component — it is the target name.
+            j: uint64 = 0
+            while j < clen:
+                out_comp[j] = name[start + j]
+                j = j + 1
+            out_comp[clen] = 0
+            out_len[0] = clen
+            return cur
+        # Intermediate component — must resolve to an existing dir.
+        comp_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](name) + start)
+        child: int32 = _find_child(cast[int64](cur), comp_ptr, clen)
+        if child < 0:
+            return TMPFS_ENOENT
+        if tmpfs_table[cast[uint64](child)].kind != TMPFS_KIND_DIR:
+            return TMPFS_ENOTDIR
+        cur = child
+        i = i + 1
+
+
+def _mk_dir_slot(parent: int32, comp: Ptr[uint8], clen: uint64) -> int32:
+    # Allocate + initialise a directory entry named `comp` (length
+    # `clen`) under directory slot `parent`. Returns the new slot or a
+    # negative TMPFS_E*. Shared by tmpfs_mkdir and the mkdir -p walker.
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        return TMPFS_ENOSPC
+    su: uint64 = cast[uint64](slot)
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[su].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[su].name[clen] = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_DIR
+    tmpfs_table[su].parent_idx = cast[int64](parent)
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].data       = 0
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    tmpfs_table[su].owner_uid  = current_task_uid()
+    tmpfs_table[su].mode       = 0x1ED                # 0755
+    tmpfs_table[su].mtime      = _tmpfs_now()
+    return slot
+
+
+def _resolve_parent_mkp(name: Ptr[char], out_comp: Ptr[uint8],
+                        out_len: Ptr[uint64]) -> int32:
+    # mkdir -p variant of _resolve_parent: walk every component except
+    # the last, AUTO-CREATING any missing intermediate directory rather
+    # than failing with -ENOENT. Returns the slot that should contain
+    # the last component (+ the last component out), or a negative
+    # TMPFS_E* (component too long / out of slots / an intermediate that
+    # is a non-dir file). dpkg/apt do `mkdir -p /usr/share/doc/<pkg>`
+    # against the writable overlay where /usr exists only as a synthetic
+    # root, so every level below it must be created on demand.
+    _tmpfs_ensure_root()
+    cur: int32 = _mount_root(name)
+    if cur < 0:
+        return TMPFS_ENOENT
+    i: uint64 = cast[uint64](_path_after_mount(name))
+    if name[i] == 47:
+        i = i + 1
+    while True:
+        start: uint64 = i
+        while name[i] != 0 and name[i] != 47:
+            i = i + 1
+        clen: uint64 = i - start
+        if clen == 0:
+            if name[i] == 0:
+                return TMPFS_ENOENT
+            i = i + 1
+            continue
+        if clen + 1 > TMPFS_NAME_LEN:
+            return TMPFS_ENAMETOOLONG
+        if name[i] == 0:
+            j: uint64 = 0
+            while j < clen:
+                out_comp[j] = name[start + j]
+                j = j + 1
+            out_comp[clen] = 0
+            out_len[0] = clen
+            return cur
+        comp_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](name) + start)
+        child: int32 = _find_child(cast[int64](cur), comp_ptr, clen)
+        if child < 0:
+            # Missing intermediate dir — create it (mkdir -p).
+            child = _mk_dir_slot(cur, comp_ptr, clen)
+            if child < 0:
+                return child
+        elif tmpfs_table[cast[uint64](child)].kind != TMPFS_KIND_DIR:
+            return TMPFS_ENOTDIR
+        cur = child
+        i = i + 1
+
+
+def _resolve_full(name: Ptr[char]) -> int32:
+    # Walk ALL components of `name`. Returns the slot of the named
+    # entry, or a negative TMPFS_E*. "/tmp" / "/var" themselves resolve
+    # to their respective synthetic root slot.
+    _tmpfs_ensure_root()
+    if is_tmpfs_dir_path(name) != 0:
+        return _mount_root(name)
+    comp: Array[256, uint8]        # TMPFS_NAME_LEN component buffer
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(name, &comp[0], &clen)
+    if parent < 0:
+        return parent
+    child: int32 = _find_child(cast[int64](parent), &comp[0], clen)
+    if child < 0:
+        return TMPFS_ENOENT
+    return child
+
+
+def tmpfs_lookup(name: Ptr[char]) -> int32:
+    # Resolve `name` to a slot index, or -1 on any miss. Kept as a
+    # boolean-ish accessor for callers that only care "does it exist".
+    # Note: lookup-miss is also the "is this a tmpfs path?" probe in
+    # vfs.ad's dispatch; setting errstr here would clobber legitimate
+    # errstrs set by other backends, so we leave the buffer alone.
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return -1
+    return slot
+
+
+def tmpfs_is_dir(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    if tmpfs_table[cast[uint64](slot)].kind == TMPFS_KIND_DIR:
+        return 1
+    return 0
+
+
+def tmpfs_owner_uid(slot: int32) -> uint32:
+    # The NATIVE owner uid stamped on this entry at creation time
+    # (current_task_uid() of the creating task). The Linux-ABI stat path
+    # maps this native id into POSIX space for st_uid; without it, fstat
+    # hard-coded 0 and a uid-1001 `spawn linux` process saw its own tmpfs
+    # files reported root-owned. Returns 1 (hostowner) for a bad slot as a
+    # safe default.
+    if slot < 0:
+        return 1
+    return tmpfs_table[cast[uint64](slot)].owner_uid
+
+
+def tmpfs_path_is_dir(name: Ptr[char]) -> int32:
+    # True if `name` resolves to an existing tmpfs directory.
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return 0
+    return tmpfs_is_dir(slot)
+
+
+def tmpfs_path_exists(name: Ptr[char]) -> int32:
+    # True if `name` resolves to ANY existing tmpfs entry (file OR
+    # directory), including a synthetic mount root. The VFS OREAD
+    # dispatch uses this for /var paths: a /var path that tmpfs does
+    # NOT have should fall through to the read-only cpio initramfs
+    # (so a cpio-baked /var/www docroot still opens) rather than
+    # failing with -ENOENT at the tmpfs route.
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return 0
+    return 1
+
+
+def _tmpfs_find_free_slot() -> int32:
+    # Slots 0 and 1 are the reserved /tmp and /var roots; usable slots
+    # start at 2.
+    i: uint64 = 2
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def tmpfs_mkdir(name: Ptr[char]) -> int32:
+    # Create a directory entry for `name`. Returns:
+    #     0  on success
+    #   -2  (-ENOENT)        a parent component is missing
+    #  -17  (-EEXIST)        the name already exists
+    #  -20  (-ENOTDIR)       a parent component is a file
+    #  -28  (-ENOSPC)        out of entry slots
+    #  -36  (-ENAMETOOLONG)  the final component is too long
+    # V3: mkdir is now ALWAYS mkdir -p. Missing intermediate dirs are
+    # created on the way down (_resolve_parent_mkp), so dpkg/apt's
+    # `mkdir -p /usr/share/doc/<pkg>` against the writable overlay (where
+    # /usr exists only as a synthetic root) succeeds in one call. An
+    # already-existing FINAL component is still -EEXIST (POSIX mkdir(2)),
+    # but an already-existing INTERMEDIATE is silently reused. A
+    # mkdir-of-an-existing-dir from `mkdir -p` userland is harmless: the
+    # caller treats -EEXIST as success.
+    _tmpfs_ensure_root()
+    if is_tmpfs_dir_path(name) != 0:
+        set_current_errstr("tmpfs: mkdir: already exists")
+        return TMPFS_EEXIST                           # bare root exists
+    comp: Array[256, uint8]        # TMPFS_NAME_LEN component buffer
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent_mkp(name, &comp[0], &clen)
+    if parent < 0:
+        set_current_errstr("tmpfs: mkdir: parent path error")
+        return parent
+    if _find_child(cast[int64](parent), &comp[0], clen) >= 0:
+        set_current_errstr("tmpfs: mkdir: already exists")
+        return TMPFS_EEXIST
+    slot: int32 = _mk_dir_slot(parent, &comp[0], clen)
+    if slot < 0:
+        if slot == TMPFS_ENOSPC:
+            printk0("tmpfs: out of entry slots\n")
+            set_current_errstr("tmpfs: out of entry slots")
+        return slot
+    return 0
+
+
+def tmpfs_open_for_write(name: Ptr[char]) -> int32:
+    # Back-compat entry point: open-or-create FOR WRITE, truncating an
+    # existing file to zero (the historical O_CREAT|O_TRUNC behaviour every
+    # legacy caller relied on). New callers that must honour the real
+    # O_TRUNC bit use tmpfs_open_for_write_t(name, do_trunc).
+    return tmpfs_open_for_write_t(name, 1)
+
+
+def tmpfs_open_for_write_t(name: Ptr[char], do_trunc: int32) -> int32:
+    # Lookup or create a FILE. If the file exists: truncate to size 0 ONLY
+    # when `do_trunc` != 0 (the O_TRUNC bit); otherwise keep its current
+    # contents (an O_WRONLY / O_RDWR open WITHOUT O_TRUNC, e.g. an in-place
+    # rewrite — dpkg re-opens an already-unpacked control file this way, and
+    # an unconditional truncate clobbered it to 0 bytes -> "no package
+    # information"). If it does not exist, create it under the resolved
+    # parent directory. Returns the slot index, or a negative TMPFS_E* on
+    # error. A path that resolves to an existing directory cannot be opened
+    # for write — returns -EEXIST (-17), matching the VFS contract that you
+    # can't clobber a dir with a file write.
+    #
+    # No backing storage is allocated here — the chunk-pointer table
+    # and the per-chunk 64 KiB buffers are allocated lazily by
+    # _tmpfs_get_chunk() on the first write that needs them.
+    _tmpfs_ensure_root()
+    existing: int32 = _resolve_full(name)
+    if existing >= 0:
+        if tmpfs_table[cast[uint64](existing)].kind == TMPFS_KIND_DIR:
+            set_current_errstr("tmpfs: open: path is a directory")
+            return TMPFS_EEXIST
+        if do_trunc != 0:
+            tmpfs_table[cast[uint64](existing)].size = 0
+            # §stat-mtime: a truncate IS a content change — restamp so a
+            # later stat reflects the modification (apt rewrites its list
+            # files O_TRUNC then writes the fetched index).
+            tmpfs_table[cast[uint64](_tmpfs_canon(existing))].mtime = _tmpfs_now()
+        return existing
+
+    comp: Array[256, uint8]        # TMPFS_NAME_LEN component buffer
+    clen: uint64 = 0
+    # V3: auto-create missing parent dirs (mkdir -p semantics) so a file
+    # create deep under a writable-overlay root (/usr/bin/hamhello,
+    # /var/lib/dpkg/status) lands even if the package manager skipped an
+    # explicit mkdir of every level. _resolve_parent_mkp materialises
+    # the chain from the synthetic root down.
+    parent: int32 = _resolve_parent_mkp(name, &comp[0], &clen)
+    if parent < 0:
+        set_current_errstr("tmpfs: create: parent path error")
+        return parent
+
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        printk0("tmpfs: out of file slots\n")
+        set_current_errstr("tmpfs: out of file slots")
+        return TMPFS_ENOSPC
+    su: uint64 = cast[uint64](slot)
+
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[su].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[su].name[clen] = 0
+
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_FILE
+    tmpfs_table[su].parent_idx = cast[int64](parent)
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    # arch audit §2.2: stamp creator uid + file mode (0644).
+    tmpfs_table[su].owner_uid  = current_task_uid()
+    tmpfs_table[su].mode       = 0x1A4                # 0644
+    tmpfs_table[su].mtime      = _tmpfs_now()
+    # NOTE: tmpfs_table[su].data may still hold a chunk-pointer table
+    # from a prior file that occupied this slot before unlink — the
+    # write path can reuse already-allocated chunks rather than freeing
+    # and re-kmallocing. The chunk-pointer table is reset / zeroed at
+    # unlink-time so a fresh file starts with all chunks "not yet
+    # allocated".
+    return slot
+
+
+def _tmpfs_now() -> uint64:
+    # §stat-mtime: wall-clock seconds for an mtime stamp. RTC is the
+    # source of truth (same as ext4's _ext4_now_epoch); an unreadable RTC
+    # falls back to 0 rather than inventing a bogus advancing time — the
+    # WHOLE POINT is a value that does NOT change between two stats of an
+    # unchanged file, so a stable 0 is strictly better than jiffies.
+    t: int64 = rtc_read_unix_time()
+    if t < 0:
+        return 0
+    return cast[uint64](t)
+
+
+def tmpfs_mtime(slot: int32) -> uint64:
+    # §stat-mtime: the STABLE stored modification time of `slot` (epoch
+    # seconds). A hard-link alias canonicalises to its data-owning slot
+    # so all names of one inode report the same mtime. The VFS stat path
+    # (vfs_fd_mtime) surfaces this so apt's index-file freshness check is
+    # coherent across `apt-get update` and a later `apt-get install`.
+    return tmpfs_table[cast[uint64](_tmpfs_canon(slot))].mtime
+
+
+def _tmpfs_canon(slot: int32) -> int32:
+    # Resolve a slot to its data-owning canonical slot. A hard-link
+    # alias (link_to >= 0) shares the canonical entry's size + chunk
+    # storage; every data accessor (size / read / write / data) routes
+    # through here so an alias name reads/writes the same bytes. A
+    # canonical entry (link_to == -1) returns itself.
+    su: uint64 = cast[uint64](slot)
+    lt: int64 = tmpfs_table[su].link_to
+    if lt < 0:
+        return slot
+    return cast[int32](lt)
+
+
+def tmpfs_size(slot: int32) -> uint64:
+    return tmpfs_table[cast[uint64](_tmpfs_canon(slot))].size
+
+
+def tmpfs_open_for_append(name: Ptr[char]) -> int32:
+    # Lookup-or-create a FILE without truncating. If `name` already
+    # exists as a file, returns its slot with size preserved — appended
+    # writes (DEVFD_FILE_APPEND in sys/src/9/port/devfd.ad) will then
+    # land at end-of-file. If `name` does not exist, creates it as an
+    # empty file under the resolved parent dir.
+    #
+    # Used by hamsh's service supervisor (user/hamsh.ad's svc_*) to
+    # capture each service's stdout+stderr to /var/log/svc/<name>.log
+    # for the lifetime of the boot, surviving across `svc restart`.
+    # The truncate-on-open semantics of tmpfs_open_for_write would
+    # discard a previous run's log on every restart — exactly what
+    # this variant avoids.
+    #
+    # Returns the slot index, or a negative TMPFS_E* on error. A path
+    # that resolves to an existing directory returns -EEXIST, matching
+    # tmpfs_open_for_write — you can't clobber a dir with a file.
+    _tmpfs_ensure_root()
+    existing: int32 = _resolve_full(name)
+    if existing >= 0:
+        if tmpfs_table[cast[uint64](existing)].kind == TMPFS_KIND_DIR:
+            return TMPFS_EEXIST
+        # Preserve size — DO NOT truncate. Subsequent writes append.
+        return existing
+
+    comp: Array[256, uint8]        # TMPFS_NAME_LEN component buffer
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(name, &comp[0], &clen)
+    if parent < 0:
+        return parent
+
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        printk0("tmpfs: out of file slots\n")
+        return TMPFS_ENOSPC
+    su: uint64 = cast[uint64](slot)
+
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[su].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[su].name[clen] = 0
+
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_FILE
+    tmpfs_table[su].parent_idx = cast[int64](parent)
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    # arch audit §2.2: stamp creator uid + file mode (0644).
+    tmpfs_table[su].owner_uid  = current_task_uid()
+    tmpfs_table[su].mode       = 0x1A4                # 0644
+    tmpfs_table[su].mtime      = _tmpfs_now()
+    return slot
+
+
+def tmpfs_capacity() -> uint64:
+    return TMPFS_FILE_CAP
+
+
+def _tmpfs_get_chunk(slot: int32, chunk_idx: uint64,
+                     create: int32) -> uint64:
+    # Returns the address of chunk `chunk_idx` for file `slot`. With
+    # create=0 (read path) returns 0 if either the chunk-table or the
+    # specific chunk has not been allocated yet — the caller must treat
+    # missing chunks as a hole that reads as zero bytes (but tmpfs files
+    # never have sparse holes today: chunks are allocated in order on
+    # write). With create=1 (write path) lazily allocates the
+    # chunk-pointer table and the chunk itself; returns 0 only if
+    # kmalloc fails or chunk_idx >= TMPFS_MAX_CHUNKS.
+    if chunk_idx >= TMPFS_MAX_CHUNKS:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    # Fast path (no lock): a chunk-table + chunk already published are
+    # immutable once set (chunks are never freed except at file teardown,
+    # which is not concurrent with a live fault), so a non-zero read is
+    # safe lockless.
+    if tmpfs_table[su].data != 0:
+        tbl0: Ptr[uint64] = cast[Ptr[uint64]](tmpfs_table[su].data)
+        a0: uint64 = tbl0[chunk_idx]
+        if a0 != 0:
+            return a0
+    if create == 0:
+        return 0
+    # §SMP coherence: serialise the allocate-and-publish so two CPUs
+    # faulting the SAME (slot, chunk_idx) don't each allocate a distinct
+    # chunk and end up with incoherent mappings. Double-check under the
+    # lock before allocating.
+    spinlock_lock(&tmpfs_chunk_lock)
+    # Lazily allocate the chunk-pointer table on first need.
+    if tmpfs_table[su].data == 0:
+        km_set_site(KM_SITE_TMPFS)
+        tbl: uint64 = kmalloc(TMPFS_MAX_CHUNKS * 8)
+        if tbl == 0:
+            spinlock_unlock(&tmpfs_chunk_lock)
+            return 0
+        # Zero the table — every entry starts "not yet allocated".
+        memset(cast[Ptr[uint8]](tbl), 0, TMPFS_MAX_CHUNKS * 8)
+        tmpfs_table[su].data = tbl
+    table: Ptr[uint64] = cast[Ptr[uint64]](tmpfs_table[su].data)
+    addr: uint64 = table[chunk_idx]
+    if addr != 0:
+        # A peer published it while we waited for the lock — use theirs.
+        spinlock_unlock(&tmpfs_chunk_lock)
+        return addr
+    # §shared-mmap coherence: allocate the DATA chunk PAGE-ALIGNED from the
+    # buddy allocator so a MAP_SHARED mmap can map its physical pages
+    # directly (see tmpfs_page_phys). Zero it (a fresh chunk reads as zero,
+    # matching a file hole / extend-with-zeros). free via free_pages in
+    # _tmpfs_free_storage.
+    pa_set_site(PA_SITE_TMPFS)
+    chunk: uint64 = alloc_pages(TMPFS_CHUNK_ORDER)
+    if chunk == 0:
+        spinlock_unlock(&tmpfs_chunk_lock)
+        return 0
+    memset(cast[Ptr[uint8]](chunk), 0, TMPFS_CHUNK_SIZE)
+    table[chunk_idx] = chunk
+    spinlock_unlock(&tmpfs_chunk_lock)
+    return chunk
+
+
+def tmpfs_extend_size(slot: int32, new_size: uint64):
+    # §shared-mmap coherence: raise the recorded file size to `new_size`
+    # if it is currently smaller (never shrinks). A MAP_SHARED writable
+    # mmap that writes THROUGH the mapping extends the file the same way
+    # the old copy-writeback path did (its tmpfs_write side-effect grew
+    # size): without this a later tmpfs_read() stops at a stale, smaller
+    # EOF and apt's pkgcache source records read back short -> "Can't find
+    # a source to download version". Caller caps `new_size` at the
+    # mapping's file_size snapshot so the file never grows past what the
+    # program intends (over-growing pads read() with zeros and corrupts
+    # apt's length-prefixed cache parse).
+    su: uint64 = cast[uint64](_tmpfs_canon(slot))
+    cap: uint64 = new_size
+    if cap > TMPFS_FILE_CAP:
+        cap = TMPFS_FILE_CAP
+    if tmpfs_table[su].size < cap:
+        tmpfs_table[su].size = cap
+        # §stat-mtime: a MAP_SHARED writable mmap stores DIRECTLY into the
+        # file's storage page (bypassing tmpfs_write), signalling the
+        # modification only via this size-extend. Restamp on a genuine
+        # grow so the file's mtime advances when apt writes its pkgcache
+        # THROUGH the mapping. This fires at most once per page-grow, so
+        # it stays stable once the write session settles (an unchanged,
+        # fully-grown file is never restamped by a bare read/stat).
+
+
+def tmpfs_page_phys(slot: int32, file_offset: uint64) -> uint64:
+    # §shared-mmap coherence: return the PAGE-ALIGNED physical address of
+    # the 4 KiB page that holds byte `file_offset` of file `slot`,
+    # allocating the backing chunk on demand. The MAP_SHARED writable mmap
+    # fault path maps THIS physical page directly into user space, so a
+    # store through the mapping and a tmpfs_read()/tmpfs_write() of the
+    # same offset touch the SAME memory — genuine POSIX page coherence.
+    # `file_offset` need not be page-aligned; the page base is computed
+    # here. Returns 0 if the chunk cannot be allocated (OOM) or the offset
+    # exceeds the per-file capacity. A hard-link alias slot is
+    # canonicalised to the data-owning slot first.
+    # A sparse file may span up to the LOGICAL cap; only the low
+    # [0, TMPFS_FILE_CAP) range gets a real backing chunk. A fault above
+    # the backed cap resolves to 0 (unbacked hole) — _tmpfs_get_chunk also
+    # guards chunk_idx >= TMPFS_MAX_CHUNKS, so this stays in-bounds.
+    if file_offset >= TMPFS_LOGICAL_CAP:
+        return 0
+    cslot: int32 = _tmpfs_canon(slot)
+    chunk_idx: uint64 = file_offset / TMPFS_CHUNK_SIZE
+    in_chunk:  uint64 = file_offset % TMPFS_CHUNK_SIZE
+    # Page base WITHIN the chunk (chunks are page-aligned via alloc_pages).
+    page_in_chunk: uint64 = in_chunk & ~cast[uint64](4095)
+    chunk: uint64 = _tmpfs_get_chunk(cslot, chunk_idx, 1)
+    if chunk == 0:
+        return 0
+    return chunk + page_in_chunk
+
+
+def tmpfs_data(slot: int32) -> Ptr[uint8]:
+    # Compatibility accessor: returns the address of the file's FIRST
+    # chunk (or 0 if no write has happened yet). Callers that walk a
+    # file by index past the first chunk MUST use tmpfs_read() — this
+    # entry point only sees the leading 64 KiB. Kept for any consumer
+    # that still wants a Ptr[uint8] view of the leading bytes.
+    su: uint64 = cast[uint64](_tmpfs_canon(slot))
+    if tmpfs_table[su].data == 0:
+        return cast[Ptr[uint8]](0)
+    table: Ptr[uint64] = cast[Ptr[uint64]](tmpfs_table[su].data)
+    return cast[Ptr[uint8]](table[0])
+
+
+def tmpfs_read(slot: int32, dst: Ptr[uint8], pos: uint64,
+               count: uint64) -> uint64:
+    # Read up to `count` bytes into `dst` from file `slot` starting at
+    # offset `pos`, walking the chunk chain. Returns the number of bytes
+    # actually read; 0 at EOF (pos >= size). A hard-link alias slot is
+    # canonicalised to the data-owning slot first.
+    cslot: int32 = _tmpfs_canon(slot)
+    su: uint64 = cast[uint64](cslot)
+    size: uint64 = tmpfs_table[su].size
+    if pos >= size:
+        return 0
+    remaining: uint64 = size - pos
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    out_done: uint64 = 0
+    cur_pos: uint64 = pos
+    while out_done < take:
+        chunk_idx: uint64 = cur_pos / TMPFS_CHUNK_SIZE
+        in_chunk: uint64 = cur_pos % TMPFS_CHUNK_SIZE
+        room_in_chunk: uint64 = TMPFS_CHUNK_SIZE - in_chunk
+        copy: uint64 = take - out_done
+        if copy > room_in_chunk:
+            copy = room_in_chunk
+        chunk: uint64 = _tmpfs_get_chunk(cslot, chunk_idx, 0)
+        if chunk == 0:
+            # Sparse hole — fill the gap with zeros. Tmpfs writes
+            # never leave holes (chunks are allocated in order on
+            # write), but be defensive: a future O_APPEND or truncate
+            # could.
+            memset(cast[Ptr[uint8]](
+                cast[uint64](dst) + out_done), 0, copy)
+        else:
+            memcpy(cast[Ptr[uint8]](cast[uint64](dst) + out_done),
+                   cast[Ptr[uint8]](chunk + in_chunk),
+                   copy)
+        out_done = out_done + copy
+        cur_pos = cur_pos + copy
+    return out_done
+
+
+def _tmpfs_free_storage(su: uint64):
+    # Free the per-file chunk chain (or a symlink's target string) for
+    # slot `su` and reset its data pointer. With chunked storage a file
+    # can carry up to TMPFS_MAX_CHUNKS * TMPFS_CHUNK_SIZE = 16 MiB;
+    # leaking that across unlink-create cycles would exhaust kmalloc long
+    # before any practical workload finished. Every materialised chunk +
+    # the chunk-pointer table itself are returned to the slab. For a
+    # symlink, `data` is a single kmalloc'd target string.
+    if tmpfs_table[su].data == 0:
+        return
+    if tmpfs_table[su].kind == TMPFS_KIND_FILE:
+        table: Ptr[uint64] = cast[Ptr[uint64]](tmpfs_table[su].data)
+        ci: uint64 = 0
+        while ci < TMPFS_MAX_CHUNKS:
+            chunk_addr: uint64 = table[ci]
+            if chunk_addr != 0:
+                # §shared-mmap coherence: DATA chunks are buddy-allocated
+                # page-aligned (alloc_pages) — free them symmetrically.
+                free_pages(chunk_addr, TMPFS_CHUNK_ORDER)
+                table[ci] = 0
+            ci = ci + 1
+        kfree(tmpfs_table[su].data)
+        tmpfs_table[su].data = 0
+    elif tmpfs_table[su].kind == TMPFS_KIND_SYMLINK:
+        kfree(tmpfs_table[su].data)
+        tmpfs_table[su].data = 0
+
+
+def _tmpfs_find_alias(canon: int32) -> int32:
+    # Return the slot index of ANY hard-link alias whose link_to points
+    # at `canon`, or -1 if `canon` has no aliases. Used when the
+    # canonical (data-owning) name is unlinked while other names still
+    # reference its data: one surviving alias is promoted to canonical
+    # so the storage keeps an owner.
+    i: uint64 = 2
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used != 0:
+            if tmpfs_table[i].link_to == cast[int64](canon):
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def tmpfs_unlink(name: Ptr[char]) -> int32:
+    # Remove the named entry. A directory can only be removed if it is
+    # empty (Linux rmdir semantics) — refuse with -ENOTEMPTY-ish
+    # behaviour (we reuse -EEXIST(-17)'s "in the way" sense).
+    #
+    # Hard links: each name is a distinct slot. The data-owning
+    # ("canonical") slot carries the link count (nlink); alias slots
+    # carry link_to = canonical-slot. Unlinking a name decrements the
+    # canonical's nlink and frees the backing storage ONLY when nlink
+    # reaches 0. If the canonical NAME itself is unlinked while aliases
+    # survive, one alias is promoted to canonical (it inherits the
+    # data/size, and the remaining aliases are repointed at it) so the
+    # storage always has exactly one owner.
+    #
+    # Returns 0 on success, -ENOENT (-2) on miss.
+    _tmpfs_ensure_root()
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return TMPFS_ENOENT
+    su: uint64 = cast[uint64](slot)
+    if tmpfs_table[su].parent_idx == -1 \
+            and tmpfs_table[su].kind == TMPFS_KIND_DIR:
+        return TMPFS_EEXIST                           # can't remove a root
+    if tmpfs_table[su].kind == TMPFS_KIND_DIR:
+        # Refuse to remove a non-empty directory.
+        i: uint64 = 0
+        while i < TMPFS_MAX_FILES:
+            if tmpfs_table[i].used != 0:
+                if tmpfs_table[i].parent_idx == cast[int64](slot):
+                    return TMPFS_EEXIST
+            i = i + 1
+
+    # Find the data-owning slot and decrement its link count.
+    canon: int32 = _tmpfs_canon(slot)
+    cu: uint64 = cast[uint64](canon)
+    is_alias: int32 = 0
+    if tmpfs_table[su].link_to >= 0:
+        is_alias = 1
+    if tmpfs_table[cu].nlink > 0:
+        tmpfs_table[cu].nlink = tmpfs_table[cu].nlink - 1
+    remaining: uint64 = tmpfs_table[cu].nlink
+
+    if is_alias != 0:
+        # Removing an alias name: just retire this slot. Storage lives
+        # on the canonical slot; free it only if the count hit 0 (the
+        # canonical name was already gone — should not normally happen
+        # via this leg, but be defensive).
+        tmpfs_table[su].used    = 0
+        tmpfs_table[su].size    = 0
+        tmpfs_table[su].link_to = -1
+        tmpfs_table[su].name[0] = 0
+        if remaining == 0:
+            _tmpfs_free_storage(cu)
+            tmpfs_table[cu].used = 0
+            tmpfs_table[cu].size = 0
+            tmpfs_table[cu].name[0] = 0
+        return 0
+
+    # Removing the canonical (data-owning) name.
+    if remaining > 0:
+        # Other names still reference this data — promote one surviving
+        # alias to canonical so the storage keeps an owner.
+        heir: int32 = _tmpfs_find_alias(canon)
+        if heir >= 0:
+            hu: uint64 = cast[uint64](heir)
+            tmpfs_table[hu].link_to = -1
+            tmpfs_table[hu].kind    = tmpfs_table[su].kind
+            tmpfs_table[hu].size    = tmpfs_table[su].size
+            tmpfs_table[hu].data    = tmpfs_table[su].data
+            tmpfs_table[hu].nlink   = remaining
+            # Repoint every other alias at the new canonical slot.
+            j: uint64 = 2
+            while j < TMPFS_MAX_FILES:
+                if tmpfs_table[j].used != 0 and j != hu:
+                    if tmpfs_table[j].link_to == cast[int64](canon):
+                        tmpfs_table[j].link_to = cast[int64](heir)
+                j = j + 1
+        # Retire the canonical name's slot WITHOUT freeing storage
+        # (ownership moved to the heir).
+        tmpfs_table[su].used    = 0
+        tmpfs_table[su].size    = 0
+        tmpfs_table[su].data    = 0
+        tmpfs_table[su].link_to = -1
+        tmpfs_table[su].name[0] = 0
+        return 0
+
+    # Last name gone — free the storage and retire the slot.
+    _tmpfs_free_storage(su)
+    tmpfs_table[su].used    = 0
+    tmpfs_table[su].size    = 0
+    tmpfs_table[su].link_to = -1
+    # Wipe the first byte of the name so a half-matched stale key
+    # can't accidentally compare equal before the slot gets reused.
+    tmpfs_table[su].name[0] = 0
+    return 0
+
+
+def tmpfs_rename(oldname: Ptr[char], newname: Ptr[char]) -> int32:
+    # Plan 9 wstat(2)'s name-change primitive routed through tmpfs.
+    # V1 scope: rename only moves the path key WITHIN THE SAME PARENT
+    # DIRECTORY (a pure component rename). Cross-directory moves are
+    # V2 backlog. Looks up the slot for `oldname`, refuses if
+    # `newname` already exists, then overwrites the slot's name
+    # component. Backing data + size are preserved.
+    #
+    # Returns:
+    #    0 on success
+    #   -2 (-ENOENT) if oldname doesn't exist
+    #  -17 (-EEXIST) if newname is taken / parents differ
+    # -36 (-ENAMETOOLONG) if newname's component is too long
+    _tmpfs_ensure_root()
+    src_slot: int32 = _resolve_full(oldname)
+    if src_slot < 0:
+        return TMPFS_ENOENT
+    # POSIX rename(2): if `newname` already exists it is ATOMICALLY
+    # REPLACED (unless it's a non-empty dir, or src==dst). dpkg's whole
+    # install pipeline depends on this — it writes /var/lib/dpkg/status.new
+    # then rename()s it over the live /var/lib/dpkg/status. The old code
+    # returned -EEXIST here, so dpkg aborted with "error installing new
+    # file '/var/lib/dpkg/status': File exists" and no package ever
+    # reached "Setting up". Replace the destination by unlinking it first
+    # (its storage is freed/retired by tmpfs_unlink), then fall through to
+    # the name-move. A directory destination still rejects (tmpfs_unlink
+    # refuses a non-empty dir and a root; an empty-dir dest is replaceable,
+    # matching rename(2)'s dir-over-empty-dir leg).
+    dst_existing: int32 = _resolve_full(newname)
+    if dst_existing >= 0:
+        if dst_existing == src_slot:
+            return 0                                  # rename to self: no-op
+        unlrc: int32 = tmpfs_unlink(newname)
+        if unlrc != 0:
+            return unlrc                              # e.g. dest is a non-empty dir
+    new_comp: Array[256, uint8]    # TMPFS_NAME_LEN component buffer
+    new_len: uint64 = 0
+    new_parent: int32 = _resolve_parent_mkp(newname, &new_comp[0], &new_len)
+    if new_parent < 0:
+        return new_parent
+    su: uint64 = cast[uint64](src_slot)
+    if new_len + 1 > TMPFS_NAME_LEN:
+        return TMPFS_ENAMETOOLONG
+    # Cross-directory rename: reparent the slot to `new_parent`. apt's
+    # acquire pipeline depends on this — the `copy`/`store` methods fetch
+    # into /var/lib/apt/lists/partial/<name> then rename() it up into
+    # /var/lib/apt/lists/<name> (a DIFFERENT parent dir). The old V1 code
+    # rejected a differing-parent rename with -EEXIST ("rename failed, File
+    # exists"), so apt-get update Ign'd every index and no package was ever
+    # installable. rename(2) within one filesystem is parent-agnostic;
+    # tmpfs is a single backend, so just restamp parent_idx + the name
+    # component (the dst, if any, was already unlinked above).
+    tmpfs_table[su].parent_idx = cast[int64](new_parent)
+    j: uint64 = 0
+    while j < new_len:
+        tmpfs_table[su].name[j] = new_comp[j]
+        j = j + 1
+    tmpfs_table[su].name[new_len] = 0
+    return 0
+
+
+_slot_path_buf: Array[256, uint8]
+
+
+def tmpfs_slot_name(slot: int32) -> Ptr[uint8]:
+    # Recover the FULL absolute path ("/tmp/.../name") for a given
+    # slot. Used by do_fwstat to convert an FD_TMPFS_MARK fd back into
+    # a path so the rename leg of wstat can route through vfs_rename
+    # (which expects an absolute /tmp/ path).
+    #
+    # In the tree model the slot only stores its bare name component
+    # plus a parent_idx, so we walk the parent chain to the root,
+    # collecting components, then emit them in forward order into a
+    # module-level scratch buffer. Single-threaded fs ops at this
+    # scale make the shared buffer safe. Returns a pointer to that
+    # buffer; callers must not write through it.
+    #
+    # Component slots are gathered into a small fixed array (a path
+    # can be at most TMPFS_MAX_FILES dirs deep). The walk records which
+    # synthetic root the chain terminates at so the right "/tmp" vs
+    # "/var" prefix gets emitted.
+    chain: Array[64, int32]
+    depth: uint64 = 0
+    root_slot: int32 = -1
+    cur: int64 = cast[int64](slot)
+    while cur >= 0:
+        # A synthetic root is any dir with parent_idx == -1 (slots 0/1
+        # are /tmp /var; the V3 overlay roots /usr /etc ... are ordinary
+        # parent_idx==-1 dirs whose name[] holds the component).
+        if tmpfs_table[cast[uint64](cur)].parent_idx == -1:
+            root_slot = cast[int32](cur)
+            cur = -1
+        else:
+            chain[depth] = cast[int32](cur)
+            depth = depth + 1
+            cur = tmpfs_table[cast[uint64](cur)].parent_idx
+    # Emit "/<root>" then each component, outermost to innermost. The
+    # reserved roots have empty name[], so map them explicitly; any other
+    # root emits "/" + its name[] component.
+    out: uint64 = 0
+    _slot_path_buf[out] = 47                            # '/'
+    out = out + 1
+    # Reserved roots store an empty name[]; map them to literal strings.
+    # Any other (V3 overlay) root carries its component in name[].
+    rname: Ptr[uint8] = cast[Ptr[uint8]](0)
+    if root_slot == cast[int32](TMPFS_ROOT_SLOT):
+        rname = "tmp"
+    elif root_slot == cast[int32](TMPFS_VAR_SLOT):
+        rname = "var"
+    elif root_slot >= 0:
+        rname = &tmpfs_table[cast[uint64](root_slot)].name[0]
+    if rname != cast[Ptr[uint8]](0):
+        rk: uint64 = 0
+        while rname[rk] != 0:
+            _slot_path_buf[out] = rname[rk]
+            out = out + 1
+            rk = rk + 1
+    d: int64 = cast[int64](depth) - 1
+    while d >= 0:
+        _slot_path_buf[out] = 47                       # '/'
+        out = out + 1
+        cslot: uint64 = cast[uint64](chain[cast[uint64](d)])
+        k: uint64 = 0
+        while tmpfs_table[cslot].name[k] != 0:
+            if out + 1 >= 256:
+                _slot_path_buf[out] = 0
+                return &_slot_path_buf[0]
+            _slot_path_buf[out] = tmpfs_table[cslot].name[k]
+            out = out + 1
+            k = k + 1
+        d = d - 1
+    _slot_path_buf[out] = 0
+    return &_slot_path_buf[0]
+
+
+def tmpfs_listdir(name: Ptr[char], buf: Ptr[uint8],
+                  count: uint64) -> int64:
+    # Pack the immediate children of directory `name` into `buf` as
+    # "NAME\n" lines. `name` is "/tmp" or "/tmp/<dir>/...". Returns the
+    # number of bytes written, or a negative TMPFS_E* (path missing /
+    # not a directory).
+    _tmpfs_ensure_root()
+    if count == 0:
+        return 0
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return cast[int64](slot)
+    if tmpfs_table[cast[uint64](slot)].kind != TMPFS_KIND_DIR:
+        return cast[int64](TMPFS_ENOTDIR)
+    slot64: int64 = cast[int64](slot)
+    out: uint64 = 0
+    i: uint64 = 0
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used != 0:
+            pidx: int64 = tmpfs_table[i].parent_idx
+            if pidx == slot64:
+                k: uint64 = 0
+                while tmpfs_table[i].name[k] != 0:
+                    if out + 1 >= count:
+                        return cast[int64](out)
+                    buf[out] = tmpfs_table[i].name[k]
+                    out = out + 1
+                    k = k + 1
+                if out + 1 >= count:
+                    return cast[int64](out)
+                buf[out] = 10                          # '\n'
+                out = out + 1
+        i = i + 1
+    return cast[int64](out)
+
+
+def tmpfs_write(slot: int32, src: Ptr[uint8], pos: uint64,
+                count: uint64) -> uint64:
+    # Write up to `count` bytes from `src` to entry `slot` starting at
+    # offset `pos`. Allocates 64 KiB chunks on demand as the write
+    # extends past chunk boundaries; caps at TMPFS_FILE_CAP (16 MiB)
+    # — short-writes if a chunk allocation fails or pos would step past
+    # the cap. Returns bytes actually written; a return < count tells
+    # the caller's _write_full loop to stop and surface a short-write
+    # error (which is exactly what dpkg / apt already do).
+    cslot: int32 = _tmpfs_canon(slot)
+    su: uint64 = cast[uint64](cslot)
+    # §memfd: file seals gate the write. F_SEAL_WRITE forbids ALL writes;
+    # F_SEAL_GROW forbids any write that would extend the file past its
+    # current size. Both surface as -EPERM via the negative-return contract
+    # tmpfs_write_checked exposes to the syscall layer; the legacy
+    # tmpfs_write entry point just short-circuits to 0 (a short-write that
+    # the caller's _write_full loop reports as a failure). Ordinary tmpfs
+    # files carry seals == 0 so this is a no-op for them.
+    sealb: uint64 = tmpfs_table[su].seals
+    if (sealb & F_SEAL_WRITE) != 0:
+        return 0
+    cap: uint64 = TMPFS_FILE_CAP
+    if pos >= cap:
+        return 0
+    if (sealb & F_SEAL_GROW) != 0:
+        # A grow-sealed file may only be written within its existing
+        # bounds. Refuse any write whose start is already past EOF, and
+        # clamp a straddling write to the current size below.
+        if pos >= tmpfs_table[su].size:
+            return 0
+    remaining: uint64 = cap - pos
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    if (sealb & F_SEAL_GROW) != 0:
+        # Clamp a straddling write so it never extends the file: only the
+        # bytes that land within [pos, current_size) are written.
+        cur_size: uint64 = tmpfs_table[su].size
+        if pos + take > cur_size:
+            take = cur_size - pos
+    out_done: uint64 = 0
+    cur_pos: uint64 = pos
+    while out_done < take:
+        chunk_idx: uint64 = cur_pos / TMPFS_CHUNK_SIZE
+        in_chunk: uint64 = cur_pos % TMPFS_CHUNK_SIZE
+        room_in_chunk: uint64 = TMPFS_CHUNK_SIZE - in_chunk
+        copy: uint64 = take - out_done
+        if copy > room_in_chunk:
+            copy = room_in_chunk
+        chunk: uint64 = _tmpfs_get_chunk(cslot, chunk_idx, 1)
+        if chunk == 0:
+            # Either chunk_idx >= TMPFS_MAX_CHUNKS (file cap reached)
+            # or kmalloc failed. Bail with whatever we got so the
+            # caller sees a short-write.
+            break
+        memcpy(cast[Ptr[uint8]](chunk + in_chunk),
+               cast[Ptr[uint8]](cast[uint64](src) + out_done),
+               copy)
+        out_done = out_done + copy
+        cur_pos = cur_pos + copy
+    new_end: uint64 = pos + out_done
+    if new_end > tmpfs_table[su].size:
+        tmpfs_table[su].size = new_end
+    # §stat-mtime: a successful data write is a content change — restamp
+    # so the file's mtime advances exactly once per modification (and is
+    # STABLE between writes). This is what apt's index-freshness check
+    # keys on across `apt-get update` -> `apt-get install`.
+    if out_done > 0:
+        tmpfs_table[su].mtime = _tmpfs_now()
+    return out_done
+
+
+# --- symlinks + hard links ------------------------------------------
+#
+# tmpfs gains real (RAM-backed) symlink and hard-link support, mirroring
+# the ext4 backend (fs/ext4.ad: ext4_create_symlink / ext4_hardlink) but
+# without any slow on-disk path — a symlink's target is a single kmalloc'd
+# string stored in the slot's `data` pointer; a hard link is a second
+# named slot whose `link_to` aliases the data-owning slot (see TmpfsEntry
+# and _tmpfs_canon). The path resolver in fs/vfs.ad follows a tmpfs
+# symlink transparently on open.
+
+def _cstr_len(s: Ptr[char]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0:
+        i = i + 1
+    return i
+
+
+def tmpfs_is_symlink(slot: int32) -> int32:
+    # True (1) if `slot` is a tmpfs symlink entry. Used by the VFS
+    # resolver to decide whether to substitute the target on open.
+    if slot < 0:
+        return 0
+    if tmpfs_table[cast[uint64](slot)].kind == TMPFS_KIND_SYMLINK:
+        return 1
+    return 0
+
+
+def tmpfs_path_is_symlink(name: Ptr[char]) -> int32:
+    # True if `name` resolves to a tmpfs symlink entry.
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return 0
+    return tmpfs_is_symlink(slot)
+
+
+def tmpfs_readlink(slot: int32) -> Ptr[uint8]:
+    # Return the NUL-terminated target string of a tmpfs symlink `slot`,
+    # or a NULL pointer if the slot is not a symlink (or has no stored
+    # target). The returned pointer is into the slot's kmalloc'd backing
+    # store — callers must not write through it, and it stays valid until
+    # the symlink is unlinked.
+    if slot < 0:
+        return cast[Ptr[uint8]](0)
+    su: uint64 = cast[uint64](slot)
+    if tmpfs_table[su].kind != TMPFS_KIND_SYMLINK:
+        return cast[Ptr[uint8]](0)
+    return cast[Ptr[uint8]](tmpfs_table[su].data)
+
+
+def tmpfs_readlink_path(name: Ptr[char]) -> Ptr[uint8]:
+    # Resolve `name` to a tmpfs symlink slot and return its target
+    # string (NUL-terminated), or NULL if `name` is not a tmpfs symlink.
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return cast[Ptr[uint8]](0)
+    return tmpfs_readlink(slot)
+
+
+def tmpfs_create_symlink(linkname: Ptr[char], target: Ptr[char]) -> int32:
+    # Create a symlink at `linkname` whose contents are the string
+    # `target`. Allocates a slot, marks it kind = SYMLINK, and stores a
+    # kmalloc'd NUL-terminated copy of `target` inline in `data`
+    # (RAM-backed — no slow-symlink data-block path). Returns:
+    #     0  on success
+    #   -2  (-ENOENT)        a parent component is missing
+    #  -17  (-EEXIST)        the name already exists
+    #  -20  (-ENOTDIR)       a parent component is a file
+    #  -28  (-ENOSPC)        out of entry slots / kmalloc failed
+    #  -36  (-ENAMETOOLONG)  the final component is too long
+    _tmpfs_ensure_root()
+    if is_tmpfs_dir_path(linkname) != 0:
+        return TMPFS_EEXIST                           # "/tmp" exists
+    comp: Array[256, uint8]        # TMPFS_NAME_LEN component buffer
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(linkname, &comp[0], &clen)
+    if parent < 0:
+        return parent
+    if _find_child(cast[int64](parent), &comp[0], clen) >= 0:
+        return TMPFS_EEXIST
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        printk0("tmpfs: out of entry slots (symlink)\n")
+        return TMPFS_ENOSPC
+    tlen: uint64 = _cstr_len(target)
+    km_set_site(KM_SITE_TMPFS)
+    buf: uint64 = kmalloc(tlen + 1)
+    if buf == 0:
+        return TMPFS_ENOSPC
+    tb: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    ti: uint64 = 0
+    while ti < tlen:
+        tb[ti] = cast[uint8](target[ti])
+        ti = ti + 1
+    tb[tlen] = 0
+    su: uint64 = cast[uint64](slot)
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[su].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[su].name[clen] = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_SYMLINK
+    tmpfs_table[su].parent_idx = cast[int64](parent)
+    tmpfs_table[su].size       = tlen
+    tmpfs_table[su].data       = buf
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    # arch audit §2.2: symlinks are conventionally 0777 (lookup gates
+    # via the resolved target's own mode); stamp creator uid.
+    tmpfs_table[su].owner_uid  = current_task_uid()
+    tmpfs_table[su].mode       = 0x1FF                # 0777
+    tmpfs_table[su].mtime      = _tmpfs_now()
+    return 0
+
+
+def tmpfs_hardlink(oldname: Ptr[char], newname: Ptr[char]) -> int32:
+    # Create a second name `newname` aliasing the SAME underlying file
+    # data as `oldname`. Allocates a fresh slot for `newname` whose
+    # link_to points at the data-owning ("canonical") slot of `oldname`,
+    # and increments the canonical slot's link count. Reads/writes
+    # through either name reach the same bytes (_tmpfs_canon). Within a
+    # single tmpfs server only — the VFS rejects cross-filesystem links
+    # with EXDEV before reaching here. Returns:
+    #     0  on success
+    #   -2  (-ENOENT)        oldname missing, or a newname parent missing
+    #  -17  (-EEXIST)        newname already exists
+    #  -20  (-ENOTDIR)       a newname parent component is a file, OR
+    #                        oldname is a directory (no dir hard links)
+    #  -28  (-ENOSPC)        out of entry slots
+    #  -36  (-ENAMETOOLONG)  newname's final component is too long
+    _tmpfs_ensure_root()
+    src: int32 = _resolve_full(oldname)
+    if src < 0:
+        return TMPFS_ENOENT
+    su: uint64 = cast[uint64](src)
+    if tmpfs_table[su].parent_idx == -1 \
+            and tmpfs_table[su].kind == TMPFS_KIND_DIR:
+        return TMPFS_ENOTDIR
+    if tmpfs_table[su].kind == TMPFS_KIND_DIR:
+        return TMPFS_ENOTDIR                          # no hard links to dirs
+    # Hard-link to the DATA-OWNING slot, never to another alias.
+    canon: int32 = _tmpfs_canon(src)
+    if is_tmpfs_dir_path(newname) != 0:
+        return TMPFS_EEXIST
+    comp: Array[256, uint8]        # TMPFS_NAME_LEN component buffer
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(newname, &comp[0], &clen)
+    if parent < 0:
+        return parent
+    if _find_child(cast[int64](parent), &comp[0], clen) >= 0:
+        return TMPFS_EEXIST
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        printk0("tmpfs: out of entry slots (hardlink)\n")
+        return TMPFS_ENOSPC
+    nu: uint64 = cast[uint64](slot)
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[nu].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[nu].name[clen] = 0
+    tmpfs_table[nu].used       = 1
+    tmpfs_table[nu].kind       = tmpfs_table[cast[uint64](canon)].kind
+    tmpfs_table[nu].parent_idx = cast[int64](parent)
+    tmpfs_table[nu].size       = 0          # size lives on the canon slot
+    tmpfs_table[nu].data       = 0          # data lives on the canon slot
+    tmpfs_table[nu].nlink      = 0          # count lives on the canon slot
+    tmpfs_table[nu].link_to    = cast[int64](canon)
+    # arch audit §2.2: alias slot inherits the canonical entry's owner+mode
+    # so a hardlink alias name reads the same permission triple as its
+    # canonical (the alias slot's owner/mode are not used in the read path
+    # — _tmpfs_canon redirects — but kept consistent for stat correctness).
+    tmpfs_table[nu].owner_uid  = tmpfs_table[cast[uint64](canon)].owner_uid
+    tmpfs_table[nu].mode       = tmpfs_table[cast[uint64](canon)].mode
+    cu: uint64 = cast[uint64](canon)
+    tmpfs_table[cu].nlink = tmpfs_table[cu].nlink + 1
+    return 0
+
+
+# --- V2: /var skeleton ----------------------------------------------
+#
+# Defined at the tail of the module so they sit after tmpfs_mkdir and
+# the TMPFS_E* constants they reference.
+
+def _skel_mkdir(path: Ptr[char]):
+    # Create one skeleton directory, tolerating "already exists".
+    # tmpfs_mkdir returns 0 on success, -17 (-EEXIST) if `path` is
+    # already present — both are fine for an idempotent boot routine.
+    # Any other negative result means a parent component is missing or
+    # the slot table is full; surface it on the serial log so a botched
+    # skeleton is debuggable, but never abort boot over /var.
+    rc: int32 = tmpfs_mkdir(path)
+    if rc != 0:
+        if rc != TMPFS_EEXIST:
+            printk1("tmpfs: /var skeleton mkdir failed rc=%d\n", rc)
+
+
+def tmpfs_var_skeleton_init():
+    # Pre-create the standard /var skeleton so apt / dpkg / httpd find
+    # canonical paths the moment they run. Directories are created
+    # parent-first because tmpfs_mkdir requires every intermediate
+    # component to already exist. /var itself is the synthetic mount
+    # root (slot 1, installed by _tmpfs_ensure_root) so it is NOT
+    # mkdir'd here — only its children.
+    #
+    # NOTE: /var is RAM-backed (tmpfs) and therefore VOLATILE — the
+    # whole tree, skeleton included, is lost on reboot. That is correct
+    # for V0: /var/cache/apt is a cache and /var/lib/dpkg is rebuilt by
+    # the package tooling. A real-disk-backed, persistent /var is a
+    # later concern. Re-running this routine on a fresh boot simply
+    # re-creates the skeleton.
+    _tmpfs_ensure_root()
+    _skel_mkdir("/var/lib")
+    _skel_mkdir("/var/lib/dpkg")
+    _skel_mkdir("/var/lib/dpkg/info")
+    _skel_mkdir("/var/lib/ssh")
+    _skel_mkdir("/var/cache")
+    _skel_mkdir("/var/cache/apt")
+    _skel_mkdir("/var/cache/apt/archives")
+    _skel_mkdir("/var/www")
+    # hpm (docs/packages.md): /var/lib/hpm holds installed.json + the
+    # per-package file lists used by `hpm remove`. RAM-backed like the
+    # rest of /var; a real-disk-backed persistent /var is a later
+    # concern (real installs need it; the live demo against the live
+    # repo loses install state on reboot, which is fine for v1).
+    _skel_mkdir("/var/lib/hpm")
+    # /var/log + /var/log/svc: persistent (boot-lifetime) log capture
+    # for hamsh's service supervisor. Each managed service has its
+    # stdout+stderr redirected to /var/log/svc/<name>.log via
+    # tmpfs_open_for_append + DEVFD_FILE_APPEND, so output survives
+    # the original child's exit and is read back via `cat`. RAM-backed
+    # like the rest of /var — lost on reboot, which is the right
+    # default for boot-time service logs (no rotation, no persistence
+    # commitment yet).
+    _skel_mkdir("/var/log")
+    _skel_mkdir("/var/log/svc")
+
+
+# --- §memfd: anonymous tmpfs files + file sealing ---------------------
+#
+# A memfd is a tmpfs file with NO path: it lives in a slot but its
+# parent_idx is -1 and it is not reachable through name resolution
+# (_resolve_full never visits it because no directory lists it as a
+# child). The fd returned by memfd_create(2) holds the slot index in
+# the per-fd FD_TMPFS_MARK record, so read/write/lseek/ftruncate all
+# reuse the existing tmpfs data path. When the last fd closes, the slot
+# is released via tmpfs_release_anon (memfds have no link count to walk).
+#
+# Sealing is per-slot state (TmpfsEntry.seals + .seal_allow), enforced
+# inside tmpfs_write (F_SEAL_WRITE / F_SEAL_GROW) and tmpfs_ftruncate
+# (F_SEAL_SHRINK / F_SEAL_GROW). fcntl(F_ADD_SEALS / F_GET_SEALS) routes
+# through tmpfs_add_seals / tmpfs_get_seals.
+
+def tmpfs_create_anon(name: Ptr[char], allow_sealing: int32) -> int32:
+    # Allocate a fresh anonymous (path-less) tmpfs FILE slot for a memfd.
+    # `name` is a short display label (memfd_create's name arg, prefixed
+    # "memfd:" by Linux for /proc/<pid>/fd) copied into the slot's name
+    # field truncated to TMPFS_NAME_LEN-1. `allow_sealing` != 0 records
+    # MFD_ALLOW_SEALING so F_ADD_SEALS is permitted later.
+    # Returns the slot index, or TMPFS_ENOSPC (-28) if no slot is free.
+    _tmpfs_ensure_root()
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        return TMPFS_ENOSPC
+    su: uint64 = cast[uint64](slot)
+    # Copy the label (single component, truncated). memfds never path-
+    # resolve, so this is purely cosmetic for /proc.
+    i: uint64 = 0
+    while i < TMPFS_NAME_LEN - 1:
+        c: uint8 = cast[Ptr[uint8]](name)[i]
+        if c == 0:
+            break
+        tmpfs_table[su].name[i] = c
+        i = i + 1
+    tmpfs_table[su].name[i]    = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_FILE
+    tmpfs_table[su].parent_idx = -1               # anonymous: no parent dir
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    tmpfs_table[su].seals      = 0
+    tmpfs_table[su].seal_allow = 0
+    # arch audit §2.2: memfd is the creator's private file (Linux memfd
+    # semantics) — owner uid = creator; mode 0600.
+    tmpfs_table[su].owner_uid  = current_task_uid()
+    tmpfs_table[su].mode       = 0x180                # 0600
+    tmpfs_table[su].mtime      = _tmpfs_now()
+    if allow_sealing != 0:
+        tmpfs_table[su].seal_allow = 1
+    # NOTE: .data may carry a stale chunk-table from a prior occupant of
+    # this slot; the write path reuses or overwrites it, and size==0 means
+    # a read sees nothing until a write extends the file. Free any stale
+    # storage so a fresh memfd starts genuinely empty.
+    _tmpfs_free_storage(su)
+    return slot
+
+
+def tmpfs_anon_ref(slot: int32):
+    # §SCM_RIGHTS: take one extra reference on an anonymous memfd slot.
+    # A normal memfd is reached through exactly ONE namec chan (fork/dup
+    # share it via namec_chan_ref), so nlink stays 1 and the last chan
+    # close frees it. Passing the fd over AF_UNIX SCM_RIGHTS creates a
+    # SECOND, INDEPENDENT chan in the receiver (a fresh namec_open_tmpfs_
+    # file), whose close would otherwise call tmpfs_release_anon and free
+    # the backing out from under the still-open sender fd. Bump nlink so
+    # the slot survives until BOTH holders release; tmpfs_release_anon
+    # only frees when nlink reaches 0. No-op on a non-anon slot.
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES:
+        return
+    if tmpfs_table[su].used == 0:
+        return
+    if tmpfs_is_anon(slot) == 0:
+        return
+    tmpfs_table[su].nlink = tmpfs_table[su].nlink + 1
+
+
+def tmpfs_release_anon(slot: int32):
+    # Release an anonymous memfd slot when its last fd closes. Frees the
+    # chunk chain and retires the slot. Safe to call on a non-anon slot
+    # too, but only the memfd close path uses it.
+    #
+    # §SCM_RIGHTS: an anon slot carries an open-reference count in nlink
+    # (see tmpfs_anon_ref). Each independent chan holder decrements once;
+    # the storage is freed only when the count reaches zero, so a memfd
+    # duplicated across processes via SCM_RIGHTS is not torn down while a
+    # peer still maps its pages.
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES:
+        return
+    if tmpfs_table[su].used == 0:
+        return
+    # Only anonymous memfd slots are reference-reclaimed here. A NAMED
+    # tmpfs file passed via SCM_RIGHTS persists by path (its slot is owned
+    # by the tree, not by open fds), so releasing it must be a no-op —
+    # guard so a stray SCM drain/close can never free a named file's data.
+    if tmpfs_is_anon(slot) == 0:
+        return
+    if tmpfs_table[su].nlink > 1:
+        tmpfs_table[su].nlink = tmpfs_table[su].nlink - 1
+        return
+    _tmpfs_free_storage(su)
+    tmpfs_table[su].used       = 0
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].link_to    = -1
+    tmpfs_table[su].seals      = 0
+    tmpfs_table[su].seal_allow = 0
+    tmpfs_table[su].name[0]    = 0
+
+
+def tmpfs_get_seals(slot: int32) -> int64:
+    # F_GET_SEALS: return the current seal bitmask for `slot`, or
+    # TMPFS_EINVAL (-22) for an invalid/retired slot.
+    if slot < 0:
+        return cast[int64](TMPFS_EINVAL)
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES or tmpfs_table[su].used == 0:
+        return cast[int64](TMPFS_EINVAL)
+    return cast[int64](tmpfs_table[cast[uint64](_tmpfs_canon(slot))].seals)
+
+
+def tmpfs_add_seals(slot: int32, new_seals: uint64,
+                    writable_refs: int32) -> int32:
+    # F_ADD_SEALS: OR `new_seals` into the file's seal set, enforcing the
+    # Linux rules:
+    #   - file must have been created with MFD_ALLOW_SEALING  -> else EPERM
+    #   - F_SEAL_SEAL already set forbids any further seal     -> EPERM
+    #   - only recognised seal bits may be set                 -> else EINVAL
+    #   - adding F_SEAL_WRITE while writable refs (mmaps) exist -> EBUSY
+    # Returns 0 on success. `writable_refs` is the count of writable
+    # mmaps on the file; Hamnix has no per-file mmap-writable tracking
+    # yet, so the syscall layer passes 0 and we enforce the simpler
+    # "no writable refs" rule (always satisfiable) — documented below.
+    if slot < 0:
+        return TMPFS_EINVAL
+    cu: uint64 = cast[uint64](_tmpfs_canon(slot))
+    if cu >= TMPFS_MAX_FILES or tmpfs_table[cu].used == 0:
+        return TMPFS_EINVAL
+    if tmpfs_table[cu].seal_allow == 0:
+        return TMPFS_EPERM                        # no MFD_ALLOW_SEALING
+    if (new_seals & ~cast[uint64](F_SEAL_ALL)) != 0:
+        return TMPFS_EINVAL                       # unknown seal bit
+    if (tmpfs_table[cu].seals & F_SEAL_SEAL) != 0:
+        return TMPFS_EPERM                        # already fully sealed
+    if (new_seals & F_SEAL_WRITE) != 0:
+        if writable_refs != 0:
+            return TMPFS_EBUSY                     # live writable mmap
+    tmpfs_table[cu].seals = tmpfs_table[cu].seals | new_seals
+    return 0
+
+
+def tmpfs_ftruncate(slot: int32, length: uint64) -> int32:
+    # ftruncate(2) on a tmpfs (incl. memfd) file. Sets the file size to
+    # exactly `length`, enforcing seals:
+    #   - F_SEAL_WRITE  : any size change is a write -> EPERM
+    #   - F_SEAL_SHRINK : refuse length < current size -> EPERM
+    #   - F_SEAL_GROW   : refuse length > current size -> EPERM
+    # Growing zero-fills (reads of unallocated chunks already return
+    # zeros). Shrinking frees no chunks here (the slot is RAM-cheap and
+    # reclaimed wholesale on close); it just lowers the logical size so
+    # reads stop early. Returns 0 on success.
+    if slot < 0:
+        return TMPFS_EINVAL
+    cu: uint64 = cast[uint64](_tmpfs_canon(slot))
+    if cu >= TMPFS_MAX_FILES or tmpfs_table[cu].used == 0:
+        return TMPFS_EINVAL
+    if tmpfs_table[cu].kind != TMPFS_KIND_FILE:
+        return TMPFS_EINVAL
+    # Allow a large SPARSE logical size (a wl_shm pool ftruncates to a
+    # generous ceiling and touches only its low buffers) — bounded by the
+    # logical cap, NOT the backed-chunk cap. Offsets above TMPFS_FILE_CAP
+    # simply never get a backing chunk (tmpfs_page_phys returns 0 there).
+    if length > TMPFS_LOGICAL_CAP:
+        return TMPFS_EINVAL
+    sealb: uint64 = tmpfs_table[cu].seals
+    cur: uint64 = tmpfs_table[cu].size
+    if length != cur:
+        if (sealb & F_SEAL_WRITE) != 0:
+            return TMPFS_EPERM
+    if length < cur:
+        if (sealb & F_SEAL_SHRINK) != 0:
+            return TMPFS_EPERM
+    if length > cur:
+        if (sealb & F_SEAL_GROW) != 0:
+            return TMPFS_EPERM
+    tmpfs_table[cu].size = length
+    # §stat-mtime: ftruncate is a content/metadata change — restamp.
+    if length != cur:
+        tmpfs_table[cu].mtime = _tmpfs_now()
+    return 0
+
+
+# --- F10-6 #458 expansion: Plan 9 Dir-record listing for tmpfs ------
+#
+# Migration of the tmpfs directory walk (/tmp, /var, /tmp/<dir>/...) from
+# NAME\n lines to Plan 9 Dir records. Each entry now reports a real size
+# (tmpfs_table[i].size for files; 0 for directories), owner uid
+# ("hostowner" by convention — TmpfsEntry.owner_uid is a numeric uid that
+# the F10-6 wire emits as a string), and the entry's per-slot low-9-bit
+# mode plus DMDIR when the entry is a directory. qpath = slot+1 so a
+# stable per-entry identifier round-trips through Dir.qid_path.
+#
+# See lib/p9dir.ad for the wire format and devsrv_list_dir for the
+# original pattern. v1 emits a constant "hostowner" uid string (the
+# numeric owner_uid → uname mapping is a follow-on for the F10
+# user-attribution work).
+
+from lib.p9dir import p9_dir_encode_into
+from lib.9p.9p import P9_QTDIR, P9_QTFILE
+
+_TMPFS_DMDIR: uint32 = 0x80000000
+_tmpfs_uname: Array[16, uint8]
+_tmpfs_uname_inited: int32 = 0
+
+
+def _tmpfs_init_uname():
+    if _tmpfs_uname_inited != 0:
+        return
+    s: Ptr[uint8] = "hostowner"
+    i: uint64 = 0
+    while s[i] != 0:
+        _tmpfs_uname[i] = s[i]
+        i = i + 1
+    _tmpfs_uname[i] = 0
+    _tmpfs_uname_inited = 1
+
+
+def tmpfs_list_dir(name: Ptr[char], out_buf: Ptr[uint8],
+                   out_max: uint64) -> int64:
+    # F10-6 #458 expansion: like tmpfs_listdir but emits one Plan 9
+    # Dir record per immediate child of directory `name` instead of
+    # NAME\n lines. Stops cleanly at the first entry that would
+    # overflow (no partial record).
+    _tmpfs_ensure_root()
+    _tmpfs_init_uname()
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return cast[int64](slot)
+    if tmpfs_table[cast[uint64](slot)].kind != TMPFS_KIND_DIR:
+        return cast[int64](TMPFS_ENOTDIR)
+    slot64: int64 = cast[int64](slot)
+    uname_p: Ptr[uint8] = cast[Ptr[uint8]](&_tmpfs_uname[0])
+    uname_len: uint64 = 0
+    while _tmpfs_uname[uname_len] != 0:
+        uname_len = uname_len + 1
+    pos: uint64 = 0
+    i: uint64 = 0
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used != 0:
+            pidx: int64 = tmpfs_table[i].parent_idx
+            if pidx == slot64:
+                nlen: uint64 = 0
+                while tmpfs_table[i].name[nlen] != 0:
+                    nlen = nlen + 1
+                if nlen > 0:
+                    qtype: uint8 = P9_QTFILE
+                    mode_v: uint32 = tmpfs_table[i].mode & 0x1FF
+                    elen: uint64 = tmpfs_table[i].size
+                    if tmpfs_table[i].kind == TMPFS_KIND_DIR:
+                        qtype = P9_QTDIR
+                        mode_v = mode_v | _TMPFS_DMDIR
+                        elen = 0
+                    wrote: uint64 = p9_dir_encode_into(
+                        out_buf, pos, out_max,
+                        qtype,                          # qid_type
+                        0,                              # qid_version
+                        i + 1,                          # qid_path
+                        mode_v,                         # mode
+                        0, 0,                           # atime, mtime
+                        elen,                           # length
+                        cast[Ptr[uint8]](&tmpfs_table[i].name[0]), nlen,
+                        uname_p, uname_len,             # uid
+                        uname_p, uname_len,             # gid
+                        uname_p, 0)                     # muid empty
+                    if wrote == 0:
+                        return cast[int64](pos)
+                    pos = pos + wrote
+        i = i + 1
+    return cast[int64](pos)
+
+
+def tmpfs_is_anon(slot: int32) -> int32:
+    # Return 1 if `slot` is a live anonymous memfd file (parent_idx == -1,
+    # not one of the two reserved synthetic roots). Used by vfs_close to
+    # decide whether closing an FD_TMPFS_MARK fd should reclaim the slot
+    # (memfds: yes; named /tmp or /var files: no, they persist by path).
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES:
+        return 0
+    if su == TMPFS_ROOT_SLOT or su == TMPFS_VAR_SLOT:
+        return 0
+    if tmpfs_table[su].used == 0:
+        return 0
+    # An anon memfd is a FILE with parent_idx == -1 (it lives in no
+    # directory) → reclaim on close. A V3 overlay root (/usr, /etc, ...)
+    # is a DIR with parent_idx == -1 → it must persist, never reclaim.
+    if tmpfs_table[su].parent_idx == -1:
+        if tmpfs_table[su].kind == TMPFS_KIND_DIR:
+            return 0
+        return 1
+    return 0

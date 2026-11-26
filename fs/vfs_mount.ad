@@ -1,0 +1,339 @@
+# HackOS: copied from Hamnix fs/vfs_mount.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
+# see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
+# fs/vfs_mount.ad
+#
+# BACKEND-INTERNAL key router (DEMOTED by the F1 substrate, audit
+# #444). This table is NOT the namespace: the per-Pgrp mount table in
+# sys/src/9/port/chan.ad (ns_walk) is the sole authority on whether a
+# name resolves and to which server. By the time a path reaches
+# vfs_fs_kind() it has already been resolved through the caller's
+# namespace by fs/vfs.ad resolve_path and LOCALIZED back into the
+# legacy backend key space (#t -> tmpfs keys, #e -> /ext, #f -> /mnt,
+# #r -> cpio keys). This module only routes those post-resolution
+# backend keys to the owning filesystem implementation.
+#
+# The Hamnix backend key table + per-backend filesystem-server selection.
+#
+# BEFORE this module was wired, fs/vfs.ad selected a filesystem backend
+# for every VFS operation by running a ladder of ~84 literal-path
+# predicate calls (is_tmpfs_path / is_fat_path / is_ext_path / ...).
+# The path STRING picked the backend by strcmp, so filesystems could
+# not be mounted/unmounted at namespace points — they were wired in by
+# prefix compares scattered across vfs_open / vfs_open_write /
+# vfs_listdir / vfs_stat / vfs_unlink / vfs_mkdir / vfs_rename.
+#
+# This module replaces the SELECTION mechanism with a real mount table:
+#   * vfs_mount(prefix, backend_id, strip, shadow) registers an entry.
+#   * vfs_fs_kind(path) does a LONGEST-PREFIX match over the backend
+#     keys and returns the backend.
+#   * vfs_fs_rel(path) returns the backend-relative tail (the bytes the
+#     backend op expects — the prefix already stripped the way each
+#     backend's old strip_*_prefix helper did).
+#   * vfs_fs_shadow(path) reports whether the matched mount permits a
+#     fall-through to the root (cpio) mount on a per-entry miss — that
+#     is the historical "/var is tmpfs-first but cpio-baked entries
+#     still show" rule.
+#
+# The cpio/initramfs backend is the ROOT mount ("/", strip 0) and the
+# fallback for anything no longer mount matches. The backend bodies
+# stay exactly where they live (fs/tmpfs.ad, fs/fat.ad, fs/ext4.ad,
+# fs/cpio.ad); only the way vfs.ad CHOOSES one is replaced.
+#
+# Linux mapping: fs/namespace.c + struct vfsmount, simplified to a flat
+# longest-prefix table (Hamnix has no per-process mount propagation at
+# this layer yet — namespace binds live in chan.ad / namec.ad).
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+MNT_NAME_MAX:    uint64 = 32
+# V3: bumped from 16 to 24 — the writable-overlay base now registers a
+# tmpfs mount for every top-level dir apt/dpkg writes into (/var /usr
+# /etc /bin /sbin /lib /lib64 /opt /run /srv) on top of / /tmp + the
+# /mnt FAT + /ext ext4 dynamic mounts, exceeding the old 16-slot table.
+MOUNT_TABLE_MAX: uint64 = 24
+
+# Backend id enumeration. 0 means an unused slot. These are the
+# discriminators vfs.ad switches on; the values line up with the
+# historical FS_KIND_* scaffold so callers reading the table stay
+# stable.
+FS_KIND_UNUSED: uint32 = 0
+FS_KIND_CPIO:   uint32 = 1      # initramfs (read-only baked root)
+FS_KIND_PROCFS: uint32 = 2      # reserved (procfs is a #p server now)
+FS_KIND_TMPFS:  uint32 = 3      # RAM-backed writable subtree (/tmp, /var)
+FS_KIND_FAT:    uint32 = 4      # FAT volume (/mnt)
+FS_KIND_EXT4:   uint32 = 5      # ext4 volume (/ext)
+FS_KIND_DEVFS:  uint32 = 6      # reserved (devfs is a #c server now)
+
+
+class VfsMountEntry:
+    used:        uint32
+    fs_kind:     uint32      # 0=unused, 1=cpio, 3=tmpfs, 4=fat, 5=ext4
+    name_len:    uint32      # mountpoint byte length (no NUL)
+    strip_len:   uint32      # bytes to strip for the backend-relative tail
+    shadow:      uint32      # 1 = miss falls through to root mount (cpio)
+    pad:         uint32
+    mountpoint:  Array[32, uint8]    # NUL-terminated path
+    private:     uint64              # FS-specific cookie (slot id, etc)
+
+
+vfs_mount_table: Array[24, VfsMountEntry]      # MOUNT_TABLE_MAX
+vfs_nr_mounts:   uint64 = 0
+
+
+def _mnt_name_copy(dst: Ptr[uint8], src: Ptr[char], max: uint64) -> uint32:
+    # Copy NUL-terminated src into dst, cap at max-1. Returns the byte
+    # count written (NOT counting the terminator) or 0 if src was too
+    # long / empty. Same shape as fs/tmpfs.ad::_name_copy.
+    i: uint64 = 0
+    while i + 1 < max:
+        c: uint8 = cast[uint8](src[i] & 0xFF)
+        dst[i] = c
+        if c == 0:
+            return cast[uint32](i)
+        i = i + 1
+    if src[i] == 0:
+        dst[i] = 0
+        return cast[uint32](i)
+    return 0
+
+
+def _mnt_is_prefix(prefix: Ptr[uint8], plen: uint32,
+                   path: Ptr[char]) -> int32:
+    # True if `path` starts with the first `plen` bytes of `prefix` AND
+    # the boundary in `path` is a path separator OR end-of-string. The
+    # boundary guard stops "/ext" matching "/extfoo" — the same trick
+    # is_subdir() / path_is_under() use in fs/namespace.c.
+    i: uint64 = 0
+    pl: uint64 = cast[uint64](plen)
+    while i < pl:
+        if path[i] == 0:
+            return 0                          # path shorter than prefix
+        pc: int32 = cast[int32](prefix[i])
+        nc: int32 = path[i]
+        if pc != nc:
+            return 0
+        i = i + 1
+    # The root mount "/" (plen 1, prefix[0]=='/') matches everything
+    # absolute — the path already starts with '/', so no boundary check.
+    if pl == 1:
+        if prefix[0] == 47:                   # '/'
+            return 1
+    boundary: int32 = path[pl]
+    if boundary == 0:
+        return 1
+    if boundary == 47:                        # '/'
+        return 1
+    return 0
+
+
+def _mnt_path_eq(stored: Ptr[uint8], slen: uint32,
+                 path: Ptr[char]) -> int32:
+    # True if the NUL-terminated `path` equals the first `slen` bytes of
+    # `stored` AND path[slen] is the terminator (exact mountpoint match).
+    i: uint64 = 0
+    sl: uint64 = cast[uint64](slen)
+    while i < sl:
+        if path[i] == 0:
+            return 0
+        if cast[int32](stored[i]) != path[i]:
+            return 0
+        i = i + 1
+    if path[sl] == 0:
+        return 1
+    return 0
+
+
+def vfs_mount(path: Ptr[char], fs_kind: uint32, strip: uint32,
+              shadow: uint32) -> int32:
+    # Register a mount. `path` is the mountpoint prefix (e.g. "/ext"),
+    # `fs_kind` the backend id, `strip` the byte count vfs_fs_rel removes
+    # to hand the backend its relative tail (e.g. 5 for "/ext/"), and
+    # `shadow` 1 when a per-entry miss should fall through to the root
+    # mount. Returns the slot id or -1 if the table is full / bad path.
+    #
+    # Idempotent by mountpoint: re-registering an existing mountpoint
+    # UPDATES that slot in place (so repeated *_init calls — the kernel
+    # has many ext4_init call sites for the installer + smoke tests —
+    # don't pile up duplicate entries). The single-mount FS state lives
+    # in the backend; the table just records where it is bound.
+    d: uint64 = 0
+    while d < MOUNT_TABLE_MAX:
+        if vfs_mount_table[d].used != 0:
+            if _mnt_path_eq(&vfs_mount_table[d].mountpoint[0],
+                            vfs_mount_table[d].name_len, path) != 0:
+                vfs_mount_table[d].fs_kind   = fs_kind
+                vfs_mount_table[d].strip_len = strip
+                vfs_mount_table[d].shadow    = shadow
+                return cast[int32](d)
+        d = d + 1
+    i: uint64 = 0
+    while i < MOUNT_TABLE_MAX:
+        if vfs_mount_table[i].used == 0:
+            n: uint32 = _mnt_name_copy(&vfs_mount_table[i].mountpoint[0],
+                                       path, MNT_NAME_MAX)
+            if n == 0:
+                printk0("vfs_mount: bad mountpoint\n")
+                return -1
+            vfs_mount_table[i].fs_kind   = fs_kind
+            vfs_mount_table[i].name_len  = n
+            vfs_mount_table[i].strip_len = strip
+            vfs_mount_table[i].shadow    = shadow
+            vfs_mount_table[i].private   = 0
+            vfs_mount_table[i].used      = 1
+            vfs_nr_mounts = vfs_nr_mounts + 1
+            return cast[int32](i)
+        i = i + 1
+    printk0("vfs_mount: table full\n")
+    return -1
+
+
+def vfs_umount(slot: int32) -> int32:
+    # Free a slot. Returns 0 on success, -1 on out-of-range / already
+    # free. Does not tear down the FS itself — that is the caller's job.
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= MOUNT_TABLE_MAX:
+        return -1
+    if vfs_mount_table[su].used == 0:
+        return -1
+    vfs_mount_table[su].used          = 0
+    vfs_mount_table[su].fs_kind       = FS_KIND_UNUSED
+    vfs_mount_table[su].name_len      = 0
+    vfs_mount_table[su].strip_len     = 0
+    vfs_mount_table[su].shadow        = 0
+    vfs_mount_table[su].private       = 0
+    vfs_mount_table[su].mountpoint[0] = 0
+    if vfs_nr_mounts > 0:
+        vfs_nr_mounts = vfs_nr_mounts - 1
+    return 0
+
+
+def _mount_lookup_slot(path: Ptr[char]) -> int32:
+    # Longest-prefix match. Returns the slot id whose mountpoint is the
+    # longest prefix of `path`, or -1 if nothing matches (which, with the
+    # root "/" mount registered, only happens for non-absolute junk).
+    best: int32 = -1
+    best_len: uint32 = 0
+    i: uint64 = 0
+    while i < MOUNT_TABLE_MAX:
+        if vfs_mount_table[i].used != 0:
+            plen: uint32 = vfs_mount_table[i].name_len
+            if _mnt_is_prefix(&vfs_mount_table[i].mountpoint[0], plen, path) != 0:
+                if best < 0 or plen > best_len:
+                    best = cast[int32](i)
+                    best_len = plen
+        i = i + 1
+    return best
+
+
+def vfs_fs_kind(path: Ptr[char]) -> uint32:
+    # The backend that owns `path`, by longest-prefix mount match. The
+    # root "/" mount makes this default to FS_KIND_CPIO for any absolute
+    # path no longer mount claims. This is the ONE backend-selection
+    # primitive vfs.ad consults — it replaces every is_*_path strcmp.
+    slot: int32 = _mount_lookup_slot(path)
+    if slot < 0:
+        return FS_KIND_CPIO
+    return vfs_mount_table[cast[uint64](slot)].fs_kind
+
+
+def vfs_fs_rel(path: Ptr[char]) -> Ptr[char]:
+    # The backend-relative tail of `path` for whichever mount owns it.
+    # The strip length recorded at mount time reproduces each backend's
+    # historical strip_*_prefix (5 for "/ext/" and "/mnt/", 0 for tmpfs
+    # and cpio which walk full absolute paths). A path equal to its
+    # mountpoint with a non-zero strip would walk off its own NUL; the
+    # backends treat the resulting "" as "the mount root", which is the
+    # same thing the bare-"/ext"/"/mnt" special cases handled before.
+    slot: int32 = _mount_lookup_slot(path)
+    if slot < 0:
+        return path
+    su: uint64 = cast[uint64](slot)
+    strip: uint64 = cast[uint64](vfs_mount_table[su].strip_len)
+    if strip == 0:
+        return path
+    # If the path is exactly the mountpoint (length == name_len), the
+    # next byte is the NUL; strip would skip past it. Clamp to the NUL so
+    # the backend sees "" (its root), matching the old "/ext"/"/mnt"
+    # bare-mountpoint arms.
+    plen: uint64 = cast[uint64](vfs_mount_table[su].name_len)
+    p: uint64 = 0
+    while p < strip:
+        if path[p] == 0:
+            return cast[Ptr[char]](cast[uint64](path) + p)
+        p = p + 1
+    return cast[Ptr[char]](cast[uint64](path) + strip)
+
+
+def vfs_fs_shadow(path: Ptr[char]) -> uint32:
+    # 1 if the mount that owns `path` permits a per-entry fall-through to
+    # the root (cpio) mount when the primary backend does not hold the
+    # name. Only the /var tmpfs mount sets this (a cpio-baked /var entry
+    # still resolves); /tmp does not (tmpfs-authoritative).
+    slot: int32 = _mount_lookup_slot(path)
+    if slot < 0:
+        return 0
+    return vfs_mount_table[cast[uint64](slot)].shadow
+
+
+# Boot-time mount registration. Called from init/main.ad after each
+# filesystem is activated. tmpfs and the cpio root are always present;
+# fat / ext4 are registered by the block-probe path only when their
+# *_init succeeded, so the mount table mirrors what really mounted.
+
+def vfs_mount_init_base():
+    # The always-present mounts: cpio at "/" (root, strip 0) and the two
+    # tmpfs writable subtrees. /var is shadow=1 (cpio-baked /var entries
+    # still resolve through it); /tmp is tmpfs-authoritative.
+    #
+    # V3 (writable overlay for apt/dpkg): the Linux-namespace keystone
+    # needs a writable layer over the read-only cpio for EVERY top-level
+    # directory a package install touches. Inside `enter linux { … }`
+    # the recipe union-binds `#t/<root>` MBEFORE+MCREATE over the cpio
+    # root; those server keys localize to `/<root>/…` and must route to
+    # the tmpfs backend here. So /usr /etc /bin /sbin /lib /lib64 /opt
+    # /run /srv join /var as shadow tmpfs mounts (shadow=1: a READ of a
+    # name tmpfs lacks falls through to the cpio-baked file; a CREATE/
+    # WRITE lands in tmpfs). The tmpfs backend materialises each as a
+    # synthetic root on first touch.
+    vfs_mount("/",      FS_KIND_CPIO,  0, 0)
+    vfs_mount("/tmp",   FS_KIND_TMPFS, 0, 0)
+    vfs_mount("/var",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/usr",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/etc",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/bin",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/sbin",  FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/lib",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/lib64", FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/opt",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/run",   FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/srv",   FS_KIND_TMPFS, 0, 1)
+    # #67 live-writable root: /home and /root complete the overlay so a
+    # LIVE session (`bind -bc '#t' /` over the read-only cpio, etc/rc.boot
+    # LIVE branch) can WRITE the live user's home and the hostowner home in
+    # RAM. shadow=1 keeps cpio-baked entries readable (a read tmpfs lacks
+    # falls through). Safe for the INSTALLED boot: there `bind '#sysroot' /`
+    # rewrites /home,/root via ns_walk to `#sysroot/...` -> `/ext/...`
+    # BEFORE vfs_fs_kind runs, so they route to the persistent ext4 backend
+    # exactly like /usr and /etc do today — these mounts only bite when `/`
+    # is still the cpio root (the live/dev image).
+    vfs_mount("/home",  FS_KIND_TMPFS, 0, 1)
+    vfs_mount("/root",  FS_KIND_TMPFS, 0, 1)
+    printk0("vfs_mount: base mounts registered (/ cpio; tmpfs overlay /tmp /var /usr /etc /bin /sbin /lib /lib64 /opt /run /srv /home /root)\n")
+
+
+def vfs_mount_fat():
+    # Register the FAT mount at /mnt. strip 5 == len("/mnt/"), matching
+    # the old fat.ad::strip_mnt_prefix.
+    vfs_mount("/mnt", FS_KIND_FAT, 5, 0)
+    printk0("vfs_mount: /mnt FAT registered\n")
+
+
+def vfs_mount_ext4():
+    # Register the ext4 mount at /ext. strip 5 == len("/ext/"), matching
+    # the old ext4.ad::strip_ext_prefix.
+    vfs_mount("/ext", FS_KIND_EXT4, 5, 0)
+    printk0("vfs_mount: /ext ext4 registered\n")
