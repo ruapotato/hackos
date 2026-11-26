@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- kernel heap under the names Hamnix code expects.
+#
+# Hamnix's mm/slab.ad offers kmalloc/kzalloc/kfree (addresses as uint64) and an
+# allocation-site tag used by its leak accounting.  HackOS provides the same
+# names on top of mm/heap.ad, so files ported from Hamnix (fs/tmpfs.ad, ...)
+# import `mm.slab` unchanged.  There are no slab caches here: every request is
+# a first-fit block.  The site tag is accepted and counted, nothing more.
+#
+# The second arena, the user arena, is what unprivileged threads may touch
+# (kernel/mpu.ad): user stacks and sys_mmap memory come from it.
+
+from mm.heap import Heap, heap_init, heap_alloc, heap_alloc_aligned, heap_free, heap_block_req
+from kernel.rt import rt_memset
+
+# Linker-script symbols (boards/*/link.ld).
+extern def __heap_start()
+extern def __heap_end()
+extern def __user_start()
+extern def __user_end()
+
+# Site tags used by the Hamnix files that HackOS carries.  The values are
+# Hamnix's (mm/slab.ad, commit 1c5d976a) so its debug output stays comparable.
+KM_SITE_NONE: uint64 = 0
+KM_SITE_TMPFS: uint64 = 10
+KM_SITE_VFS: uint64 = 1
+KM_SITE_PIPE: uint64 = 12
+
+kheap: Heap
+uheap: Heap
+km_site: uint64 = 0
+km_ready: uint32 = 0
+
+
+def mm_init():
+    heap_init(&kheap, cast[uint64](&__heap_start), cast[uint64](&__heap_end))
+    heap_init(&uheap, cast[uint64](&__user_start), cast[uint64](&__user_end))
+    km_ready = 1
+
+
+def km_set_site(site: uint64):
+    km_site = site
+
+
+def kmalloc(size: uint64) -> uint64:
+    return heap_alloc(&kheap, size)
+
+
+def kmalloc_aligned(size: uint64, align: uint64) -> uint64:
+    return heap_alloc_aligned(&kheap, size, align)
+
+
+def kzalloc(size: uint64) -> uint64:
+    p: uint64 = heap_alloc(&kheap, size)
+    if p != 0:
+        rt_memset(p, 0, size)
+    return p
+
+
+def kfree(addr: uint64):
+    heap_free(&kheap, addr)
+
+
+# User arena.
+def umalloc_aligned(size: uint64, align: uint64) -> uint64:
+    return heap_alloc_aligned(&uheap, size, align)
+
+
+def ufree(addr: uint64) -> int32:
+    return heap_free(&uheap, addr)
+
+
+def user_arena_start() -> uint64:
+    return cast[uint64](&__user_start)
+
+
+def user_arena_end() -> uint64:
+    return cast[uint64](&__user_end)

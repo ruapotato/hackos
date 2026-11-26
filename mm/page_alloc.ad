@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- page-granular allocations under the names Hamnix code expects.
+#
+# Hamnix's mm/page_alloc.ad is a buddy allocator over physical pages; its
+# callers in the files HackOS carries (fs/tmpfs.ad) only need "2^order pages,
+# page aligned" and the matching free.  Without an MMU a page is just a 4 KiB
+# alignment unit, so both map onto the kernel heap's aligned allocation.
+
+from mm.slab import kmalloc_aligned, kfree
+
+PA_SITE_NONE: uint64 = 0
+PA_SITE_TMPFS: uint64 = 18
+PAGE_SIZE: uint64 = 4096
+pa_site: uint64 = 0
+pa_pages_live: uint64 = 0
+
+
+def pa_set_site(site: uint64):
+    pa_site = site
+
+
+def alloc_pages(order: int32) -> uint64:
+    n: uint64 = PAGE_SIZE << cast[uint64](order)
+    p: uint64 = kmalloc_aligned(n, PAGE_SIZE)
+    if p != 0:
+        pa_pages_live = pa_pages_live + (cast[uint64](1) << cast[uint64](order))
+    return p
+
+
+def free_pages(addr: uint64, order: int32):
+    if addr == 0:
+        return
+    pa_pages_live = pa_pages_live - (cast[uint64](1) << cast[uint64](order))
+    kfree(addr)

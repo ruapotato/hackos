@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- heap allocator: first fit over an address-ordered free list, with
+# immediate coalescing in both directions.
+#
+# One `Heap` describes one contiguous arena.  The kernel has two: the kernel
+# heap (mm/slab.ad: kmalloc/kfree) and the user arena (umalloc/ufree), which
+# the MPU opens to unprivileged threads.
+#
+# Block layout (all sizes are multiples of 16, payloads are 16-byte aligned):
+#
+#     +0  size     uint32   whole block, header included; bit 0 = in use
+#     +4  prev     uint32   size of the block just below (0 for the first)
+#     +8  magic    uint32   HEAP_MAGIC_USED / HEAP_MAGIC_FREE
+#     +12 req      uint32   bytes the caller asked for (statistics, checks)
+#     +16 payload  ...      a free block keeps its list links here:
+#                           +16 next free (address), +20 previous free
+#
+# The header is 16 bytes, the smallest block 32.  The arena ends with a
+# zero-payload sentinel block marked used, so coalescing never runs off the
+# end.  Overhead per allocation: 16 bytes of header plus rounding to 16.
+#
+# Locking: every public entry runs in a kernel critical section (BASEPRI).
+# The free-list walk is O(free blocks) with kernel interrupts masked; that is a
+# deliberate simplification (see the milestone report).
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+
+HEAP_HDR: uint32 = 16
+HEAP_MIN_BLOCK: uint32 = 32
+HEAP_MAGIC_USED: uint32 = 0xA110CA7E
+HEAP_MAGIC_FREE: uint32 = 0xF4EEB10C
+
+
+class Heap:
+    base: uint32            # first block
+    end: uint32             # address of the end sentinel
+    free_head: uint32       # lowest-address free block, 0 if none
+    used_bytes: uint32      # sum of block sizes in use (headers included)
+    peak_bytes: uint32
+    req_bytes: uint32       # sum of requested sizes in use
+    n_alloc: uint32         # successful allocations so far
+    n_free: uint32
+    n_fail: uint32
+    n_live: uint32          # blocks in use now
+    corrupt: uint32         # set when a header check fails
+
+
+def _hw(addr: uint32, off: uint32) -> uint32:
+    return cast[Ptr[uint32]](cast[uint64](addr + off))[0]
+
+
+def _hset(addr: uint32, off: uint32, v: uint32):
+    cast[Ptr[uint32]](cast[uint64](addr + off))[0] = v
+
+
+def _blk_size(b: uint32) -> uint32:
+    return _hw(b, 0) & 0xFFFFFFFE
+
+
+def _free_unlink(h: Ptr[Heap], b: uint32):
+    nx: uint32 = _hw(b, 16)
+    pv: uint32 = _hw(b, 20)
+    if pv != 0:
+        _hset(pv, 16, nx)
+    else:
+        h[0].free_head = nx
+    if nx != 0:
+        _hset(nx, 20, pv)
+
+
+# Insert `b` into the address-ordered free list.
+def _free_insert(h: Ptr[Heap], b: uint32):
+    pv: uint32 = 0
+    cur: uint32 = h[0].free_head
+    while cur != 0 and cur < b:
+        pv = cur
+        cur = _hw(cur, 16)
+    _hset(b, 16, cur)
+    _hset(b, 20, pv)
+    if cur != 0:
+        _hset(cur, 20, b)
+    if pv != 0:
+        _hset(pv, 16, b)
+    else:
+        h[0].free_head = b
+    _hset(b, 8, HEAP_MAGIC_FREE)
+
+
+def heap_init(h: Ptr[Heap], start: uint64, end: uint64):
+    b: uint32 = cast[uint32]((start + 15) & 0xFFFFFFF0)
+    e: uint32 = cast[uint32](end & 0xFFFFFFF0) - HEAP_HDR
+    h[0].base = b
+    h[0].end = e
+    h[0].free_head = 0
+    h[0].used_bytes = 0
+    h[0].peak_bytes = 0
+    h[0].req_bytes = 0
+    h[0].n_alloc = 0
+    h[0].n_free = 0
+    h[0].n_fail = 0
+    h[0].n_live = 0
+    h[0].corrupt = 0
+    _hset(b, 0, e - b)
+    _hset(b, 4, 0)
+    _hset(b, 12, 0)
+    _free_insert(h, b)
+    # end sentinel: a used block of header size
+    _hset(e, 0, HEAP_HDR | 1)
+    _hset(e, 4, e - b)
+    _hset(e, 8, HEAP_MAGIC_USED)
+    _hset(e, 12, 0)
+
+
+# Carve [b, b+need) out of free block `b` (already unlinked), returning the
+# tail to the free list when it is big enough to be a block.
+def _take(h: Ptr[Heap], b: uint32, need: uint32, req: uint32):
+    total: uint32 = _blk_size(b)
+    if total - need >= HEAP_MIN_BLOCK:
+        rest: uint32 = b + need
+        _hset(rest, 0, total - need)
+        _hset(rest, 4, need)
+        _hset(rest, 12, 0)
+        _hset(rest + (total - need), 4, total - need)
+        _free_insert(h, rest)
+        total = need
+    _hset(b, 0, total | 1)
+    _hset(b, 8, HEAP_MAGIC_USED)
+    _hset(b, 12, req)
+    h[0].used_bytes = h[0].used_bytes + total
+    if h[0].used_bytes > h[0].peak_bytes:
+        h[0].peak_bytes = h[0].used_bytes
+    h[0].req_bytes = h[0].req_bytes + req
+    h[0].n_alloc = h[0].n_alloc + 1
+    h[0].n_live = h[0].n_live + 1
+
+
+# Allocate `size` bytes whose address is a multiple of `align` (a power of two,
+# at least 16).  Returns 0 when no block fits.
+def heap_alloc_aligned(h: Ptr[Heap], size: uint64, align: uint64) -> uint64:
+    if size == 0:
+        size = 1
+    if size > 0x7FFFFF00:
+        return 0
+    al: uint32 = cast[uint32](align)
+    if al < 16:
+        al = 16
+    need: uint32 = (cast[uint32](size) + HEAP_HDR + 15) & 0xFFFFFFF0
+    if need < HEAP_MIN_BLOCK:
+        need = HEAP_MIN_BLOCK
+    irq: uint32 = cpu_irq_save()
+    b: uint32 = h[0].free_head
+    while b != 0:
+        if _hw(b, 8) != HEAP_MAGIC_FREE:
+            h[0].corrupt = h[0].corrupt + 1
+            b = 0
+            break
+        bsz: uint32 = _blk_size(b)
+        pay: uint32 = b + HEAP_HDR
+        apay: uint32 = (pay + al - 1) & (0 - al)
+        if apay != pay:
+            # the gap in front must itself be a block
+            apay = (pay + HEAP_MIN_BLOCK + al - 1) & (0 - al)
+        nb: uint32 = apay - HEAP_HDR
+        if nb + need <= b + bsz and nb + need > nb:
+            _free_unlink(h, b)
+            if nb != b:
+                front: uint32 = nb - b
+                _hset(b, 0, front)
+                _hset(nb, 0, bsz - front)
+                _hset(nb, 4, front)
+                _hset(nb + (bsz - front), 4, bsz - front)
+                _free_insert(h, b)
+            _take(h, nb, need, cast[uint32](size))
+            cpu_irq_restore(irq)
+            return cast[uint64](nb + HEAP_HDR)
+        b = _hw(b, 16)
+    h[0].n_fail = h[0].n_fail + 1
+    cpu_irq_restore(irq)
+    return 0
+
+
+def heap_alloc(h: Ptr[Heap], size: uint64) -> uint64:
+    return heap_alloc_aligned(h, size, 16)
+
+
+# Returns 0, or -1 when `addr` is not a live block of this heap (nothing is
+# changed in that case and `corrupt` is counted).
+def heap_free(h: Ptr[Heap], addr: uint64) -> int32:
+    if addr == 0:
+        return 0
+    a: uint32 = cast[uint32](addr)
+    b: uint32 = a - HEAP_HDR
+    irq: uint32 = cpu_irq_save()
+    if b < h[0].base or b >= h[0].end or (a & 15) != 0 or _hw(b, 8) != HEAP_MAGIC_USED or (_hw(b, 0) & 1) == 0:
+        h[0].corrupt = h[0].corrupt + 1
+        cpu_irq_restore(irq)
+        return -1
+    sz: uint32 = _blk_size(b)
+    h[0].used_bytes = h[0].used_bytes - sz
+    h[0].req_bytes = h[0].req_bytes - _hw(b, 12)
+    h[0].n_free = h[0].n_free + 1
+    h[0].n_live = h[0].n_live - 1
+    # merge with the block above
+    nx: uint32 = b + sz
+    if (_hw(nx, 0) & 1) == 0:
+        _free_unlink(h, nx)
+        _hset(nx, 8, 0)
+        sz = sz + _blk_size(nx)
+    # merge with the block below
+    psz: uint32 = _hw(b, 4)
+    if psz != 0:
+        pb: uint32 = b - psz
+        if (_hw(pb, 0) & 1) == 0:
+            _free_unlink(h, pb)
+            _hset(b, 8, 0)
+            b = pb
+            sz = sz + psz
+    _hset(b, 0, sz)
+    _hset(b, 12, 0)
+    _hset(b + sz, 4, sz)
+    _free_insert(h, b)
+    cpu_irq_restore(irq)
+    return 0
+
+
+# Usable size of a live block (what the caller asked for).
+def heap_block_req(addr: uint64) -> uint64:
+    return cast[uint64](_hw(cast[uint32](addr) - HEAP_HDR, 12))
+
+
+def heap_total(h: Ptr[Heap]) -> uint64:
+    return cast[uint64](h[0].end - h[0].base)
+
+
+def heap_free_bytes(h: Ptr[Heap]) -> uint64:
+    return cast[uint64](h[0].end - h[0].base - h[0].used_bytes)
+
+
+def heap_free_blocks(h: Ptr[Heap]) -> uint64:
+    irq: uint32 = cpu_irq_save()
+    n: uint64 = 0
+    b: uint32 = h[0].free_head
+    while b != 0:
+        n = n + 1
+        b = _hw(b, 16)
+    cpu_irq_restore(irq)
+    return n
+
+
+def heap_largest_free(h: Ptr[Heap]) -> uint64:
+    irq: uint32 = cpu_irq_save()
+    best: uint32 = 0
+    b: uint32 = h[0].free_head
+    while b != 0:
+        s: uint32 = _blk_size(b)
+        if s > best:
+            best = s
+        b = _hw(b, 16)
+    cpu_irq_restore(irq)
+    if best < HEAP_HDR:
+        return 0
+    return cast[uint64](best - HEAP_HDR)
+
+
+# Walk every block and check the invariants: sizes chain exactly from base to
+# the sentinel, `prev` fields match, magics match the used bit, no two free
+# blocks are adjacent, and the free list holds exactly the free blocks in
+# address order.  Returns 0 when consistent, else a small positive code.
+def heap_check(h: Ptr[Heap]) -> int32:
+    irq: uint32 = cpu_irq_save()
+    rc: int32 = 0
+    b: uint32 = h[0].base
+    prev: uint32 = 0
+    prev_free: uint32 = 0
+    nfree: uint32 = 0
+    used: uint32 = 0
+    while b < h[0].end and rc == 0:
+        sz: uint32 = _blk_size(b)
+        if sz < HEAP_MIN_BLOCK or (sz & 15) != 0 or b + sz > h[0].end:
+            rc = 1
+        elif _hw(b, 4) != prev:
+            rc = 2
+        elif (_hw(b, 0) & 1) != 0:
+            if _hw(b, 8) != HEAP_MAGIC_USED:
+                rc = 3
+            used = used + sz
+            prev_free = 0
+        else:
+            if _hw(b, 8) != HEAP_MAGIC_FREE:
+                rc = 4
+            if prev_free != 0:
+                rc = 5
+            prev_free = 1
+            nfree = nfree + 1
+        prev = sz
+        b = b + sz
+    if rc == 0 and b != h[0].end:
+        rc = 6
+    if rc == 0 and used != h[0].used_bytes:
+        rc = 7
+    if rc == 0:
+        n: uint32 = 0
+        last: uint32 = 0
+        f: uint32 = h[0].free_head
+        while f != 0 and rc == 0:
+            if f <= last and last != 0:
+                rc = 8
+            if (_hw(f, 0) & 1) != 0:
+                rc = 9
+            last = f
+            n = n + 1
+            f = _hw(f, 16)
+        if rc == 0 and n != nfree:
+            rc = 10
+    cpu_irq_restore(irq)
+    return rc
