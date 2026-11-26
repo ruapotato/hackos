@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- wall-clock time under the name Hamnix code expects.
+#
+# Hamnix reads the PC's CMOS clock here.  The emulated board has no clock that
+# HackOS drives yet, so time is a fixed epoch plus the uptime; the i.MX RT's
+# SNVS real-time clock replaces this on the target.  rtc_set_unix_time() lets
+# a console command or a test set it.
+
+from kernel.sched.core import sched_now
+
+rtc_base: int64 = 1795651200           # 2026-11-26 00:00:00 UTC
+
+
+def rtc_set_unix_time(t: int64):
+    rtc_base = t - cast[int64](sched_now() / 1000)
+
+
+def rtc_read_unix_time() -> int64:
+    return rtc_base + cast[int64](sched_now() / 1000)

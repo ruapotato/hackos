@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- formatted kernel output under Hamnix's names (printk0..printk4).
+#
+# Same directives as Hamnix's kernel/printk/printk.ad: %d %u (decimal), %x
+# (hex, no prefix), %p (0x + 8 hex digits here: addresses are 32 bits), %s, %c,
+# %%.  HackOS adds a zero-padded width for %x and %d ("%08x", "%3d").  A whole
+# message is formatted into a buffer and written in one piece, so lines from
+# different threads do not interleave.
+
+from drivers.tty.console import console_write
+
+PRINTK_BUF: uint32 = 256
+
+
+def _pk_putc(buf: Ptr[uint8], n: uint32, cap: uint32, c: uint32) -> uint32:
+    if n + 1 < cap:
+        buf[n] = cast[uint8](c)
+        return n + 1
+    return n
+
+
+def _pk_num(buf: Ptr[uint8], n: uint32, cap: uint32, v: uint64, base: uint32, width: uint32, pad: uint32) -> uint32:
+    tmp: Array[24, uint8]
+    k: uint32 = 0
+    x: uint64 = v
+    if x == 0:
+        tmp[0] = 48
+        k = 1
+    while x > 0:
+        d: uint32 = cast[uint32](x % cast[uint64](base))
+        if d < 10:
+            tmp[k] = cast[uint8](48 + d)
+        else:
+            tmp[k] = cast[uint8](87 + d)
+        k = k + 1
+        x = x / cast[uint64](base)
+    while k < width and k < 24:
+        tmp[k] = cast[uint8](pad)
+        k = k + 1
+    while k > 0:
+        k = k - 1
+        n = _pk_putc(buf, n, cap, cast[uint32](tmp[k]))
+    return n
+
+
+# Format into buf (always NUL-terminated); returns the length.
+def kfmt(buf: Ptr[uint8], cap: uint32, fmt: Ptr[uint8], a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> uint32:
+    n: uint32 = 0
+    i: uint32 = 0
+    argi: uint32 = 0
+    while fmt[i] != 0:
+        c: uint32 = cast[uint32](fmt[i])
+        i = i + 1
+        if c != 37:
+            n = _pk_putc(buf, n, cap, c)
+            continue
+        pad: uint32 = 32
+        width: uint32 = 0
+        if fmt[i] == 48:
+            pad = 48
+            i = i + 1
+        while fmt[i] >= 48 and fmt[i] <= 57:
+            width = width * 10 + cast[uint32](fmt[i]) - 48
+            i = i + 1
+        while fmt[i] == 108:                       # 'l' length modifiers
+            i = i + 1
+        spec: uint32 = cast[uint32](fmt[i])
+        if spec == 0:
+            n = _pk_putc(buf, n, cap, 37)
+            break
+        i = i + 1
+        if spec == 37:
+            n = _pk_putc(buf, n, cap, 37)
+            continue
+        arg: uint64 = a0
+        if argi == 1:
+            arg = a1
+        elif argi == 2:
+            arg = a2
+        elif argi == 3:
+            arg = a3
+        argi = argi + 1
+        if spec == 100:                            # %d
+            sv: int64 = cast[int64](arg)
+            if sv < 0:
+                n = _pk_putc(buf, n, cap, 45)
+                arg = cast[uint64](0) - arg
+            n = _pk_num(buf, n, cap, arg, 10, width, pad)
+        elif spec == 117:                          # %u
+            n = _pk_num(buf, n, cap, arg, 10, width, pad)
+        elif spec == 120:                          # %x
+            n = _pk_num(buf, n, cap, arg, 16, width, pad)
+        elif spec == 112:                          # %p
+            n = _pk_putc(buf, n, cap, 48)
+            n = _pk_putc(buf, n, cap, 120)
+            n = _pk_num(buf, n, cap, arg, 16, 8, 48)
+        elif spec == 99:                           # %c
+            n = _pk_putc(buf, n, cap, cast[uint32](arg & 255))
+        elif spec == 115:                          # %s
+            s: Ptr[uint8] = cast[Ptr[uint8]](arg)
+            if arg == 0:
+                s = "(null)"
+            j: uint32 = 0
+            while s[j] != 0:
+                n = _pk_putc(buf, n, cap, cast[uint32](s[j]))
+                j = j + 1
+            while j < width:
+                n = _pk_putc(buf, n, cap, 32)
+                j = j + 1
+        else:
+            n = _pk_putc(buf, n, cap, 37)
+            n = _pk_putc(buf, n, cap, spec)
+    buf[n] = 0
+    return n
+
+
+def printk4(fmt: Ptr[uint8], a0: uint64, a1: uint64, a2: uint64, a3: uint64):
+    buf: Array[256, uint8]
+    n: uint32 = kfmt(&buf[0], PRINTK_BUF, fmt, a0, a1, a2, a3)
+    console_write(&buf[0], cast[uint64](n))
+
+
+def printk0(fmt: Ptr[uint8]):
+    printk4(fmt, 0, 0, 0, 0)
+
+
+def printk1(fmt: Ptr[uint8], a0: uint64):
+    printk4(fmt, a0, 0, 0, 0)
+
+
+def printk2(fmt: Ptr[uint8], a0: uint64, a1: uint64):
+    printk4(fmt, a0, a1, 0, 0)
+
+
+def printk3(fmt: Ptr[uint8], a0: uint64, a1: uint64, a2: uint64):
+    printk4(fmt, a0, a1, a2, 0)

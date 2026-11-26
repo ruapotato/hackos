@@ -31,3 +31,23 @@ def board_console_putc(c: uint32):
     while (mmio_read32(0x40004004) & 1) != 0:
         c = c
     mmio_write32(0x40004000, c & 255)
+
+
+# ---- receive side (interrupt driven; IRQ 0 = UART0 RX) ----------------------
+def board_console_rx_irq_enable():
+    mmio_write32(0x40004008, 0xB)        # TX_EN | RX_EN | RX_INTEN
+    # NVIC: priority of IRQ 0 = 0x80 (kernel aware), then enable it.
+    cast[Ptr[volatile uint8]](0xE000E400)[0] = 0x80
+    mmio_write32(0xE000E100, 1)
+
+
+def board_console_rx_ready() -> uint32:
+    return (mmio_read32(0x40004004) >> 1) & 1
+
+
+def board_console_getc() -> uint32:
+    return mmio_read32(0x40004000) & 255
+
+
+def board_console_rx_irq_ack():
+    mmio_write32(0x4000400C, 2)          # INTCLEAR: RX
