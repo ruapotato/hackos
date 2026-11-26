@@ -39,7 +39,10 @@ def _in_guard(addr: uint32, base: uint64) -> uint32:
 def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint64:
     if sched_running == 0 or sched_current == 0 or cpu_basepri() != 0:
         return 1
-    if kind != 4 and kind != 5 and kind != 6:
+    # 11: an `svc` the kernel does not accept from this thread (an unknown
+    # immediate, or the kernel-only return-from-system-call).  It is the
+    # thread's mistake, not the kernel's.
+    if kind != 4 and kind != 5 and kind != 6 and kind != 11:
         return 1
     t: Ptr[Thread] = thr(sched_current)
     cfsr: uint32 = mmio_read32(0xE000ED28)
@@ -88,6 +91,8 @@ def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint
             kputs("access violation")
     elif what == FAULT_BUS:
         kputs("bus fault")
+    elif kind == 11:
+        kputs("invalid svc instruction")
     else:
         kputs("usage fault")
     if addr_valid != 0:

@@ -226,9 +226,13 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         thread_sleep(a0)
         return 0
     if nr == SYS_NANOSLEEP:
-        if _uok(a0, 16, 0) == 0:
+        if _uok(a0, 16, 0) == 0 or (a1 != 0 and _uok(a1, 16, 1) == 0):
             return _bad()
-        return _sys_nanosleep(a0)
+        rs: int64 = _sys_nanosleep(a0)
+        if a1 != 0:
+            cast[Ptr[int64]](a1)[0] = 0     # never interrupted: nothing remains
+            cast[Ptr[int64]](a1)[1] = 0
+        return rs
     if nr == SYS_PUTC:
         ch: Array[8, uint8]
         ch[0] = cast[uint8](a0)

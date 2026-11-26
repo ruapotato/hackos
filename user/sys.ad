@@ -110,6 +110,11 @@ def sys_munmap(addr: uint64, length: uint64) -> int64:
     return hackos_syscall(304, addr, length, 0, 0, 0, 0, 0)
 
 
+# req and rem point at {int64 seconds, int64 nanoseconds}; rem may be null.
+def sys_nanosleep(req: Ptr[int64], rem: Ptr[int64]) -> int64:
+    return hackos_syscall(308, cast[uint64](req), cast[uint64](rem), 0, 0, 0, 0)
+
+
 # ---- HackOS only -------------------------------------------------------------
 # Start `entry(arg)` as a new unprivileged thread; returns its id.
 def sys_thread_spawn(entry: uint64, arg: uint64, prio: uint32, stack_size: uint64) -> int64:

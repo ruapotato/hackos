@@ -105,6 +105,7 @@ expect "  ... C calling the Adder-convention memcpy" $B/clink_bad.log "^R1: C co
 expect "  ... C calling an Adder kernel function" $B/clink_bad.log "^R1: C code calls 'kmalloc'"
 expect "  ... C defining a bare C library name" $B/clink_bad.log "^R3: .*'strlen'"
 
+rm -f $B/*.bin
 echo "[test] === 3. static checks on the images"
 for img in hackos ktest selftest; do
     undef="$("$NM" -u $B/$img.elf | wc -l)"

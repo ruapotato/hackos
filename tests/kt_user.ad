@@ -6,7 +6,7 @@
 # unprivileged thread (that is one of the things under test).  Results go to
 # memory the test runner allocated in the user arena, or to the exit code.
 
-from user.sys import sys_putc, sys_exit, sys_get_jiffies, sys_getpid, sys_open, sys_read, sys_close, sys_write, sys_lseek, sys_open_write, sys_dup, sys_dup2, sys_chdir, sys_getcwd, sys_unlink, sys_mkdir, sys_read_nb, sys_yield, sys_create, sys_stat_p9, sys_fstat_p9, sys_remove, sys_errstr, sys_mmap, sys_munmap, sys_thread_spawn, sys_thread_join, sys_rename, sys_gettid, sys_sleep_ms, hackos_syscall
+from user.sys import sys_putc, sys_exit, sys_get_jiffies, sys_getpid, sys_open, sys_read, sys_close, sys_write, sys_lseek, sys_open_write, sys_dup, sys_dup2, sys_chdir, sys_getcwd, sys_unlink, sys_mkdir, sys_read_nb, sys_yield, sys_create, sys_stat_p9, sys_fstat_p9, sys_remove, sys_errstr, sys_mmap, sys_munmap, sys_thread_spawn, sys_thread_join, sys_rename, sys_gettid, sys_sleep_ms, sys_nanosleep, hackos_syscall
 from kernel.cpu import cpu_control
 
 extern def fp_hold(seed: uint64, loops: uint64) -> uint64
@@ -187,4 +187,12 @@ def u_syscalls(arg: uint64) -> int64:
     r[59] = cast[int64](sys_dup2(1, 9))
     r[60] = _puts(9, "[and through a dup2'd descriptor]\n")
     sys_close(9)
+    ts: Array[4, int64]
+    ts[0] = 0
+    ts[1] = 30000000                                 # 30 ms
+    ts[2] = 5
+    ts[3] = 5
+    j0 = sys_get_jiffies()
+    r[61] = sys_nanosleep(&ts[0], &ts[2]) + ts[2] + ts[3]
+    r[62] = cast[int64](sys_get_jiffies() - j0)
     return 77

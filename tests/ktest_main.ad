@@ -24,7 +24,7 @@ from mm.slab import kheap, uheap, kmalloc, kfree, kmalloc_aligned, umalloc_align
 from mm.heap import Heap, heap_free, heap_check, heap_free_blocks, heap_largest_free, heap_total
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_mkdir, vfs_unlink, vfs_rename, vfs_open_stdio, vfs_open_count, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, OAPPEND
 from drivers.tty.console import console_rx_enable, console_input, console_set_mode, console_read, con_rx_bytes, con_rx_dropped, con_rx_irqs, CON_RAW, CON_COOKED
-from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf
+from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf, fault_badsvc
 from tests.kt_user import stress_mix, u_stress, u_fphold, u_syscalls, u_child, f64_bits
 
 from tests.kt_cinterop import ci_scalars, ci_callback, ci_structs, ci_sht_serial, ci_sht_measure, ci_sht_negative, ci_sht_errors, ci_dt, ci_t, ci_rh, fk_writes, fk_reads
@@ -637,6 +637,7 @@ def test_syscalls():
     check(cast[uint32](r[33] == -38 and r[36] == -9 and r[56] == -9), "syscall: unknown number is ENOSYS, bad descriptors are EBADF")
     printk1("   sleep_ms(50) measured %d jiffies (100 Hz)\n", cast[uint64](r[37]))
     check(cast[uint32](r[37] == 5 or r[37] == 6), "syscall: sleep_ms(50) takes 5 jiffies by get_jiffies")
+    check(cast[uint32](r[61] == 0 and (r[62] == 3 or r[62] == 4)), "syscall: nanosleep(30 ms) takes 3 jiffies and clears the remaining time")
     check(cast[uint32](r[38] >= 0x60C00000 and r[39] == 0 and r[40] == 0x12345678 and r[41] == 0 and r[42] == -22), "syscall: mmap gives zeroed user memory, munmap frees it once")
     check(cast[uint32](r[43] > 0 and r[44] == 0 and r[45] == 43), "syscall: thread_spawn + thread_join from user mode, exit code 43")
     check(cast[uint32](r[46] == 0 and r[47] == 100 and r[48] == 104 and r[52] == 104), "syscall: create (dir and file), fstat, dup shares the file offset")
@@ -721,10 +722,16 @@ def test_mpu():
     t = spawn("undefined", cast[uint64](&fault_udf), 0, 3, TF_USER)
     code = join(t)
     check(cast[uint32](code == 132 and trap_last_kind == FAULT_USAGE), "fault: undefined instruction ends the thread with 132")
+    # (h) the kernel-only svc numbers are not for threads
+    t = spawn("bad-svc", cast[uint64](&fault_badsvc), 7, 3, TF_USER)
+    code = join(t)
+    t = spawn("fake-ret", cast[uint64](&fault_badsvc), 1, 3, TF_USER)
+    code2: int64 = join(t)
+    check(cast[uint32](code == 132 and code2 == 132 and trap_last_tid == t), "fault: an unknown svc and a forged return-from-system-call end the thread, not the kernel")
     mp_stop = 1
     join(hb)
     printk2("   %d faults handled; the heartbeat thread counted %d beats meanwhile\n", cast[uint64](trap_count - tc0), mp_beat - beat0)
-    check(cast[uint32](trap_count == tc0 + 12 and mp_beat > beat0), "fault: twelve faults, the other threads kept running")
+    check(cast[uint32](trap_count == tc0 + 14 and mp_beat > beat0), "fault: fourteen faults, the other threads kept running")
     check(cast[uint32](kheap.n_live == klive0 and uheap.n_live == ulive0 and heap_check(&kheap) == 0 and heap_check(&uheap) == 0), "fault: the stacks of all ended threads were released, heaps intact")
 
 

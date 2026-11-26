@@ -40,3 +40,13 @@ def fault_jump(addr: uint64) -> int64:
 def fault_udf(arg: uint64) -> int64:
     asm_volatile("udf #0")
     return 1002
+
+
+# An `svc` with an immediate the kernel does not offer to threads (svc #1 is
+# the kernel's own return-from-system-call).
+def fault_badsvc(arg: uint64) -> int64:
+    if arg == 1:
+        asm_volatile("svc #1")
+    else:
+        asm_volatile("svc #7")
+    return 1003
