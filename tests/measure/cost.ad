@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Measurement fixture (not part of the firmware): small functions whose
+# Thumb-2 code is compared with the same functions written in C
+# (tests/measure/cost.c) to show what the 64-bit value model costs.
+
+class Item:
+    key: uint32
+    next: Ptr[Item]
+    data: Ptr[uint8]
+
+extern def ext_copy(dst: Ptr[uint8], src: Ptr[uint8], n: uint32) -> uint32
+extern def ext5(a: Ptr[uint8], b: Ptr[uint8], c: Ptr[uint8], d: Ptr[uint8], e: uint32) -> uint32
+
+g_items: Ptr[Item]
+
+
+# 1. pointer dereference
+def deref(p: Ptr[uint32]) -> uint32:
+    return p[0]
+
+
+# 2. store through a pointer
+def store(p: Ptr[uint32], v: uint32):
+    p[0] = v
+
+
+# 3. a call that forwards two pointers and a length
+def call3(dst: Ptr[uint8], src: Ptr[uint8], n: uint32) -> uint32:
+    return ext_copy(dst, src, n) + 1
+
+
+# 4. a call with five arguments (four pointers)
+def call5(a: Ptr[uint8], b: Ptr[uint8], c: Ptr[uint8], d: Ptr[uint8], e: uint32) -> uint32:
+    return ext5(a, b, c, d, e)
+
+
+# 5. loop over an array
+def sum_array(a: Ptr[uint32], n: uint32) -> uint32:
+    s: uint32 = 0
+    i: uint32 = 0
+    while i < n:
+        s = s + a[i]
+        i = i + 1
+    return s
+
+
+# 6. pointer chasing through a struct
+def list_sum(head: Ptr[Item]) -> uint32:
+    s: uint32 = 0
+    p: Ptr[Item] = head
+    while p != cast[Ptr[Item]](0):
+        s = s + p[0].key
+        p = p[0].next
+    return s
+
+
+# 7. field update through a global pointer
+def bump_first():
+    g_items[0].key = g_items[0].key + 1
+
+
+# 8. byte copy loop
+def copy_bytes(d: Ptr[uint8], s: Ptr[uint8], n: uint32):
+    i: uint32 = 0
+    while i < n:
+        d[i] = s[i]
+        i = i + 1
+
+
+def main() -> int32:
+    return 0
+
+
+def sizeof_item() -> uint32:
+    return cast[uint32](sizeof(Item))

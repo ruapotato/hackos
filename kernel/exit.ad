@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- what happens when main() returns or the kernel gives up.
+# Test builds end the emulator run through semihosting; see kernel/semihost.ad.
+
+from kernel.semihost import semihost_exit
+from kernel.cpu import cpu_irq_disable
+
+
+def hackos_exit(code: uint32):
+    cpu_irq_disable()
+    semihost_exit(code)

@@ -1,0 +1,365 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS milestone 1 demo / self-test for QEMU `mps2-an500` (Cortex-M7).
+#
+# Every check prints "PASS <name>" or "FAIL <name>"; main() returns the number
+# of failed checks, which becomes the QEMU exit status (0 = all passed).
+#
+# Expected values were computed on the host with Python (IEEE-754 binary64,
+# arbitrary-precision integers); see tests/reference_values.py.
+#
+# Inputs to the arithmetic checks are read from `volatile` globals so the
+# optimiser cannot fold the checks away at compile time: the arithmetic below
+# really executes on the (emulated) Cortex-M7.
+
+from kernel.start import hackos_start
+from kernel.fault import hackos_fault
+from kernel.print import kputs, kputc, kput_u64, kput_i64, kput_hex, kput_hex32, kput_f64
+from kernel.cpu import cpu_irq_disable, cpu_irq_enable, cpu_wait_for_interrupt, cpu_primask, cpu_ipsr, cpu_control, cpu_set_basepri, cpu_basepri, mmio_read32, mmio_write32
+from kernel.systick import systick_start, systick_stop, systick_ticks, systick_seen_ipsr, systick_handler
+from kernel.rt import rt_memcpy, rt_memset, rt_memmove, rt_udivmod64, rt_sdivmod64, rt_u64_to_f64, rt_i64_to_f64, rt_f64_to_u64, rt_f64_to_i64
+
+failures: uint32 = 0
+
+# ---- inputs the optimiser cannot see through --------------------------------
+in_u64_a: volatile uint64 = 0x123456789ABCDEF0
+in_u64_b: volatile uint64 = 0x0000000FEDCBA987
+in_u64_c: volatile uint64 = 1000000007
+in_i64_a: volatile int64 = -1234567890123456789
+in_i64_b: volatile int64 = 987654321
+in_u32_a: volatile uint32 = 4000000000
+in_u32_b: volatile uint32 = 7
+in_f_a: volatile float64 = 1.5
+in_f_b: volatile float64 = 2.25
+in_f_two: volatile float64 = 2.0
+in_n: volatile uint32 = 1000
+
+# ---- a struct with pointers ---------------------------------------------------
+class Node:
+    value: uint32
+    weight: float64
+    next: Ptr[Node]
+    name: Ptr[uint8]
+
+nodes: Array[4, Node]
+svc_count: volatile uint32 = 0
+svc_seen_ipsr: volatile uint32 = 0
+copy_src: Array[64, uint8]
+copy_dst: Array[64, uint8]
+f64_cell: float64 = 0.0
+
+
+def check(ok: uint32, name: Ptr[uint8]):
+    if ok != 0:
+        kputs("PASS ")
+    else:
+        kputs("FAIL ")
+        failures = failures + 1
+    kputs(name)
+    kputc(10)
+
+
+# The IEEE-754 bit pattern of a float64 (through memory: Adder has no bit cast).
+def f64_bits(d: float64) -> uint64:
+    f64_cell = d
+    return cast[Ptr[uint64]](cast[uint64](&f64_cell))[0]
+
+
+def f64_abs(d: float64) -> float64:
+    if d < 0.0:
+        return 0.0 - d
+    return d
+
+
+# Newton's method square root -- real double-precision multiply/divide/add.
+def f64_sqrt(x: float64) -> float64:
+    g: float64 = x
+    if g < 1.0:
+        g = 1.0
+    i: uint32 = 0
+    while i < 60:
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    return g
+
+
+# Exception 11 (SVCall), written in Adder.
+def svc_handler():
+    svc_count = svc_count + 1
+    svc_seen_ipsr = cpu_ipsr()
+
+
+def test_systick():
+    kputs("-- SysTick interrupt handled in Adder\n")
+    systick_start(1000)
+    guard: uint32 = 0
+    # Sleep until the handler has counted 20 ticks.  `wfi` only returns on an
+    # interrupt; the guard bounds the loop if no interrupt ever arrives.
+    while systick_ticks < 20 and guard < 100000:
+        cpu_wait_for_interrupt()
+        guard = guard + 1
+    t1: uint32 = systick_ticks
+    kputs("   ticks counted by systick_handler: ")
+    kput_u64(cast[uint64](t1))
+    kputs(", wfi wake-ups: ")
+    kput_u64(cast[uint64](guard))
+    kputs(", IPSR seen in handler: ")
+    kput_u64(cast[uint64](systick_seen_ipsr))
+    kputs(", IPSR in thread: ")
+    kput_u64(cast[uint64](cpu_ipsr()))
+    kputc(10)
+    check(cast[uint32](t1 >= 20), "systick: handler counted 20 ticks")
+    check(cast[uint32](systick_seen_ipsr == 15), "systick: handler ran as exception 15")
+    check(cast[uint32](cpu_ipsr() == 0), "systick: thread mode IPSR is 0")
+    # Mask interrupts and let the timer expire three times.  COUNTFLAG (bit 16
+    # of SYST_CSR, cleared by reading it) proves that time really passed and
+    # ticks became pending; the handler's count must not move meanwhile.
+    cpu_irq_disable()
+    pm: uint32 = cpu_primask()
+    t2: uint32 = systick_ticks
+    expired: uint32 = 0
+    spin: uint32 = 0
+    mmio_read32(0xE000E010)
+    while expired < 3 and spin < 200000000:
+        if (mmio_read32(0xE000E010) & 0x10000) != 0:
+            expired = expired + 1
+        spin = spin + 1
+    t3: uint32 = systick_ticks
+    cpu_irq_enable()
+    kputs("   masked: timer expired ")
+    kput_u64(cast[uint64](expired))
+    kputs(" times, handler count moved by ")
+    kput_u64(cast[uint64](t3 - t2))
+    kputc(10)
+    check(cast[uint32](pm == 1), "cpsid i: PRIMASK reads 1")
+    check(cast[uint32](expired == 3), "cpsid i: timer kept running while masked")
+    check(cast[uint32](t3 == t2), "cpsid i: no ticks counted while masked")
+    check(cast[uint32](cpu_primask() == 0), "cpsie i: PRIMASK reads 0")
+    guard = 0
+    while systick_ticks < t3 + 3 and guard < 100000:
+        cpu_wait_for_interrupt()
+        guard = guard + 1
+    check(cast[uint32](systick_ticks >= t3 + 3), "cpsie i: ticks resume")
+    systick_stop()
+    cpu_set_basepri(0x40)
+    bp: uint32 = cpu_basepri()
+    cpu_set_basepri(0)
+    check(cast[uint32](bp == 0x40), "msr/mrs basepri round trip")
+
+
+def test_svc():
+    kputs("-- svc from Adder inline asm, handler in Adder\n")
+    before: uint32 = svc_count
+    asm_volatile("svc #42")
+    asm_volatile("svc #1")
+    check(cast[uint32](svc_count == before + 2), "svc: handler ran twice")
+    check(cast[uint32](svc_seen_ipsr == 11), "svc: handler ran as exception 11")
+
+
+def test_float():
+    kputs("-- double-precision floating point (FPv5-D16)\n")
+    a: float64 = in_f_a
+    b: float64 = in_f_b
+    s: float64 = a * b + a / b - 0.125
+    kputs("   1.5*2.25 + 1.5/2.25 - 0.125 = ")
+    kput_f64(s, 12)
+    kputs("  bits ")
+    kput_hex(f64_bits(s), 16)
+    kputc(10)
+    # 3.375 + 0.6666666666666666 - 0.125 = 3.916666666666667
+    check(cast[uint32](f64_bits(s) == 0x400F555555555556), "f64: mul/div/add/sub exact bits")
+    r: float64 = f64_sqrt(in_f_two)
+    kputs("   sqrt(2) by Newton = ")
+    kput_f64(r, 15)
+    kputs("  bits ")
+    kput_hex(f64_bits(r), 16)
+    kputc(10)
+    check(cast[uint32](f64_abs(r * r - 2.0) < 0.000000000000001), "f64: sqrt(2)^2 within 1e-15 of 2")
+    check(cast[uint32](f64_bits(r) == 0x3FF6A09E667F3BCC), "f64: Newton sqrt(2) bit-identical to the host reference")
+    # Basel series: sum 1/k^2 for k = 1..1000, summed smallest-first.
+    n: uint32 = in_n
+    acc: float64 = 0.0
+    k: uint32 = n
+    while k > 0:
+        fk: float64 = cast[float64](k)
+        acc = acc + 1.0 / (fk * fk)
+        k = k - 1
+    kputs("   sum 1/k^2, k=1..1000 = ")
+    kput_f64(acc, 15)
+    kputc(10)
+    check(cast[uint32](f64_bits(acc) == 0x3FFA4D8E550A9466), "f64: series sum bit-identical to the host reference")
+    # float -> integer and back
+    big: float64 = 123456789012.75
+    bi: int64 = cast[int64](big * in_f_two)
+    check(cast[uint32](bi == 246913578025), "f64 -> int64 (needs __aeabi_d2lz)")
+    back: float64 = cast[float64](in_i64_b)
+    check(cast[uint32](f64_bits(back) == 0x41CD6F3458800000), "int64 -> f64 (987654321.0)")
+    neg: float64 = cast[float64](in_i64_a)
+    kputs("   float64(-1234567890123456789) = ")
+    kput_f64(neg, 1)
+    kputc(10)
+    check(cast[uint32](f64_bits(neg) == 0xC3B12210F47DE981), "int64 -> f64 (large negative, rounded)")
+    check(cast[uint32](rt_f64_to_u64(rt_u64_to_f64(0xFFFFFFFFFFFFF800)) == 0xFFFFFFFFFFFFF800), "uint64 <-> f64 round trip near 2^64")
+    check(cast[uint32](a < b and b > a and a != b), "f64: comparisons")
+
+
+def test_int64():
+    kputs("-- 64-bit integer multiply / divide / modulo\n")
+    a: uint64 = in_u64_a
+    b: uint64 = in_u64_b
+    c: uint64 = in_u64_c
+    p: uint64 = a * b
+    kputs("   0x123456789abcdef0 * 0xfedcba987 (low 64) = ")
+    kput_hex(p, 16)
+    kputc(10)
+    check(cast[uint32](p == 0x70A3D5F941160090), "u64 multiply (low 64 bits)")
+    q: uint64 = a / c
+    r: uint64 = a % c
+    kputs("   0x123456789abcdef0 / 1000000007 = ")
+    kput_u64(q)
+    kputs(" rem ")
+    kput_u64(r)
+    kputc(10)
+    check(cast[uint32](q == 1311768458), "u64 divide by 32-bit-sized divisor")
+    check(cast[uint32](r == 281411114), "u64 modulo by 32-bit-sized divisor")
+    check(cast[uint32](q * c + r == a), "u64: q*d + r == n")
+    q2: uint64 = a / b
+    r2: uint64 = a % b
+    check(cast[uint32](q2 == 19173961 and q2 * b + r2 == a and r2 < b), "u64 divide by 36-bit divisor")
+    sa: int64 = in_i64_a
+    sb: int64 = in_i64_b
+    sq: int64 = sa / sb
+    sr: int64 = sa % sb
+    kputs("   -1234567890123456789 / 987654321 = ")
+    kput_i64(sq)
+    kputs(" rem ")
+    kput_i64(sr)
+    kputc(10)
+    check(cast[uint32](sq == -1249999988), "i64 divide truncates toward zero")
+    check(cast[uint32](sr == -725308641), "i64 modulo takes the dividend's sign")
+    check(cast[uint32](sq * sb + sr == sa), "i64: q*d + r == n")
+    # 32-bit unsigned values stay 32-bit: 4000000000 + 4000000000 wraps.
+    u: uint32 = in_u32_a
+    w: uint32 = u + u
+    check(cast[uint32](w == 3705032704), "u32 add wraps at 2^32")
+    check(cast[uint32](u / in_u32_b == 571428571 and u % in_u32_b == 3), "u32 divide/modulo (hardware udiv)")
+    sh: uint64 = (a >> 36) | (a << 28)
+    check(cast[uint32](sh == 0x89ABCDEF01234567), "u64 shifts across the word boundary")
+
+
+def test_struct():
+    kputs("-- struct with pointers\n")
+    kputs("   sizeof(Node) = ")
+    kput_u64(cast[uint64](sizeof(Node)))
+    kputs(", &nodes[1] - &nodes[0] = ")
+    kput_u64(cast[uint64](&nodes[1]) - cast[uint64](&nodes[0]))
+    kputc(10)
+    # value u32 @0 (+4 pad), weight f64 @8, next Ptr @16 (8 bytes), name Ptr @24
+    check(cast[uint32](sizeof(Node) == 32), "struct: sizeof(Node) is 32 (pointers are 8-byte slots)")
+    i: uint32 = 0
+    while i < 4:
+        nodes[i].value = (i + 1) * 10
+        nodes[i].weight = cast[float64](i) + 0.5
+        nodes[i].name = "node"
+        if i < 3:
+            nodes[i].next = &nodes[i + 1]
+        else:
+            nodes[i].next = cast[Ptr[Node]](0)
+        i = i + 1
+    # walk the list through the pointers
+    p: Ptr[Node] = &nodes[0]
+    sum: uint32 = 0
+    wsum: float64 = 0.0
+    count: uint32 = 0
+    while p != cast[Ptr[Node]](0):
+        sum = sum + p[0].value
+        wsum = wsum + p[0].weight
+        count = count + 1
+        p = p[0].next
+    check(cast[uint32](count == 4 and sum == 100), "struct: list walk through next pointers")
+    check(cast[uint32](wsum == 8.0), "struct: float64 field")
+    # the pointer slot: low word = the address, high word = 0
+    slot: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&nodes[0]) + 16)
+    check(cast[uint32](slot[0] == cast[uint32](cast[uint64](&nodes[1])) and slot[1] == 0), "struct: pointer slot is {addr32, 0}")
+    nm: Ptr[uint8] = nodes[2].name
+    check(cast[uint32](nm[0] == 110 and nm[3] == 101 and nm[4] == 0), "struct: string pointer field")
+
+
+def test_volatile_mmio():
+    kputs("-- volatile register read-modify-write (CMSDK UART0 CTRL)\n")
+    ctrl: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0x40004008)
+    before: uint32 = ctrl[0]
+    ctrl[0] = ctrl[0] | 2                 # set RX_EN
+    mid: uint32 = ctrl[0]
+    ctrl[0] = ctrl[0] & 0xFFFFFFFD        # clear RX_EN
+    after: uint32 = ctrl[0]
+    kputs("   CTRL before/mid/after = ")
+    kput_hex32(before)
+    kputc(32)
+    kput_hex32(mid)
+    kputc(32)
+    kput_hex32(after)
+    kputc(10)
+    check(cast[uint32](before == 1 and mid == 3 and after == 1), "mmio: set and clear RX_EN, TX_EN preserved")
+    # BAUDDIV is a plain read/write register: write, read back, restore.
+    old: uint32 = mmio_read32(0x40004010)
+    mmio_write32(0x40004010, 434)
+    rb: uint32 = mmio_read32(0x40004010)
+    mmio_write32(0x40004010, old)
+    check(cast[uint32](rb == 434 and mmio_read32(0x40004010) == old), "mmio: BAUDDIV write/read back/restore")
+
+
+def test_runtime():
+    kputs("-- run-time helpers written in Adder\n")
+    i: uint32 = 0
+    while i < 64:
+        copy_src[i] = cast[uint8](i * 3 + 1)
+        i = i + 1
+    rt_memset(cast[uint64](&copy_dst[0]), 0xAA, 64)
+    rt_memcpy(cast[uint64](&copy_dst[0]) + 5, cast[uint64](&copy_src[0]) + 1, 41)
+    ok: uint32 = 1
+    i = 0
+    while i < 64:
+        want: uint32 = 0xAA
+        if i >= 5 and i < 46:
+            want = ((i - 4) * 3 + 1) & 255
+        if cast[uint32](copy_dst[i]) != want:
+            ok = 0
+        i = i + 1
+    check(ok, "memset + unaligned memcpy")
+    rt_memmove(cast[uint64](&copy_src[0]) + 4, cast[uint64](&copy_src[0]), 32)
+    check(cast[uint32](copy_src[4] == 1 and copy_src[35] == 94 and copy_src[36] == 109), "overlapping memmove")
+    rem: uint64 = 0
+    qq: uint64 = rt_udivmod64(0xFFFFFFFFFFFFFFFF, 3, &rem)
+    check(cast[uint32](qq == 0x5555555555555555 and rem == 0), "udivmod64(2^64-1, 3)")
+    qq = rt_udivmod64(5, 0, &rem)
+    check(cast[uint32](qq == 0 and rem == 5), "udivmod64 by zero is defined (q=0, r=n)")
+
+
+def main() -> int32:
+    kputs("\nHackOS 0.1 (milestone 1) -- Adder on ARM Cortex-M7, QEMU mps2-an500\n")
+    kputs("CONTROL=")
+    kput_hex32(cpu_control())
+    kputs(" CPACR=")
+    kput_hex32(mmio_read32(0xE000ED88))
+    kputs(" VTOR=")
+    kput_hex32(mmio_read32(0xE000ED08))
+    kputs(" CPUID=")
+    kput_hex32(mmio_read32(0xE000ED00))
+    kputc(10)
+    check(cast[uint32]((mmio_read32(0xE000ED88) & 0xF00000) == 0xF00000), "FPU enabled in CPACR")
+    check(cast[uint32](((mmio_read32(0xE000ED00) >> 4) & 0xFFF) == 0xC27), "CPUID part number is Cortex-M7")
+    test_systick()
+    test_svc()
+    test_float()
+    test_int64()
+    test_struct()
+    test_volatile_mmio()
+    test_runtime()
+    if failures == 0:
+        kputs("RESULT: PASS (all checks passed)\n")
+    else:
+        kputs("RESULT: FAIL (")
+        kput_u64(cast[uint64](failures))
+        kputs(" checks failed)\n")
+    return cast[int32](failures)

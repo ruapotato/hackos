@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS board support: QEMU `mps2-an500` (ARM MPS2 FPGA board, AN500 image).
+#
+# Facts checked against QEMU 10.0 (hw/arm/mps2.c, hw/char/cmsdk-apb-uart.c)
+# and the running machine's `info mtree`:
+#   SYSCLK (CPU clock, SysTick CLKSOURCE=1) = 25 MHz, refclk = 1 MHz
+#   UART0 = CMSDK APB UART at 0x40004000 (RX irq 0, TX irq 1)
+#     +0x00 DATA      rx/tx byte
+#     +0x04 STATE     bit0 TXFULL, bit1 RXFULL, bit2 TXOVERRUN, bit3 RXOVERRUN
+#     +0x08 CTRL      bit0 TX_EN, bit1 RX_EN, bit2 TX_INTEN, bit3 RX_INTEN
+#     +0x0C INTSTATUS
+#     +0x10 BAUDDIV   must be >= 16; baud = pclk / BAUDDIV
+#   A byte written to DATA is only transmitted while CTRL.TX_EN is set.
+
+from kernel.cpu import mmio_read32, mmio_write32
+
+
+def board_cpu_hz() -> uint32:
+    return 25000000
+
+
+def board_console_init():
+    # 25 MHz / 115200 = 217
+    mmio_write32(0x40004010, 217)
+    mmio_write32(0x40004008, 1)          # TX_EN
+
+
+def board_console_putc(c: uint32):
+    # wait while the transmit holding register is full
+    while (mmio_read32(0x40004004) & 1) != 0:
+        c = c
+    mmio_write32(0x40004000, c & 255)

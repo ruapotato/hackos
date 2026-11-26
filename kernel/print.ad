@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- console output formatting (no allocation, no varargs).
+
+from boards.mps2_an500.board import board_console_putc
+
+
+def kputc(c: uint32):
+    if c == 10:
+        board_console_putc(13)
+    board_console_putc(c)
+
+
+def kputs(s: Ptr[uint8]):
+    i: uint32 = 0
+    while s[i] != 0:
+        kputc(cast[uint32](s[i]))
+        i = i + 1
+
+
+def kput_u64(v: uint64):
+    if v == 0:
+        kputc(48)
+        return
+    tmp: Array[24, uint8]
+    n: uint32 = 0
+    x: uint64 = v
+    while x > 0:
+        tmp[n] = cast[uint8]((x % 10) + 48)
+        n = n + 1
+        x = x / 10
+    while n > 0:
+        n = n - 1
+        kputc(cast[uint32](tmp[n]))
+
+
+def kput_i64(v: int64):
+    if v < 0:
+        kputc(45)
+        kput_u64(cast[uint64](0) - cast[uint64](v))
+        return
+    kput_u64(cast[uint64](v))
+
+
+def kput_hex(v: uint64, digits: uint32):
+    hexd: Ptr[uint8] = "0123456789abcdef"
+    kputs("0x")
+    i: uint32 = digits
+    while i > 0:
+        i = i - 1
+        kputc(cast[uint32](hexd[(v >> cast[uint64](i * 4)) & 15]))
+
+
+def kput_hex32(v: uint32):
+    kput_hex(cast[uint64](v), 8)
+
+
+# float64 with `decimals` digits after the point, rounded half-up on the last
+# digit.  Handles |d| < 2^63; prints "nan"/"inf" for the special values.
+def kput_f64(d: float64, decimals: uint32):
+    if d != d:
+        kputs("nan")
+        return
+    x: float64 = d
+    if x < 0.0:
+        kputc(45)
+        x = 0.0 - x
+    if x > 9000000000.0 * 1000000000.0:
+        kputs("inf")
+        return
+    scale: float64 = 1.0
+    i: uint32 = 0
+    while i < decimals:
+        scale = scale * 10.0
+        i = i + 1
+    x = x + 0.5 / scale
+    ip: uint64 = cast[uint64](x)
+    kput_u64(ip)
+    if decimals == 0:
+        return
+    kputc(46)
+    frac: float64 = x - cast[float64](ip)
+    i = 0
+    while i < decimals:
+        frac = frac * 10.0
+        dg: uint32 = cast[uint32](frac)
+        if dg > 9:
+            dg = 9
+        kputc(48 + dg)
+        frac = frac - cast[float64](dg)
+        i = i + 1

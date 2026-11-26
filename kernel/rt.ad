@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS run-time support: the routines LLVM-generated Thumb-2 code calls
+# behind the programmer's back, written in Adder.
+#
+# There is no compiler-rt, libgcc or newlib on this toolchain, so everything
+# the code generator may call must exist here.  arch/armv7m/startup.S holds the
+# EABI entry points (__aeabi_uldivmod, memcpy, __aeabi_l2d, ...), which only
+# convert between the EABI helper calling convention and Adder's (every integer
+# argument is a 64-bit value) and then call the functions below.
+#
+# RULES FOR THIS FILE: nothing in here may itself need the helper it
+# implements.  So: no 64-bit `/` or `%`, and no 64-bit <-> float64 casts
+# (32-bit ones are single FPU instructions and are fine).  The compiler emits
+# every function `"no-builtins"` on this target, so the byte loops below are
+# not turned back into calls to memcpy/memset.
+
+def rt_memcpy(dst: uint64, src: uint64, n: uint64) -> uint64:
+    d: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    # Word-at-a-time when both pointers are 4-byte aligned.
+    if ((dst | src) & 3) == 0:
+        dw: Ptr[uint32] = cast[Ptr[uint32]](dst)
+        sw: Ptr[uint32] = cast[Ptr[uint32]](src)
+        words: uint64 = n >> 2
+        w: uint64 = 0
+        while w < words:
+            dw[w] = sw[w]
+            w = w + 1
+        i = words << 2
+    while i < n:
+        d[i] = s[i]
+        i = i + 1
+    return dst
+
+
+def rt_memmove(dst: uint64, src: uint64, n: uint64) -> uint64:
+    d: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    if dst <= src or dst >= src + n:
+        return rt_memcpy(dst, src, n)
+    i: uint64 = n
+    while i > 0:
+        i = i - 1
+        d[i] = s[i]
+    return dst
+
+
+def rt_memset(dst: uint64, c: uint64, n: uint64) -> uint64:
+    d: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    b: uint8 = cast[uint8](c & 255)
+    i: uint64 = 0
+    if (dst & 3) == 0:
+        b32: uint32 = cast[uint32](c & 255)
+        pat: uint32 = b32 | (b32 << 8) | (b32 << 16) | (b32 << 24)
+        dw: Ptr[uint32] = cast[Ptr[uint32]](dst)
+        words: uint64 = n >> 2
+        w: uint64 = 0
+        while w < words:
+            dw[w] = pat
+            w = w + 1
+        i = words << 2
+    while i < n:
+        d[i] = b
+        i = i + 1
+    return dst
+
+
+# Unsigned 64-bit divide with remainder: restoring shift-subtract, one bit per
+# step, skipping the leading zero bits of the numerator.  Division by zero
+# returns quotient 0 and remainder n (the EABI leaves it to __aeabi_ldiv0; a
+# kernel build should trap here instead -- milestone 2).
+def rt_udivmod64(n: uint64, d: uint64, rem_out: Ptr[uint64]) -> uint64:
+    if d == 0:
+        rem_out[0] = n
+        return 0
+    if n < d:
+        rem_out[0] = n
+        return 0
+    q: uint64 = 0
+    r: uint64 = 0
+    i: int32 = 63
+    # skip leading zeros of n (purely a speed-up)
+    while i > 0 and ((n >> cast[uint64](i)) & 1) == 0:
+        i = i - 1
+    while i >= 0:
+        r = (r << 1) | ((n >> cast[uint64](i)) & 1)
+        if r >= d:
+            r = r - d
+            q = q | (cast[uint64](1) << cast[uint64](i))
+        i = i - 1
+    rem_out[0] = r
+    return q
+
+
+# Signed: C semantics (quotient truncates toward zero, remainder has the sign
+# of the numerator).
+def rt_sdivmod64(n: int64, d: int64, rem_out: Ptr[int64]) -> int64:
+    un: uint64 = cast[uint64](n)
+    ud: uint64 = cast[uint64](d)
+    neg_q: uint32 = 0
+    neg_r: uint32 = 0
+    if n < 0:
+        un = cast[uint64](0) - un
+        neg_q = 1
+        neg_r = 1
+    if d < 0:
+        ud = cast[uint64](0) - ud
+        neg_q = neg_q ^ 1
+    ur: uint64 = 0
+    uq: uint64 = rt_udivmod64(un, ud, &ur)
+    if neg_r != 0:
+        ur = cast[uint64](0) - ur
+    if neg_q != 0:
+        uq = cast[uint64](0) - uq
+    rem_out[0] = cast[int64](ur)
+    return cast[int64](uq)
+
+
+# uint64 -> float64: hi * 2^32 + lo.  Both 32-bit conversions and the multiply
+# by a power of two are exact, so the single addition rounds once, correctly.
+def rt_u64_to_f64(v: uint64) -> float64:
+    hi: uint32 = cast[uint32](v >> 32)
+    lo: uint32 = cast[uint32](v & 0xFFFFFFFF)
+    fhi: float64 = cast[float64](hi)
+    flo: float64 = cast[float64](lo)
+    return fhi * 4294967296.0 + flo
+
+
+def rt_i64_to_f64(v: int64) -> float64:
+    if v < 0:
+        m: uint64 = cast[uint64](0) - cast[uint64](v)
+        return 0.0 - rt_u64_to_f64(m)
+    return rt_u64_to_f64(cast[uint64](v))
+
+
+# float64 -> uint64, truncating toward zero.  Out-of-range and NaN inputs
+# saturate (0 or 2^64-1) instead of being undefined.
+def rt_f64_to_u64(d: float64) -> uint64:
+    if d != d:
+        return 0
+    if d < 1.0:
+        return 0
+    two32: float64 = 4294967296.0
+    if d >= two32 * two32:
+        return 0xFFFFFFFFFFFFFFFF
+    hi: uint32 = cast[uint32](d / two32)
+    fhi: float64 = cast[float64](hi)
+    rest: float64 = d - fhi * two32
+    lo: uint32 = cast[uint32](rest)
+    return (cast[uint64](hi) << 32) | cast[uint64](lo)
+
+
+def rt_f64_to_i64(d: float64) -> int64:
+    if d != d:
+        return 0
+    two63: float64 = 2147483648.0 * 4294967296.0
+    if d < 0.0:
+        if d <= 0.0 - two63:
+            return cast[int64](0x8000000000000000)
+        m: uint64 = rt_f64_to_u64(0.0 - d)
+        return cast[int64](cast[uint64](0) - m)
+    if d >= two63:
+        return cast[int64](0x7FFFFFFFFFFFFFFF)
+    return cast[int64](rt_f64_to_u64(d))

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- SysTick timer (ARMv7-M system timer, 24-bit down-counter).
+#   0xE000E010 SYST_CSR  bit0 ENABLE, bit1 TICKINT, bit2 CLKSOURCE (1 = CPU clock)
+#   0xE000E014 SYST_RVR  reload value (period - 1)
+#   0xE000E018 SYST_CVR  current value (any write clears it)
+
+from kernel.cpu import mmio_read32, mmio_write32, cpu_ipsr
+from boards.mps2_an500.board import board_cpu_hz
+
+# Written by the interrupt handler, read by thread code: volatile.
+systick_ticks: volatile uint32 = 0
+# The IPSR value observed inside the handler (15 when it really ran as the
+# SysTick exception).
+systick_seen_ipsr: volatile uint32 = 0
+
+
+def systick_start(hz: uint32):
+    mmio_write32(0xE000E010, 0)
+    mmio_write32(0xE000E014, board_cpu_hz() / hz - 1)
+    mmio_write32(0xE000E018, 0)
+    mmio_write32(0xE000E010, 7)
+
+
+def systick_stop():
+    mmio_write32(0xE000E010, 0)
+
+
+# Exception 15.  The vector table refers to this symbol by name; an ordinary
+# Adder function is a valid Cortex-M exception handler.
+def systick_handler():
+    systick_ticks = systick_ticks + 1
+    systick_seen_ipsr = cpu_ipsr()

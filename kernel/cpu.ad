@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- Cortex-M7 core access from Adder.
+#
+# Inline assembly on the thumbv7em target is `asm_volatile("...")`: the text is
+# passed to the assembler verbatim; it takes no operands.  The compiler tells
+# LLVM the statement clobbers r0-r3, r12, lr, flags and memory, so a body may
+# use those as scratch and must preserve r4-r11, sp and the FP registers.
+# Values are exchanged with Adder through globals, addressed with
+# movw/movt (no literal pool is needed).
+
+# Scratch cells for the inline-asm bodies below.  `volatile` because they are
+# written behind the compiler's back.
+cpu_reg_scratch: volatile uint32 = 0
+
+
+def cpu_irq_disable():
+    asm_volatile("cpsid i")
+
+
+def cpu_irq_enable():
+    asm_volatile("cpsie i")
+
+
+def cpu_wait_for_interrupt():
+    asm_volatile("wfi")
+
+
+def cpu_primask() -> uint32:
+    asm_volatile("mrs r0, primask\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
+    return cpu_reg_scratch
+
+
+# Interrupt Program Status Register: 0 in thread mode, else the active
+# exception number (15 = SysTick, 11 = SVCall, ...).
+def cpu_ipsr() -> uint32:
+    asm_volatile("mrs r0, ipsr\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
+    return cpu_reg_scratch
+
+
+def cpu_control() -> uint32:
+    asm_volatile("mrs r0, control\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
+    return cpu_reg_scratch
+
+
+# BASEPRI := v (priority mask; 0 = no masking).
+def cpu_set_basepri(v: uint32):
+    cpu_reg_scratch = v
+    asm_volatile("movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n ldr r0, [r1]\n msr basepri, r0")
+
+
+def cpu_basepri() -> uint32:
+    asm_volatile("mrs r0, basepri\n movw r1, #:lower16:cpu_reg_scratch\n movt r1, #:upper16:cpu_reg_scratch\n str r0, [r1]")
+    return cpu_reg_scratch
+
+
+# 32-bit memory-mapped register access.  The pointee type is `volatile`, so
+# every call is exactly one load or one store that the optimiser may not
+# remove, merge or reorder.
+def mmio_read32(addr: uint64) -> uint32:
+    return cast[Ptr[volatile uint32]](addr)[0]
+
+
+def mmio_write32(addr: uint64, v: uint32):
+    cast[Ptr[volatile uint32]](addr)[0] = v

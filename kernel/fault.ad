@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- default fault / unexpected-exception report.
+#
+# Entered from hackos_fault_entry (arch/armv7m/startup.S) on a private stack
+# with interrupts masked.  Prints the exception, the fault status registers
+# and the stacked frame over the console, then halts (test builds: ends the
+# emulator run with status 3).
+
+from kernel.cpu import mmio_read32
+from kernel.print import kputs, kput_hex32, kput_u64, kputc
+from kernel.exit import hackos_exit
+
+
+def fault_name(kind: uint64) -> Ptr[uint8]:
+    if kind == 2:
+        return "NMI"
+    if kind == 3:
+        return "HardFault"
+    if kind == 4:
+        return "MemManage"
+    if kind == 5:
+        return "BusFault"
+    if kind == 6:
+        return "UsageFault"
+    if kind == 11:
+        return "unexpected SVCall"
+    if kind == 12:
+        return "unexpected DebugMonitor"
+    if kind == 14:
+        return "unexpected PendSV"
+    if kind == 15:
+        return "unexpected SysTick"
+    return "unexpected interrupt"
+
+
+def fault_reg(name: Ptr[uint8], v: uint32):
+    kputs("  ")
+    kputs(name)
+    kputs(" = ")
+    kput_hex32(v)
+    kputc(10)
+
+
+def fault_bit(v: uint32, bit: uint32, name: Ptr[uint8]):
+    if ((v >> bit) & 1) != 0:
+        kputs("    ")
+        kputs(name)
+        kputc(10)
+
+
+# kind: exception number.  frame: address of the stacked
+# {r0,r1,r2,r3,r12,lr,pc,xpsr}.  exc_return: the EXC_RETURN value.
+def hackos_fault(kind: uint64, frame: uint64, exc_return: uint64):
+    cfsr: uint32 = mmio_read32(0xE000ED28)
+    hfsr: uint32 = mmio_read32(0xE000ED2C)
+    mmfar: uint32 = mmio_read32(0xE000ED34)
+    bfar: uint32 = mmio_read32(0xE000ED38)
+    icsr: uint32 = mmio_read32(0xE000ED04)
+    f: Ptr[uint32] = cast[Ptr[uint32]](frame)
+    kputs("\n*** HackOS FAULT: ")
+    kputs(fault_name(kind))
+    kputs(" (exception ")
+    kput_u64(cast[uint64](icsr & 0x1FF))
+    kputs(") ***\n")
+    fault_reg("CFSR ", cfsr)
+    fault_bit(cfsr, 0, "MMFSR.IACCVIOL  instruction access violation")
+    fault_bit(cfsr, 1, "MMFSR.DACCVIOL  data access violation")
+    fault_bit(cfsr, 3, "MMFSR.MUNSTKERR unstacking")
+    fault_bit(cfsr, 4, "MMFSR.MSTKERR   stacking")
+    fault_bit(cfsr, 7, "MMFSR.MMARVALID MMFAR holds the address")
+    fault_bit(cfsr, 8, "BFSR.IBUSERR    instruction bus error")
+    fault_bit(cfsr, 9, "BFSR.PRECISERR  precise data bus error")
+    fault_bit(cfsr, 10, "BFSR.IMPRECISERR imprecise data bus error")
+    fault_bit(cfsr, 11, "BFSR.UNSTKERR   unstacking")
+    fault_bit(cfsr, 12, "BFSR.STKERR     stacking")
+    fault_bit(cfsr, 15, "BFSR.BFARVALID  BFAR holds the address")
+    fault_bit(cfsr, 16, "UFSR.UNDEFINSTR undefined instruction")
+    fault_bit(cfsr, 17, "UFSR.INVSTATE   invalid EPSR state")
+    fault_bit(cfsr, 18, "UFSR.INVPC      invalid PC load")
+    fault_bit(cfsr, 19, "UFSR.NOCP       coprocessor (FPU) not enabled")
+    fault_bit(cfsr, 24, "UFSR.UNALIGNED  unaligned access")
+    fault_bit(cfsr, 25, "UFSR.DIVBYZERO  divide by zero")
+    fault_reg("HFSR ", hfsr)
+    fault_bit(hfsr, 1, "VECTTBL  vector table read")
+    fault_bit(hfsr, 30, "FORCED   escalated configurable fault")
+    fault_reg("MMFAR", mmfar)
+    fault_reg("BFAR ", bfar)
+    fault_reg("EXC_RETURN", cast[uint32](exc_return))
+    fault_reg("frame", cast[uint32](frame))
+    fault_reg("r0   ", f[0])
+    fault_reg("r1   ", f[1])
+    fault_reg("r2   ", f[2])
+    fault_reg("r3   ", f[3])
+    fault_reg("r12  ", f[4])
+    fault_reg("lr   ", f[5])
+    fault_reg("pc   ", f[6])
+    fault_reg("xpsr ", f[7])
+    kputs("*** halted ***\n")
+    hackos_exit(3)
