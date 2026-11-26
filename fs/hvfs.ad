@@ -1,0 +1,780 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the file layer: descriptors, paths, mounts, device files.
+#
+# This is new HackOS code, not a port of Hamnix's fs/vfs.ad.  That file cannot
+# be lifted: its descriptors live in Hamnix's task structure, every open goes
+# through the Plan 9 channel layer (namec.ad/chan.ad), and its read and write
+# paths never call tmpfs directly (see the milestone-2 report for the
+# analysis).  What IS Hamnix's, unmodified, sits underneath:
+#     fs/tmpfs.ad      the RAM file system
+#     fs/vfs_mount.ad  the mount table (longest-prefix routing)
+# and the behaviour seen by programs follows Hamnix's native interface:
+# open(path) is read-only, open_write(path) creates or truncates, a directory
+# opened for reading yields "NAME\n" lines, stat returns a 9P stat record,
+# errors are negative errno values plus a per-thread error string.
+#
+# Mounts:  "/"     tmpfs.  Hamnix's tmpfs only serves a fixed set of top-level
+#                  names, so HackOS keeps its whole tree under the tmpfs root
+#                  named "root": the HackOS path /a/b is the tmpfs path
+#                  /root/a/b.  The tmpfs file stays unmodified this way.
+#          "/dev"  device files: console (the UART), null, zero.
+#
+# Locking: one mutex (fs_lock) serialises everything that touches tmpfs or the
+# tables here; tmpfs itself assumes Hamnix's cooperative scheduling.  Device
+# reads and writes run outside the lock because the console may block.
+#
+# Descriptors are per thread; a new thread gets copies of its creator's.
+
+from kernel.sched.core import Thread, thr, current_thread, sched_current, set_current_errstr, sched_exit_hook, sched_exit_hook_set, sched_spawn_hook, sched_spawn_hook_set
+from kernel.sync import Mutex, mutex_init, mutex_lock, mutex_unlock, memcpy, memset, spinlock_lock, spinlock_unlock
+from kernel.rt import rt_memcpy, rt_memset
+from mm.slab import kmalloc, kfree
+from drivers.tty.console import console_read, console_write
+from fs.vfs_mount import vfs_mount, vfs_fs_kind, vfs_fs_rel, FS_KIND_TMPFS, FS_KIND_DEVFS
+from fs.tmpfs import tmpfs_lookup, tmpfs_open_for_write_t, tmpfs_read, tmpfs_write, tmpfs_size, tmpfs_ftruncate, tmpfs_unlink, tmpfs_rename, tmpfs_mkdir, tmpfs_listdir, tmpfs_path_is_dir, tmpfs_path_exists, tmpfs_mtime, tmpfs_is_dir, tmpfs_table, TmpfsEntry
+
+# errno values (Linux numbering, as Hamnix returns them)
+ENOENT: int32 = -2
+EBADF: int32 = -9
+ENOMEM: int32 = -12
+EFAULT: int32 = -14
+EBUSY: int32 = -16
+EEXIST: int32 = -17
+ENOTDIR: int32 = -20
+EISDIR: int32 = -21
+EINVAL: int32 = -22
+EMFILE: int32 = -24
+ENOSPC: int32 = -28
+ESPIPE: int32 = -29
+EROFS: int32 = -30
+ERANGE: int32 = -34
+ENAMETOOLONG: int32 = -36
+ENOSYS: int32 = -38
+ENOTEMPTY: int32 = -39
+EPERM: int32 = -1
+
+# open modes (Plan 9 values, as documented for Hamnix)
+OREAD: uint32 = 0
+OWRITE: uint32 = 1
+ORDWR: uint32 = 2
+OTRUNC: uint32 = 16
+OAPPEND: uint32 = 128
+OCREATE: uint32 = 0x1000            # HackOS-internal: create if missing
+
+SEEK_SET: uint32 = 0
+SEEK_CUR: uint32 = 1
+SEEK_END: uint32 = 2
+
+OF_FILE: uint32 = 1
+OF_DIR: uint32 = 2
+OF_DEV: uint32 = 3
+
+DEV_CONSOLE: int32 = 1
+DEV_NULL: int32 = 2
+DEV_ZERO: int32 = 3
+
+VFS_NR_FDS: uint32 = 16             # per thread (Hamnix: 64 per task)
+VFS_NR_OPEN: uint32 = 64            # system-wide open files
+VFS_PATH_MAX: uint32 = 256
+VFS_DIRBUF: uint64 = 8192
+
+QTDIR: uint32 = 0x80
+DMDIR: uint32 = 0x80000000
+DMDEVICE: uint32 = 0x00800000
+
+
+class OpenFile:
+    refs: uint32                    # descriptors referring to this entry
+    kind: uint32
+    slot: int32                     # tmpfs slot, or device number
+    mode: uint32
+    pos: uint64
+    dirbuf: uint64                  # OF_DIR: snapshot of the listing
+    dirlen: uint64
+
+
+ofiles: Array[64, OpenFile]
+fs_lock: Mutex
+vfs_ready: uint32 = 0
+
+
+def _pc(p: Ptr[uint8]) -> Ptr[char]:
+    return cast[Ptr[char]](p)
+
+
+def _err(code: int32, msg: Ptr[uint8]) -> int32:
+    set_current_errstr(msg)
+    return code
+
+
+def _slen(s: Ptr[uint8]) -> uint32:
+    n: uint32 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _seq(a: Ptr[uint8], b: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while a[i] != 0 and a[i] == b[i]:
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+# Make `path` absolute (against the thread's working directory) and canonical:
+# no ".", "..", doubled or trailing slashes.  out holds VFS_PATH_MAX bytes.
+def vfs_canon(path: Ptr[uint8], out: Ptr[uint8]) -> int32:
+    tmp: Array[400, uint8]
+    n: uint32 = 0
+    if path[0] != 47:
+        cwd: Ptr[uint8] = &current_thread()[0].cwd[0]
+        while cwd[n] != 0:
+            tmp[n] = cwd[n]
+            n = n + 1
+        tmp[n] = 47
+        n = n + 1
+    i: uint32 = 0
+    while path[i] != 0:
+        if n >= 398:
+            return ENAMETOOLONG
+        tmp[n] = path[i]
+        n = n + 1
+        i = i + 1
+    tmp[n] = 0
+    o: uint32 = 0
+    i = 0
+    while tmp[i] != 0:
+        while tmp[i] == 47:
+            i = i + 1
+        if tmp[i] == 0:
+            break
+        st: uint32 = i
+        while tmp[i] != 0 and tmp[i] != 47:
+            i = i + 1
+        ln: uint32 = i - st
+        if ln == 1 and tmp[st] == 46:
+            continue
+        if ln == 2 and tmp[st] == 46 and tmp[st + 1] == 46:
+            while o > 0 and out[o - 1] != 47:
+                o = o - 1
+            if o > 0:
+                o = o - 1
+            continue
+        if o + ln + 2 > VFS_PATH_MAX:
+            return ENAMETOOLONG
+        out[o] = 47
+        o = o + 1
+        k: uint32 = 0
+        while k < ln:
+            out[o] = tmp[st + k]
+            o = o + 1
+            k = k + 1
+    if o == 0:
+        out[0] = 47
+        o = 1
+    out[o] = 0
+    return 0
+
+
+# HackOS canonical path -> tmpfs key ("/root" + path).  out: VFS_PATH_MAX + 8.
+def _tkey(canon: Ptr[uint8], out: Ptr[uint8]):
+    out[0] = 47
+    out[1] = 114
+    out[2] = 111
+    out[3] = 111
+    out[4] = 116
+    n: uint32 = 5
+    if canon[1] != 0:
+        i: uint32 = 0
+        while canon[i] != 0:
+            out[n] = canon[i]
+            n = n + 1
+            i = i + 1
+    out[n] = 0
+
+
+# Does the directory that would hold tmpfs key `tk` exist?
+def _parent_is_dir(tk: Ptr[uint8]) -> uint32:
+    par: Array[272, uint8]
+    n: uint32 = _slen(tk)
+    while n > 0 and tk[n - 1] != 47:
+        n = n - 1
+    if n <= 1:
+        return 0
+    i: uint32 = 0
+    while i + 1 < n:
+        par[i] = tk[i]
+        i = i + 1
+    par[i] = 0
+    if tmpfs_path_is_dir(_pc(&par[0])) != 0:
+        return 1
+    return 0
+
+
+def _dev_lookup(rel: Ptr[uint8]) -> int32:
+    if _seq(rel, "/console") != 0 or _seq(rel, "/cons") != 0:
+        return DEV_CONSOLE
+    if _seq(rel, "/null") != 0:
+        return DEV_NULL
+    if _seq(rel, "/zero") != 0:
+        return DEV_ZERO
+    return 0
+
+
+def _fd_file(fd: int32) -> Ptr[OpenFile]:
+    if fd < 0 or fd >= cast[int32](VFS_NR_FDS):
+        return cast[Ptr[OpenFile]](0)
+    idx: int32 = current_thread()[0].fd[fd]
+    if idx < 0:
+        return cast[Ptr[OpenFile]](0)
+    return &ofiles[idx]
+
+
+# Bind a new OpenFile to the lowest free descriptor of the current thread.
+# fs_lock held.  Returns the descriptor or EMFILE.
+def _install(kind: uint32, slot: int32, mode: uint32, dirbuf: uint64, dirlen: uint64) -> int32:
+    t: Ptr[Thread] = current_thread()
+    fd: int32 = 0
+    while fd < cast[int32](VFS_NR_FDS) and t[0].fd[fd] >= 0:
+        fd = fd + 1
+    i: int32 = 0
+    while i < cast[int32](VFS_NR_OPEN) and ofiles[i].refs != 0:
+        i = i + 1
+    if fd == cast[int32](VFS_NR_FDS) or i == cast[int32](VFS_NR_OPEN):
+        return _err(EMFILE, "too many open files")
+    ofiles[i].refs = 1
+    ofiles[i].kind = kind
+    ofiles[i].slot = slot
+    ofiles[i].mode = mode
+    ofiles[i].pos = 0
+    ofiles[i].dirbuf = dirbuf
+    ofiles[i].dirlen = dirlen
+    t[0].fd[fd] = i
+    return fd
+
+
+def _slot_is_open(slot: int32) -> uint32:
+    i: uint32 = 0
+    while i < VFS_NR_OPEN:
+        if ofiles[i].refs != 0 and ofiles[i].kind == OF_FILE and ofiles[i].slot == slot:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _open_locked(canon: Ptr[uint8], mode: uint32) -> int32:
+    kind: uint32 = vfs_fs_kind(_pc(canon))
+    wants_write: uint32 = 0
+    if (mode & 3) != OREAD or (mode & (OTRUNC | OCREATE | OAPPEND)) != 0:
+        wants_write = 1
+    if kind == FS_KIND_DEVFS:
+        rel: Ptr[uint8] = cast[Ptr[uint8]](vfs_fs_rel(_pc(canon)))
+        if rel[0] == 0:
+            if wants_write != 0:
+                return _err(EISDIR, "is a directory")
+            db: uint64 = kmalloc(32)
+            if db == 0:
+                return _err(ENOMEM, "out of memory")
+            lst: Ptr[uint8] = "console\nnull\nzero\n"
+            rt_memcpy(db, cast[uint64](lst), 18)
+            fdd: int32 = _install(OF_DIR, 0, OREAD, db, 18)
+            if fdd < 0:
+                kfree(db)
+            return fdd
+        dev: int32 = _dev_lookup(rel)
+        if dev == 0:
+            return _err(ENOENT, "file does not exist")
+        return _install(OF_DEV, dev, mode & 3, 0, 0)
+    tk: Array[272, uint8]
+    _tkey(canon, &tk[0])
+    if tmpfs_path_is_dir(_pc(&tk[0])) != 0:
+        if wants_write != 0:
+            return _err(EISDIR, "is a directory")
+        buf: uint64 = kmalloc(VFS_DIRBUF)
+        if buf == 0:
+            return _err(ENOMEM, "out of memory")
+        n: int64 = tmpfs_listdir(_pc(&tk[0]), cast[Ptr[uint8]](buf), VFS_DIRBUF)
+        if n < 0:
+            kfree(buf)
+            return _err(cast[int32](n), "cannot list directory")
+        fd2: int32 = _install(OF_DIR, 0, OREAD, buf, cast[uint64](n))
+        if fd2 < 0:
+            kfree(buf)
+        return fd2
+    slot: int32 = tmpfs_lookup(_pc(&tk[0]))
+    if slot < 0:
+        if (mode & OCREATE) == 0:
+            return _err(ENOENT, "file does not exist")
+        if _parent_is_dir(&tk[0]) == 0:
+            return _err(ENOENT, "directory does not exist")
+        slot = tmpfs_open_for_write_t(_pc(&tk[0]), 1)
+        if slot < 0:
+            return _err(slot, "cannot create file")
+    elif (mode & OTRUNC) != 0:
+        slot = tmpfs_open_for_write_t(_pc(&tk[0]), 1)
+        if slot < 0:
+            return _err(slot, "cannot truncate file")
+    return _install(OF_FILE, slot, mode & (3 | OAPPEND), 0, 0)
+
+
+def vfs_open(path: Ptr[uint8], mode: uint32) -> int32:
+    canon: Array[256, uint8]
+    rc: int32 = vfs_canon(path, &canon[0])
+    if rc < 0:
+        return _err(rc, "path too long")
+    mutex_lock(&fs_lock)
+    fd: int32 = _open_locked(&canon[0], mode)
+    mutex_unlock(&fs_lock)
+    return fd
+
+
+def _close_index(idx: int32):
+    ofiles[idx].refs = ofiles[idx].refs - 1
+    if ofiles[idx].refs == 0:
+        if ofiles[idx].dirbuf != 0:
+            kfree(ofiles[idx].dirbuf)
+            ofiles[idx].dirbuf = 0
+        ofiles[idx].kind = 0
+
+
+def vfs_close(fd: int32) -> int32:
+    if fd < 0 or fd >= cast[int32](VFS_NR_FDS):
+        return _err(EBADF, "close: bad fd")
+    t: Ptr[Thread] = current_thread()
+    mutex_lock(&fs_lock)
+    idx: int32 = t[0].fd[fd]
+    if idx < 0:
+        mutex_unlock(&fs_lock)
+        return _err(EBADF, "close: bad fd")
+    t[0].fd[fd] = -1
+    _close_index(idx)
+    mutex_unlock(&fs_lock)
+    return 0
+
+
+def vfs_read(fd: int32, buf: Ptr[uint8], n: uint64, nonblock: uint32) -> int64:
+    mutex_lock(&fs_lock)
+    f: Ptr[OpenFile] = _fd_file(fd)
+    if f == cast[Ptr[OpenFile]](0):
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EBADF, "read: bad fd"))
+    if f[0].kind == OF_DEV:
+        dev: int32 = f[0].slot
+        mutex_unlock(&fs_lock)
+        if dev == DEV_CONSOLE:
+            return console_read(buf, n, nonblock)
+        if dev == DEV_ZERO:
+            rt_memset(cast[uint64](buf), 0, n)
+            return cast[int64](n)
+        if nonblock != 0:
+            return -1
+        return 0
+    if (f[0].mode & 3) == OWRITE:
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EBADF, "read: not open for reading"))
+    got: uint64 = 0
+    if f[0].kind == OF_DIR:
+        if f[0].pos < f[0].dirlen:
+            got = f[0].dirlen - f[0].pos
+            if got > n:
+                got = n
+            rt_memcpy(cast[uint64](buf), f[0].dirbuf + f[0].pos, got)
+    else:
+        got = tmpfs_read(f[0].slot, buf, f[0].pos, n)
+    f[0].pos = f[0].pos + got
+    mutex_unlock(&fs_lock)
+    if got == 0 and nonblock != 0:
+        return -1
+    return cast[int64](got)
+
+
+def vfs_write(fd: int32, buf: Ptr[uint8], n: uint64) -> int64:
+    mutex_lock(&fs_lock)
+    f: Ptr[OpenFile] = _fd_file(fd)
+    if f == cast[Ptr[OpenFile]](0):
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EBADF, "write: bad fd"))
+    if f[0].kind == OF_DEV:
+        dev: int32 = f[0].slot
+        mutex_unlock(&fs_lock)
+        if dev == DEV_CONSOLE:
+            console_write(buf, n)
+        return cast[int64](n)
+    if f[0].kind != OF_FILE or (f[0].mode & 3) == OREAD:
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EBADF, "write: not open for writing"))
+    if (f[0].mode & OAPPEND) != 0:
+        f[0].pos = tmpfs_size(f[0].slot)
+    w: uint64 = tmpfs_write(f[0].slot, buf, f[0].pos, n)
+    f[0].pos = f[0].pos + w
+    mutex_unlock(&fs_lock)
+    if w == 0 and n != 0:
+        return cast[int64](_err(ENOSPC, "tmpfs: no space"))
+    return cast[int64](w)
+
+
+def vfs_lseek(fd: int32, off: int64, whence: uint32) -> int64:
+    mutex_lock(&fs_lock)
+    f: Ptr[OpenFile] = _fd_file(fd)
+    if f == cast[Ptr[OpenFile]](0):
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EBADF, "lseek: bad fd"))
+    if f[0].kind == OF_DEV:
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(ESPIPE, "lseek: not seekable"))
+    base: int64 = 0
+    if whence == SEEK_CUR:
+        base = cast[int64](f[0].pos)
+    elif whence == SEEK_END:
+        if f[0].kind == OF_DIR:
+            base = cast[int64](f[0].dirlen)
+        else:
+            base = cast[int64](tmpfs_size(f[0].slot))
+    elif whence != SEEK_SET:
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EINVAL, "lseek: bad whence"))
+    np: int64 = base + off
+    if np < 0:
+        mutex_unlock(&fs_lock)
+        return cast[int64](_err(EINVAL, "lseek: negative offset"))
+    f[0].pos = cast[uint64](np)
+    mutex_unlock(&fs_lock)
+    return np
+
+
+def vfs_dup2(oldfd: int32, newfd: int32) -> int32:
+    t: Ptr[Thread] = current_thread()
+    mutex_lock(&fs_lock)
+    f: Ptr[OpenFile] = _fd_file(oldfd)
+    if f == cast[Ptr[OpenFile]](0):
+        mutex_unlock(&fs_lock)
+        return _err(EBADF, "dup: bad fd")
+    if newfd < 0:
+        newfd = 0
+        while newfd < cast[int32](VFS_NR_FDS) and t[0].fd[newfd] >= 0:
+            newfd = newfd + 1
+    if newfd >= cast[int32](VFS_NR_FDS):
+        mutex_unlock(&fs_lock)
+        return _err(EMFILE, "dup: no free fd")
+    if newfd != oldfd:
+        if t[0].fd[newfd] >= 0:
+            _close_index(t[0].fd[newfd])
+        t[0].fd[newfd] = t[0].fd[oldfd]
+        f[0].refs = f[0].refs + 1
+    mutex_unlock(&fs_lock)
+    return newfd
+
+
+def vfs_dup(oldfd: int32) -> int32:
+    return vfs_dup2(oldfd, -1)
+
+
+def vfs_mkdir(path: Ptr[uint8]) -> int32:
+    canon: Array[256, uint8]
+    tk: Array[272, uint8]
+    rc: int32 = vfs_canon(path, &canon[0])
+    if rc < 0:
+        return _err(rc, "path too long")
+    if vfs_fs_kind(_pc(&canon[0])) != FS_KIND_TMPFS:
+        return _err(EROFS, "read-only file system")
+    _tkey(&canon[0], &tk[0])
+    mutex_lock(&fs_lock)
+    if tmpfs_path_exists(_pc(&tk[0])) != 0:
+        rc = _err(EEXIST, "file exists")
+    elif _parent_is_dir(&tk[0]) == 0:
+        rc = _err(ENOENT, "directory does not exist")
+    else:
+        rc = tmpfs_mkdir(_pc(&tk[0]))
+    mutex_unlock(&fs_lock)
+    return rc
+
+
+# Remove a file or an empty directory.  A file that is open cannot be removed
+# (EBUSY): tmpfs keeps no open count and would recycle the slot under the
+# descriptor.  This differs from POSIX.
+def vfs_unlink(path: Ptr[uint8]) -> int32:
+    canon: Array[256, uint8]
+    tk: Array[272, uint8]
+    rc: int32 = vfs_canon(path, &canon[0])
+    if rc < 0:
+        return _err(rc, "path too long")
+    if vfs_fs_kind(_pc(&canon[0])) != FS_KIND_TMPFS:
+        return _err(EROFS, "read-only file system")
+    if canon[1] == 0:
+        return _err(EBUSY, "cannot remove the root directory")
+    _tkey(&canon[0], &tk[0])
+    mutex_lock(&fs_lock)
+    slot: int32 = tmpfs_lookup(_pc(&tk[0]))
+    if slot < 0:
+        rc = _err(ENOENT, "file does not exist")
+    elif _slot_is_open(slot) != 0:
+        rc = _err(EBUSY, "file is open")
+    else:
+        isdir: int32 = tmpfs_is_dir(slot)
+        rc = tmpfs_unlink(_pc(&tk[0]))
+        if rc == EEXIST and isdir != 0:
+            rc = _err(ENOTEMPTY, "directory not empty")
+    mutex_unlock(&fs_lock)
+    return rc
+
+
+def vfs_rename(oldpath: Ptr[uint8], newpath: Ptr[uint8]) -> int32:
+    co: Array[256, uint8]
+    cn: Array[256, uint8]
+    to: Array[272, uint8]
+    tn: Array[272, uint8]
+    rc: int32 = vfs_canon(oldpath, &co[0])
+    if rc == 0:
+        rc = vfs_canon(newpath, &cn[0])
+    if rc < 0:
+        return _err(rc, "path too long")
+    if vfs_fs_kind(_pc(&co[0])) != FS_KIND_TMPFS or vfs_fs_kind(_pc(&cn[0])) != FS_KIND_TMPFS:
+        return _err(EROFS, "read-only file system")
+    if co[1] == 0 or cn[1] == 0:
+        return _err(EBUSY, "cannot rename the root directory")
+    _tkey(&co[0], &to[0])
+    _tkey(&cn[0], &tn[0])
+    mutex_lock(&fs_lock)
+    if tmpfs_path_exists(_pc(&to[0])) == 0:
+        rc = _err(ENOENT, "file does not exist")
+    elif _parent_is_dir(&tn[0]) == 0:
+        rc = _err(ENOENT, "directory does not exist")
+    elif tmpfs_path_is_dir(_pc(&tn[0])) != 0:
+        rc = _err(EISDIR, "target is a directory")
+    else:
+        ns: int32 = tmpfs_lookup(_pc(&tn[0]))
+        if ns >= 0 and _slot_is_open(ns) != 0:
+            rc = _err(EBUSY, "target is open")
+        else:
+            rc = tmpfs_rename(_pc(&to[0]), _pc(&tn[0]))
+    mutex_unlock(&fs_lock)
+    return rc
+
+
+def _put16(b: Ptr[uint8], off: uint32, v: uint32):
+    b[off] = cast[uint8](v & 255)
+    b[off + 1] = cast[uint8]((v >> 8) & 255)
+
+
+def _put32(b: Ptr[uint8], off: uint32, v: uint32):
+    _put16(b, off, v & 0xFFFF)
+    _put16(b, off + 2, v >> 16)
+
+
+def _putstr(b: Ptr[uint8], off: uint32, s: Ptr[uint8]) -> uint32:
+    n: uint32 = _slen(s)
+    _put16(b, off, n)
+    i: uint32 = 0
+    while i < n:
+        b[off + 2 + i] = s[i]
+        i = i + 1
+    return off + 2 + n
+
+
+# Encode a 9P2000 stat record, the format of Hamnix's SYS_STAT_P9:
+#   size[2] type[2] dev[4] qid.type[1] qid.vers[4] qid.path[8] mode[4]
+#   atime[4] mtime[4] length[8] name[s] uid[s] gid[s] muid[s]
+# Returns the bytes written, or ERANGE when nbuf is too small.
+def _stat_encode(buf: Ptr[uint8], nbuf: uint64, name: Ptr[uint8], qtype: uint32, qpath: uint64, mode: uint32, mtime: uint32, length: uint64) -> int64:
+    total: uint32 = 41 + 2 + _slen(name) + 3 * 8
+    if cast[uint64](total) > nbuf:
+        return cast[int64](_err(ERANGE, "stat buffer too small"))
+    _put16(buf, 0, total - 2)
+    _put16(buf, 2, 0)
+    _put32(buf, 4, 0)
+    buf[8] = cast[uint8](qtype)
+    _put32(buf, 9, 0)
+    _put32(buf, 13, cast[uint32](qpath))
+    _put32(buf, 17, cast[uint32](qpath >> 32))
+    _put32(buf, 21, mode)
+    _put32(buf, 25, mtime)
+    _put32(buf, 29, mtime)
+    _put32(buf, 33, cast[uint32](length))
+    _put32(buf, 37, cast[uint32](length >> 32))
+    off: uint32 = _putstr(buf, 41, name)
+    off = _putstr(buf, off, "hackos")
+    off = _putstr(buf, off, "hackos")
+    off = _putstr(buf, off, "hackos")
+    return cast[int64](off)
+
+
+def _basename(canon: Ptr[uint8]) -> Ptr[uint8]:
+    n: uint32 = _slen(canon)
+    while n > 0 and canon[n - 1] != 47:
+        n = n - 1
+    if canon[n] == 0:
+        return "/"
+    return cast[Ptr[uint8]](cast[uint64](canon) + cast[uint64](n))
+
+
+def _stat_slot(slot: int32, name: Ptr[uint8], buf: Ptr[uint8], nbuf: uint64) -> int64:
+    mode: uint32 = tmpfs_table[slot].mode & 0x1FF
+    qt: uint32 = 0
+    ln: uint64 = 0
+    if tmpfs_is_dir(slot) != 0:
+        mode = mode | DMDIR
+        qt = QTDIR
+    else:
+        ln = tmpfs_size(slot)
+    return _stat_encode(buf, nbuf, name, qt, cast[uint64](slot) + 1, mode, cast[uint32](tmpfs_mtime(slot)), ln)
+
+
+def vfs_stat(path: Ptr[uint8], buf: Ptr[uint8], nbuf: uint64) -> int64:
+    canon: Array[256, uint8]
+    tk: Array[272, uint8]
+    rc: int32 = vfs_canon(path, &canon[0])
+    if rc < 0:
+        return cast[int64](_err(rc, "path too long"))
+    if vfs_fs_kind(_pc(&canon[0])) == FS_KIND_DEVFS:
+        rel: Ptr[uint8] = cast[Ptr[uint8]](vfs_fs_rel(_pc(&canon[0])))
+        if rel[0] == 0:
+            return _stat_encode(buf, nbuf, "dev", QTDIR, 0x1000, DMDIR | 0x16D, 0, 0)
+        dev: int32 = _dev_lookup(rel)
+        if dev == 0:
+            return cast[int64](_err(ENOENT, "file does not exist"))
+        return _stat_encode(buf, nbuf, _basename(&canon[0]), 0, 0x1000 + cast[uint64](dev), DMDEVICE | 0x1B6, 0, 0)
+    _tkey(&canon[0], &tk[0])
+    mutex_lock(&fs_lock)
+    r: int64 = 0
+    slot: int32 = tmpfs_lookup(_pc(&tk[0]))
+    if slot < 0:
+        r = cast[int64](_err(ENOENT, "file does not exist"))
+    else:
+        r = _stat_slot(slot, _basename(&canon[0]), buf, nbuf)
+    mutex_unlock(&fs_lock)
+    return r
+
+
+def vfs_fstat(fd: int32, buf: Ptr[uint8], nbuf: uint64) -> int64:
+    mutex_lock(&fs_lock)
+    r: int64 = 0
+    f: Ptr[OpenFile] = _fd_file(fd)
+    if f == cast[Ptr[OpenFile]](0):
+        r = cast[int64](_err(EBADF, "fstat: bad fd"))
+    elif f[0].kind == OF_DEV:
+        r = _stat_encode(buf, nbuf, "dev", 0, 0x1000 + cast[uint64](f[0].slot), DMDEVICE | 0x1B6, 0, 0)
+    elif f[0].kind == OF_DIR:
+        r = _stat_encode(buf, nbuf, "", QTDIR, 0, DMDIR | 0x1ED, 0, 0)
+    else:
+        r = _stat_slot(f[0].slot, "", buf, nbuf)
+    mutex_unlock(&fs_lock)
+    return r
+
+
+def vfs_chdir(path: Ptr[uint8]) -> int32:
+    canon: Array[256, uint8]
+    tk: Array[272, uint8]
+    rc: int32 = vfs_canon(path, &canon[0])
+    if rc < 0:
+        return _err(rc, "path too long")
+    if _slen(&canon[0]) >= 127:
+        return _err(ENAMETOOLONG, "chdir: path too long")
+    if vfs_fs_kind(_pc(&canon[0])) == FS_KIND_DEVFS:
+        if cast[Ptr[uint8]](vfs_fs_rel(_pc(&canon[0])))[0] != 0:
+            return _err(ENOTDIR, "not a directory")
+    else:
+        _tkey(&canon[0], &tk[0])
+        mutex_lock(&fs_lock)
+        ok: int32 = tmpfs_path_is_dir(_pc(&tk[0]))
+        ex: int32 = tmpfs_path_exists(_pc(&tk[0]))
+        mutex_unlock(&fs_lock)
+        if ok == 0:
+            if ex != 0:
+                return _err(ENOTDIR, "not a directory")
+            return _err(ENOENT, "directory does not exist")
+    cwd: Ptr[uint8] = &current_thread()[0].cwd[0]
+    i: uint32 = 0
+    while canon[i] != 0:
+        cwd[i] = canon[i]
+        i = i + 1
+    cwd[i] = 0
+    return 0
+
+
+# Copies the working directory including its NUL; returns the byte count.
+def vfs_getcwd(buf: Ptr[uint8], n: uint64) -> int64:
+    cwd: Ptr[uint8] = &current_thread()[0].cwd[0]
+    ln: uint64 = cast[uint64](_slen(cwd)) + 1
+    if n < ln:
+        return cast[int64](_err(ERANGE, "getcwd: buffer too small"))
+    rt_memcpy(cast[uint64](buf), cast[uint64](cwd), ln)
+    return cast[int64](ln)
+
+
+# Number of open-file entries in use (for leak checks).
+def vfs_open_count() -> uint32:
+    n: uint32 = 0
+    i: uint32 = 0
+    while i < VFS_NR_OPEN:
+        if ofiles[i].refs != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+# A thread ends: release its descriptors.  Runs in thread context (the exiting
+# thread itself, or whoever reaps a thread that was ended by a fault).
+def _vfs_thread_exit(tp: uint64) -> int64:
+    t: Ptr[Thread] = thr(tp)
+    mutex_lock(&fs_lock)
+    fd: uint32 = 0
+    while fd < VFS_NR_FDS:
+        if t[0].fd[fd] >= 0:
+            _close_index(t[0].fd[fd])
+            t[0].fd[fd] = -1
+        fd = fd + 1
+    mutex_unlock(&fs_lock)
+    return 0
+
+
+# A thread is created: it starts with its creator's descriptors and directory.
+def _vfs_thread_spawn(childp: uint64, parentp: uint64) -> int64:
+    c: Ptr[Thread] = thr(childp)
+    p: Ptr[Thread] = thr(parentp)
+    mutex_lock(&fs_lock)
+    fd: uint32 = 0
+    while fd < VFS_NR_FDS:
+        idx: int32 = p[0].fd[fd]
+        c[0].fd[fd] = idx
+        if idx >= 0:
+            ofiles[idx].refs = ofiles[idx].refs + 1
+        fd = fd + 1
+    mutex_unlock(&fs_lock)
+    i: uint32 = 0
+    while p[0].cwd[i] != 0:
+        c[0].cwd[i] = p[0].cwd[i]
+        i = i + 1
+    c[0].cwd[i] = 0
+    return 0
+
+
+# Mount the root tmpfs and /dev, create the standard directories.
+def vfs_init():
+    mutex_init(&fs_lock)
+    i: uint32 = 0
+    while i < VFS_NR_OPEN:
+        ofiles[i].refs = 0
+        i = i + 1
+    vfs_mount("/", FS_KIND_TMPFS, 0, 0)
+    vfs_mount("/dev", FS_KIND_DEVFS, 4, 0)
+    tmpfs_mkdir("/root/dev")
+    tmpfs_mkdir("/root/tmp")
+    tmpfs_mkdir("/root/etc")
+    sched_exit_hook = _vfs_thread_exit
+    sched_exit_hook_set = 1
+    sched_spawn_hook = _vfs_thread_spawn
+    sched_spawn_hook_set = 1
+    vfs_ready = 1
+
+
+# Give the current thread the console on descriptors 0, 1 and 2.
+def vfs_open_stdio() -> int32:
+    fd: int32 = vfs_open("/dev/console", ORDWR)
+    if fd != 0:
+        return -1
+    vfs_dup2(0, 1)
+    vfs_dup2(0, 2)
+    return 0

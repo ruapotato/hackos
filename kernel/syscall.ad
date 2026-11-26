@@ -1,0 +1,310 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- system calls.
+#
+# Entry: a thread executes `svc #0` through the stub hackos_syscall(nr, a0..a5)
+# (arch/armv7m/switch.S).  The stub is called with the Adder convention, so at
+# the SVC the call number is in r0 (r1 = its high word), a0 in r2:r3, and
+# a1..a5 are 8-byte slots on the caller's stack.  The core pushes r0-r3 with
+# the rest of the exception frame onto that same stack, so the frame holds
+# nr and a0, and a1.. start right above it.  The SVC handler moves the thread
+# to its kernel stack and into privileged thread mode, then calls
+# syscall_dispatch(frame) here; the 64-bit result is written to the frame's
+# r0:r1 slots and returned to the caller by the exception return.
+#
+# Numbers are Hamnix's native ones (arch/x86/kernel/syscall.ad at 1c5d976a)
+# wherever HackOS implements the same call; HackOS-only calls start at 512.
+# docs/syscalls.md has the table and the differences.
+#
+# Pointers from an unprivileged caller are checked against what the MPU lets
+# that caller touch before the kernel uses them.
+
+from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, TF_USER, T_UNUSED
+from kernel.rt import rt_memcpy
+from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
+from drivers.tty.console import console_write
+
+extern def __text_end()
+extern def __vectors_start()
+
+# ---- Hamnix native numbers ----
+SYS_PUTC: uint32 = 0
+SYS_EXIT: uint32 = 1
+SYS_GET_JIFFIES: uint32 = 2
+SYS_GETPID: uint32 = 4
+SYS_OPEN: uint32 = 5
+SYS_READ: uint32 = 6
+SYS_CLOSE: uint32 = 7
+SYS_WRITE: uint32 = 8
+SYS_LSEEK: uint32 = 9
+SYS_OPEN_WRITE: uint32 = 13
+SYS_DUP: uint32 = 16
+SYS_DUP2: uint32 = 17
+SYS_CHDIR: uint32 = 19
+SYS_GETCWD: uint32 = 20
+SYS_UNLINK: uint32 = 21
+SYS_MKDIR: uint32 = 22
+SYS_READ_NB: uint32 = 23
+SYS_YIELD: uint32 = 24
+SYS_CREATE: uint32 = 260
+SYS_STAT_P9: uint32 = 261
+SYS_FSTAT_P9: uint32 = 262
+SYS_REMOVE: uint32 = 263
+SYS_ERRSTR: uint32 = 265
+SYS_MMAP: uint32 = 302
+SYS_MUNMAP: uint32 = 304
+SYS_NANOSLEEP: uint32 = 308
+# ---- HackOS only ----
+SYS_THREAD_SPAWN: uint32 = 512
+SYS_THREAD_JOIN: uint32 = 513
+SYS_RENAME: uint32 = 514
+SYS_GETTID: uint32 = 515
+SYS_SLEEP_MS: uint32 = 516
+
+sys_count: uint64 = 0               # system calls dispatched so far
+sys_bad_ptr: uint64 = 0             # calls refused for a bad user pointer
+
+
+# May the system-call caller access [addr, addr+len)?  A privileged caller
+# may pass anything.  An unprivileged one may read and write the user arena
+# and read the image's text and constants (string literals live there).
+def _uok(addr: uint64, len: uint64, write: uint32) -> uint32:
+    if thr(sched_current)[0].svc_ctrl == 0:
+        return 1
+    end: uint64 = addr + len
+    if end < addr or addr > 0xFFFFFFFF or end > 0x100000000:
+        return 0
+    if addr >= user_arena_start() and end <= user_arena_end():
+        return 1
+    if write == 0 and addr >= cast[uint64](&__vectors_start) and end <= cast[uint64](&__text_end):
+        return 1
+    return 0
+
+
+# A NUL-terminated string of at most 255 bytes, readable by the caller.
+def _ustr(addr: uint64) -> uint32:
+    if thr(sched_current)[0].svc_ctrl == 0:
+        return 1
+    i: uint64 = 0
+    while i < 256:
+        if _uok(addr + i, 1, 0) == 0:
+            return 0
+        if cast[Ptr[uint8]](addr + i)[0] == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _bad() -> int64:
+    sys_bad_ptr = sys_bad_ptr + 1
+    set_current_errstr("bad address")
+    return cast[int64](EFAULT)
+
+
+def _sys_thread_spawn(entry: uint64, arg: uint64, prio: uint64, stack: uint64) -> int64:
+    # the entry point must be code in the image
+    if (entry & 0xFFFFFFFE) < cast[uint64](&__vectors_start) or entry >= cast[uint64](&__text_end):
+        return _bad()
+    me: Ptr[Thread] = current_thread()
+    p: uint32 = cast[uint32](prio)
+    # an unprivileged caller cannot create a thread more urgent than itself
+    if me[0].svc_ctrl != 0 and p < me[0].base_prio:
+        p = me[0].base_prio
+    if stack < 2048 or stack > 0x100000:
+        set_current_errstr("thread_spawn: bad stack size")
+        return cast[int64](EINVAL)
+    t: Ptr[Thread] = thread_create("user", entry, arg, p, cast[uint32](stack), TF_USER)
+    if t == cast[Ptr[Thread]](0):
+        set_current_errstr("thread_spawn: out of threads or memory")
+        return cast[int64](ENOMEM)
+    return cast[int64](t[0].tid)
+
+
+def _sys_errstr(buf: uint64, n: uint64) -> int64:
+    if n == 0:
+        return 0
+    es: Ptr[uint8] = &current_thread()[0].errstr[0]
+    out: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    i: uint64 = 0
+    while i + 1 < n and es[i] != 0:
+        out[i] = es[i]
+        i = i + 1
+    out[i] = 0
+    return cast[int64](i)
+
+
+# {int64 sec, int64 nsec}
+def _sys_nanosleep(req: uint64) -> int64:
+    ts: Ptr[int64] = cast[Ptr[int64]](req)
+    if ts[0] < 0 or ts[1] < 0 or ts[1] >= 1000000000:
+        return cast[int64](EINVAL)
+    ms: uint64 = cast[uint64](ts[0]) * 1000 + (cast[uint64](ts[1]) + 999999) / 1000000
+    thread_sleep(ms)
+    return 0
+
+
+def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64:
+    if nr == SYS_WRITE:
+        if _uok(a1, a2, 0) == 0:
+            return _bad()
+        return vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    if nr == SYS_READ or nr == SYS_READ_NB:
+        if _uok(a1, a2, 1) == 0:
+            return _bad()
+        nb: uint32 = 0
+        if nr == SYS_READ_NB:
+            nb = 1
+        return vfs_read(cast[int32](a0), cast[Ptr[uint8]](a1), a2, nb)
+    if nr == SYS_OPEN:
+        if _ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_open(cast[Ptr[uint8]](a0), OREAD))
+    if nr == SYS_OPEN_WRITE:
+        if _ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_open(cast[Ptr[uint8]](a0), OWRITE | OTRUNC | OCREATE))
+    if nr == SYS_CREATE:
+        if _ustr(a0) == 0:
+            return _bad()
+        if (a2 & cast[uint64](DMDIR)) != 0:
+            return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
+        return cast[int64](vfs_open(cast[Ptr[uint8]](a0), ORDWR | OTRUNC | OCREATE))
+    if nr == SYS_CLOSE:
+        return cast[int64](vfs_close(cast[int32](a0)))
+    if nr == SYS_LSEEK:
+        return vfs_lseek(cast[int32](a0), cast[int64](a1), cast[uint32](a2))
+    if nr == SYS_DUP:
+        return cast[int64](vfs_dup(cast[int32](a0)))
+    if nr == SYS_DUP2:
+        if cast[int32](a1) < 0:
+            return cast[int64](EINVAL)
+        return cast[int64](vfs_dup2(cast[int32](a0), cast[int32](a1)))
+    if nr == SYS_UNLINK or nr == SYS_REMOVE:
+        if _ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_unlink(cast[Ptr[uint8]](a0)))
+    if nr == SYS_MKDIR:
+        if _ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
+    if nr == SYS_RENAME:
+        if _ustr(a0) == 0 or _ustr(a1) == 0:
+            return _bad()
+        return cast[int64](vfs_rename(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1)))
+    if nr == SYS_STAT_P9:
+        if _ustr(a0) == 0 or _uok(a1, a2, 1) == 0:
+            return _bad()
+        return vfs_stat(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1), a2)
+    if nr == SYS_FSTAT_P9:
+        if _uok(a1, a2, 1) == 0:
+            return _bad()
+        return vfs_fstat(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    if nr == SYS_CHDIR:
+        if _ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_chdir(cast[Ptr[uint8]](a0)))
+    if nr == SYS_GETCWD:
+        if _uok(a0, a1, 1) == 0:
+            return _bad()
+        return vfs_getcwd(cast[Ptr[uint8]](a0), a1)
+    if nr == SYS_ERRSTR:
+        if _uok(a0, a1, 1) == 0:
+            return _bad()
+        return _sys_errstr(a0, a1)
+    if nr == SYS_EXIT:
+        thread_exit(cast[int64](a0))
+        return 0
+    if nr == SYS_YIELD:
+        thread_yield()
+        return 0
+    if nr == SYS_GETPID or nr == SYS_GETTID:
+        return cast[int64](current_thread()[0].tid)
+    if nr == SYS_GET_JIFFIES:
+        return cast[int64](sched_now() / 10)        # 100 Hz, as in Hamnix
+    if nr == SYS_SLEEP_MS:
+        thread_sleep(a0)
+        return 0
+    if nr == SYS_NANOSLEEP:
+        if _uok(a0, 16, 0) == 0:
+            return _bad()
+        return _sys_nanosleep(a0)
+    if nr == SYS_PUTC:
+        ch: Array[8, uint8]
+        ch[0] = cast[uint8](a0)
+        console_write(&ch[0], 1)
+        return 0
+    if nr == SYS_THREAD_SPAWN:
+        return _sys_thread_spawn(a0, a1, a2, a3)
+    if nr == SYS_THREAD_JOIN:
+        if a1 != 0 and _uok(a1, 8, 1) == 0:
+            return _bad()
+        return cast[int64](thread_join(cast[uint32](a0), cast[Ptr[int64]](a1)))
+    if nr == SYS_MMAP:
+        # anonymous memory only: (addr ignored, len, prot, flags, fd, off)
+        if a1 == 0 or cast[int32](a4) != -1:
+            set_current_errstr("mmap: only anonymous mappings")
+            return cast[int64](EINVAL)
+        p: uint64 = umalloc_aligned(a1, 4096)
+        if p == 0:
+            set_current_errstr("mmap: out of memory")
+            return cast[int64](ENOMEM)
+        i: uint64 = 0
+        while i < a1:
+            cast[Ptr[uint8]](p + i)[0] = 0
+            i = i + 1
+        return cast[int64](p)
+    if nr == SYS_MUNMAP:
+        if a0 < user_arena_start() or a0 >= user_arena_end() or ufree(a0) != 0:
+            return cast[int64](EINVAL)
+        return 0
+    set_current_errstr("unknown syscall")
+    return cast[int64](ENOSYS)
+
+
+# Number of arguments passed on the caller's stack (a1 and up) per call.
+def _stack_args(nr: uint32) -> uint32:
+    if nr == SYS_WRITE or nr == SYS_READ or nr == SYS_READ_NB or nr == SYS_LSEEK or nr == SYS_CREATE or nr == SYS_STAT_P9 or nr == SYS_FSTAT_P9:
+        return 2
+    if nr == SYS_DUP2 or nr == SYS_GETCWD or nr == SYS_ERRSTR or nr == SYS_RENAME or nr == SYS_THREAD_JOIN or nr == SYS_MUNMAP or nr == SYS_NANOSLEEP:
+        return 1
+    if nr == SYS_THREAD_SPAWN:
+        return 3
+    if nr == SYS_MMAP:
+        return 5
+    return 0
+
+
+# Called by syscall_trampoline in privileged thread mode on the kernel stack.
+# `frame` is the exception frame the SVC pushed on the caller's stack:
+# {r0, r1, r2, r3, r12, lr, pc, xPSR}, followed by the FP state area when the
+# caller had an FP context, and one padding word when xPSR bit 9 is set.
+def syscall_dispatch(frame: uint64):
+    t: Ptr[Thread] = current_thread()
+    f: Ptr[uint32] = cast[Ptr[uint32]](frame)
+    sys_count = sys_count + 1
+    nr: uint32 = f[0]
+    a0: uint64 = cast[uint64](f[2]) | (cast[uint64](f[3]) << 32)
+    args: uint64 = frame + 32
+    if (t[0].svc_exc & 0x10) == 0:
+        args = args + 72
+    if (f[7] & 0x200) != 0:
+        args = args + 4
+    a: Array[5, uint64]
+    i: uint32 = 0
+    while i < 5:
+        a[i] = 0
+        i = i + 1
+    n: uint32 = _stack_args(nr)
+    r: int64 = 0
+    if n != 0 and _uok(args, cast[uint64](n) * 8, 0) == 0:
+        r = _bad()
+    else:
+        sp: Ptr[uint64] = cast[Ptr[uint64]](args)
+        i = 0
+        while i < n:
+            a[i] = sp[i]
+            i = i + 1
+        r = sys_call(nr, a0, a[0], a[1], a[2], a[3], a[4])
+    f[0] = cast[uint32](cast[uint64](r))
+    f[1] = cast[uint32](cast[uint64](r) >> 32)

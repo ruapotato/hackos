@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- faults raised by a thread: report, end the thread, carry on.
+#
+# hackos_fault_entry (arch/armv7m/startup.S) offers every fault taken from
+# thread mode on the process stack to hackos_thread_fault() below.  It runs in
+# handler mode on the main stack, which is intact even when the thread's own
+# stack is not.  The thread is turned into a zombie whose exit code says what
+# happened; whoever joins it reads the code.  Faults in handler mode, inside a
+# critical section, or before the scheduler runs are fatal and go to the
+# report in kernel/fault.ad.
+
+from kernel.cpu import mmio_read32, mmio_write32, cpu_basepri, cpu_set_basepri, cpu_set_psp, cpu_control
+from kernel.print import kputs, kput_hex32, kput_u64, kputc
+from kernel.sched.core import Thread, thr, sched_current, sched_running, thread_kill_current_from_fault, STACK_GUARD
+
+FAULT_STACK_OVERFLOW: uint32 = 1
+FAULT_ACCESS: uint32 = 2
+FAULT_BUS: uint32 = 3
+FAULT_USAGE: uint32 = 4
+
+# What the last thread fault was (read by tests and the monitor).
+trap_count: uint32 = 0
+trap_last_tid: uint32 = 0
+trap_last_kind: uint32 = 0
+trap_last_addr: uint32 = 0
+trap_last_pc: uint32 = 0
+
+
+def _in_guard(addr: uint32, base: uint64) -> uint32:
+    if base == 0:
+        return 0
+    b: uint32 = cast[uint32](base)
+    if addr >= b and addr < b + STACK_GUARD:
+        return 1
+    return 0
+
+
+def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint64:
+    if sched_running == 0 or sched_current == 0 or cpu_basepri() != 0:
+        return 1
+    if kind != 4 and kind != 5 and kind != 6:
+        return 1
+    t: Ptr[Thread] = thr(sched_current)
+    cfsr: uint32 = mmio_read32(0xE000ED28)
+    mmfar: uint32 = mmio_read32(0xE000ED34)
+    bfar: uint32 = mmio_read32(0xE000ED38)
+    psp: uint32 = cast[uint32](frame)
+    unpriv: uint32 = cpu_control() & 1
+    what: uint32 = FAULT_USAGE
+    addr: uint32 = 0
+    addr_valid: uint32 = 0
+    stacking: uint32 = 0
+    if kind == 4:
+        what = FAULT_ACCESS
+        if (cfsr & 0x80) != 0:
+            addr = mmfar
+            addr_valid = 1
+        if (cfsr & 0x30) != 0:          # MSTKERR | MLSPERR: the frame itself faulted
+            stacking = 1
+        # A stack overflow shows up either as an access inside a guard, or as
+        # the exception frame not fitting above the guard.
+        if addr_valid != 0 and (_in_guard(addr, t[0].kstack_base) != 0 or _in_guard(addr, t[0].ustack_base) != 0):
+            what = FAULT_STACK_OVERFLOW
+        elif stacking != 0 and (_in_guard(psp, t[0].kstack_base) != 0 or _in_guard(psp, t[0].ustack_base) != 0 or _in_guard(psp + 104, t[0].kstack_base) != 0 or _in_guard(psp + 104, t[0].ustack_base) != 0):
+            what = FAULT_STACK_OVERFLOW
+            addr = psp
+            addr_valid = 1
+    elif kind == 5:
+        what = FAULT_BUS
+        if (cfsr & 0x8000) != 0:
+            addr = bfar
+            addr_valid = 1
+    pc: uint32 = 0
+    if stacking == 0:
+        pc = cast[Ptr[uint32]](frame)[6]
+    kputs("\n*** HackOS: thread ")
+    kput_u64(cast[uint64](t[0].tid))
+    kputs(" '")
+    kputs(&t[0].name[0])
+    kputs("' ended: ")
+    if what == FAULT_STACK_OVERFLOW:
+        kputs("stack overflow")
+    elif what == FAULT_ACCESS:
+        if unpriv != 0:
+            kputs("unprivileged access violation")
+        else:
+            kputs("access violation")
+    elif what == FAULT_BUS:
+        kputs("bus fault")
+    else:
+        kputs("usage fault")
+    if addr_valid != 0:
+        kputs(" at ")
+        kput_hex32(addr)
+    kputs(", pc ")
+    kput_hex32(pc)
+    kputs(", CFSR ")
+    kput_hex32(cfsr)
+    kputs(" ***\n")
+    trap_count = trap_count + 1
+    trap_last_tid = t[0].tid
+    trap_last_kind = what
+    trap_last_addr = addr
+    trap_last_pc = pc
+    # Clear the sticky status bits and any armed lazy FP save (it may point
+    # into the stack that just overflowed).
+    mmio_write32(0xE000ED28, cfsr)
+    mmio_write32(0xE000EF34, mmio_read32(0xE000EF34) & 0xFFFFFFFE)
+    # The switch that follows saves the dead thread's registers below PSP:
+    # point it at memory that is certainly writable.
+    cpu_set_psp(t[0].kstack_top)
+    code: int64 = 139                   # 128 + SIGSEGV, as a shell would show it
+    if what == FAULT_BUS:
+        code = 135
+    elif what == FAULT_USAGE:
+        code = 132
+    thread_kill_current_from_fault(code, what, addr)
+    return 0
