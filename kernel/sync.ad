@@ -1,0 +1,279 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- synchronisation: mutex, semaphore, condition variable, message
+# queue, and the spinlock names Hamnix code calls.
+#
+# Everything is built on wait queues and critical sections from
+# kernel/sched/core.ad.  Blocking calls are for thread mode only; sem_post,
+# cond_signal/broadcast and a zero-timeout mq_send may be used from interrupt
+# handlers.  Timeouts are in scheduler ticks; WAIT_FOREVER means none.
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.rt import rt_memcpy
+from kernel.sched.core import WaitQueue, Thread, thr, wq_init, wq_wait, wq_wake_one, wq_wake_all, wq_best, wq_wake_thread, sched_set_prio, sched_current, sched_running, sched_in_handler, sched_ticks, WAIT_FOREVER, WAKE_TIMEOUT
+from mm.slab import kmalloc, kfree
+
+SYNC_OK: int32 = 0
+SYNC_TIMEOUT: int32 = -110          # ETIMEDOUT
+SYNC_EPERM: int32 = -1
+SYNC_EDEADLK: int32 = -35
+SYNC_ENOMEM: int32 = -12
+
+
+# ---------------------------------------------------------------- mutex
+# Not recursive.  Priority inheritance, kept simple: while a thread waits, the
+# owner runs at least at the waiter's priority; on unlock the owner drops back
+# to its base priority (even if it still holds another contended mutex -- no
+# per-mutex bookkeeping, no chains through a blocked owner).  The highest-
+# priority waiter is woken; it competes for the mutex again when it runs.
+class Mutex:
+    owner: uint64                   # Ptr[Thread] or 0
+    wq: WaitQueue
+    contended: uint32               # times a locker had to wait
+    pad: uint32
+
+
+def mutex_init(m: Ptr[Mutex]):
+    m[0].owner = 0
+    m[0].contended = 0
+    wq_init(&m[0].wq)
+
+
+def mutex_lock_timeout(m: Ptr[Mutex], timeout: uint64) -> int32:
+    if sched_running == 0 or sched_in_handler() != 0:
+        return SYNC_OK              # single flow of control: nothing to exclude
+    irq: uint32 = cpu_irq_save()
+    me: uint64 = sched_current
+    if m[0].owner == me:
+        cpu_irq_restore(irq)
+        return SYNC_EDEADLK
+    deadline: uint64 = WAIT_FOREVER
+    if timeout != WAIT_FOREVER:
+        deadline = sched_ticks + timeout
+    while m[0].owner != 0:
+        left: uint64 = WAIT_FOREVER
+        if deadline != WAIT_FOREVER:
+            if sched_ticks >= deadline:
+                cpu_irq_restore(irq)
+                return SYNC_TIMEOUT
+            left = deadline - sched_ticks
+        m[0].contended = m[0].contended + 1
+        if thr(me)[0].prio < thr(m[0].owner)[0].prio:
+            sched_set_prio(m[0].owner, thr(me)[0].prio)
+        wq_wait(&m[0].wq, left)
+    m[0].owner = me
+    cpu_irq_restore(irq)
+    return SYNC_OK
+
+
+def mutex_lock(m: Ptr[Mutex]) -> int32:
+    return mutex_lock_timeout(m, WAIT_FOREVER)
+
+
+def mutex_trylock(m: Ptr[Mutex]) -> int32:
+    return mutex_lock_timeout(m, 0)
+
+
+def mutex_unlock(m: Ptr[Mutex]) -> int32:
+    if sched_running == 0 or sched_in_handler() != 0:
+        return SYNC_OK
+    irq: uint32 = cpu_irq_save()
+    me: uint64 = sched_current
+    if m[0].owner != me:
+        cpu_irq_restore(irq)
+        return SYNC_EPERM
+    m[0].owner = 0
+    w: uint64 = wq_best(&m[0].wq)
+    if w != 0:
+        wq_wake_thread(w)
+    if thr(me)[0].prio != thr(me)[0].base_prio:
+        sched_set_prio(me, thr(me)[0].base_prio)
+    cpu_irq_restore(irq)
+    return SYNC_OK
+
+
+# ---------------------------------------------------------------- semaphore
+class Semaphore:
+    count: int32
+    pad: uint32
+    wq: WaitQueue
+
+
+def sem_init(s: Ptr[Semaphore], initial: int32):
+    s[0].count = initial
+    wq_init(&s[0].wq)
+
+
+def sem_wait_timeout(s: Ptr[Semaphore], timeout: uint64) -> int32:
+    irq: uint32 = cpu_irq_save()
+    deadline: uint64 = WAIT_FOREVER
+    if timeout != WAIT_FOREVER:
+        deadline = sched_ticks + timeout
+    while s[0].count <= 0:
+        left: uint64 = WAIT_FOREVER
+        if deadline != WAIT_FOREVER:
+            if sched_ticks >= deadline:
+                cpu_irq_restore(irq)
+                return SYNC_TIMEOUT
+            left = deadline - sched_ticks
+        wq_wait(&s[0].wq, left)
+    s[0].count = s[0].count - 1
+    cpu_irq_restore(irq)
+    return SYNC_OK
+
+
+def sem_wait(s: Ptr[Semaphore]) -> int32:
+    return sem_wait_timeout(s, WAIT_FOREVER)
+
+
+def sem_post(s: Ptr[Semaphore]):
+    irq: uint32 = cpu_irq_save()
+    s[0].count = s[0].count + 1
+    wq_wake_one(&s[0].wq)
+    cpu_irq_restore(irq)
+
+
+# ---------------------------------------------------------------- condition
+class Cond:
+    wq: WaitQueue
+
+
+def cond_init(c: Ptr[Cond]):
+    wq_init(&c[0].wq)
+
+
+# Atomically release `m` and wait; `m` is held again on return.  Returns
+# SYNC_OK or SYNC_TIMEOUT.  As always, re-test the condition in a loop.
+def cond_wait_timeout(c: Ptr[Cond], m: Ptr[Mutex], timeout: uint64) -> int32:
+    irq: uint32 = cpu_irq_save()
+    mutex_unlock(m)
+    r: uint32 = wq_wait(&c[0].wq, timeout)
+    cpu_irq_restore(irq)
+    mutex_lock(m)
+    if r == WAKE_TIMEOUT:
+        return SYNC_TIMEOUT
+    return SYNC_OK
+
+
+def cond_wait(c: Ptr[Cond], m: Ptr[Mutex]) -> int32:
+    return cond_wait_timeout(c, m, WAIT_FOREVER)
+
+
+def cond_signal(c: Ptr[Cond]):
+    wq_wake_one(&c[0].wq)
+
+
+def cond_broadcast(c: Ptr[Cond]):
+    wq_wake_all(&c[0].wq)
+
+
+# ---------------------------------------------------------------- message queue
+# A ring of `cap` fixed-size messages, copied in and out.
+class MsgQueue:
+    buf: uint64
+    msg_size: uint32
+    cap: uint32
+    head: uint32                    # index of the oldest message
+    count: uint32
+    recv_wq: WaitQueue
+    send_wq: WaitQueue
+
+
+def mq_init(q: Ptr[MsgQueue], msg_size: uint32, cap: uint32) -> int32:
+    q[0].buf = kmalloc(cast[uint64](msg_size) * cast[uint64](cap))
+    if q[0].buf == 0:
+        return SYNC_ENOMEM
+    q[0].msg_size = msg_size
+    q[0].cap = cap
+    q[0].head = 0
+    q[0].count = 0
+    wq_init(&q[0].recv_wq)
+    wq_init(&q[0].send_wq)
+    return SYNC_OK
+
+
+def mq_destroy(q: Ptr[MsgQueue]):
+    kfree(q[0].buf)
+    q[0].buf = 0
+
+
+def mq_send(q: Ptr[MsgQueue], msg: uint64, timeout: uint64) -> int32:
+    irq: uint32 = cpu_irq_save()
+    deadline: uint64 = WAIT_FOREVER
+    if timeout != WAIT_FOREVER:
+        deadline = sched_ticks + timeout
+    while q[0].count == q[0].cap:
+        left: uint64 = WAIT_FOREVER
+        if deadline != WAIT_FOREVER:
+            if sched_ticks >= deadline:
+                cpu_irq_restore(irq)
+                return SYNC_TIMEOUT
+            left = deadline - sched_ticks
+        wq_wait(&q[0].send_wq, left)
+    slot: uint32 = (q[0].head + q[0].count) % q[0].cap
+    rt_memcpy(q[0].buf + cast[uint64](slot) * cast[uint64](q[0].msg_size), msg, cast[uint64](q[0].msg_size))
+    q[0].count = q[0].count + 1
+    wq_wake_one(&q[0].recv_wq)
+    cpu_irq_restore(irq)
+    return SYNC_OK
+
+
+def mq_recv(q: Ptr[MsgQueue], out: uint64, timeout: uint64) -> int32:
+    irq: uint32 = cpu_irq_save()
+    deadline: uint64 = WAIT_FOREVER
+    if timeout != WAIT_FOREVER:
+        deadline = sched_ticks + timeout
+    while q[0].count == 0:
+        left: uint64 = WAIT_FOREVER
+        if deadline != WAIT_FOREVER:
+            if sched_ticks >= deadline:
+                cpu_irq_restore(irq)
+                return SYNC_TIMEOUT
+            left = deadline - sched_ticks
+        wq_wait(&q[0].recv_wq, left)
+    rt_memcpy(out, q[0].buf + cast[uint64](q[0].head) * cast[uint64](q[0].msg_size), cast[uint64](q[0].msg_size))
+    q[0].head = (q[0].head + 1) % q[0].cap
+    q[0].count = q[0].count - 1
+    wq_wake_one(&q[0].send_wq)
+    cpu_irq_restore(irq)
+    return SYNC_OK
+
+
+# ---------------------------------------------------------------- Hamnix names
+# Hamnix's spinlock_lock/spinlock_unlock are x86 assembly.  On one core a
+# spinlock is a critical section; the saved interrupt state of the outermost
+# lock is kept here (locks nest, they are released in reverse order).
+spin_depth: uint32 = 0
+spin_saved: uint32 = 0
+
+
+def spinlock_lock(l: Ptr[uint32]):
+    irq: uint32 = cpu_irq_save()
+    if spin_depth == 0:
+        spin_saved = irq
+    spin_depth = spin_depth + 1
+    l[0] = 1
+
+
+def spinlock_unlock(l: Ptr[uint32]):
+    l[0] = 0
+    spin_depth = spin_depth - 1
+    if spin_depth == 0:
+        cpu_irq_restore(spin_saved)
+
+
+# memcpy/memset as Hamnix code calls them: Adder calling convention (64-bit
+# argument slots).  These are NOT the C library functions and must never be
+# given C linkage; see the README on mixing C and Adder.
+def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]:
+    rt_memcpy(cast[uint64](dst), cast[uint64](src), n)
+    return dst
+
+
+def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]:
+    i: uint64 = 0
+    b: uint8 = cast[uint8](val)
+    while i < n:
+        dst[i] = b
+        i = i + 1
+    return dst
