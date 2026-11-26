@@ -573,7 +573,11 @@ def thread_kill_current_from_fault(code: int64, kind: uint32, addr: uint32):
     cpu_irq_restore(irq)
 
 
+# Release a zombie.  Thread context only: a thread that was ended by a fault
+# could not release its own resources, so the exit hook runs here for it.
 def _reap(t: Ptr[Thread]):
+    if t[0].fault_kind != 0 and sched_exit_hook_set != 0:
+        sched_exit_hook(cast[uint64](t))
     _free_stacks(cast[uint64](t))
     t[0].state = T_UNUSED
 
@@ -638,14 +642,27 @@ def current_task_uid() -> uint32:
 
 
 # ---------------------------------------------------------------- idle, start
+# The idle thread must always be runnable, so it does nothing that can block.
 def _idle_main(arg: uint64) -> int64:
+    while 1 == 1:
+        cpu_wfi()
+    return 0
+
+
+# Detached threads are nobody's to join: this thread releases them.  It polls
+# (every REAPER_PERIOD ticks); releasing may block on the file-system lock,
+# which is why this is not the idle thread's job.
+REAPER_PERIOD: uint64 = 20
+
+
+def _reaper_main(arg: uint64) -> int64:
     while 1 == 1:
         i: uint32 = 0
         while i < THREAD_MAX:
             if threads[i].state == T_ZOMBIE and (threads[i].flags & TF_DETACHED) != 0:
                 _reap(&threads[i])
             i = i + 1
-        cpu_wfi()
+        thread_sleep(REAPER_PERIOD)
     return 0
 
 
@@ -660,6 +677,7 @@ def sched_init():
     sched_current = 0
     sched_running = 0
     thread_create("idle", cast[uint64](&_idle_main), 0, SCHED_PRIOS - 1, 2048, 0)
+    thread_create("reaper", cast[uint64](&_reaper_main), 0, SCHED_PRIOS - 2, 8192, 0)
 
 
 # Start scheduling: never returns.  Interrupt priorities: SVCall, SysTick and
