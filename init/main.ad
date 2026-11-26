@@ -1,18 +1,58 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the interactive image: kernel plus the monitor on the console.
+# HackOS -- the system image: kernel, the programs under /bin, and an init
+# thread that keeps Hamnix's shell running on the console.
+#
+# The shell is /bin/hamsh, an unprivileged process like any other.  It does
+# its own echo and line editing, so the console is switched to raw mode.
+# When the shell ends, init starts another one; the system stops only when
+# something asks for it (the `halt` program, system call 518).
 
 from kernel.init import kernel_init
-from kernel.sched.core import thread_create, sched_start
+from kernel.sched.core import thread_create, sched_start, thread_sleep
 from kernel.print import kputs
-from drivers.tty.console import console_rx_enable
-from init.monitor import monitor_main
+from kernel.printk.printk import printk1, printk2
+from kernel.proc import proc_spawn, proc_waitpid
+from drivers.tty.console import console_rx_enable, console_set_mode, CON_RAW
+from fs.hvfs import vfs_open_stdio, vfs_open, vfs_write, vfs_close, vfs_mkdir, OWRITE, OTRUNC, OCREATE
+
+init_argv: Array[2, uint64]
+
+
+def _put_file(path: Ptr[uint8], text: Ptr[uint8]):
+    fd: int32 = vfs_open(path, OWRITE | OTRUNC | OCREATE)
+    if fd < 0:
+        return
+    n: uint64 = 0
+    while text[n] != 0:
+        n = n + 1
+    vfs_write(fd, text, n)
+    vfs_close(fd)
+
+
+def init_main(arg: uint64) -> int64:
+    vfs_open_stdio()
+    # What the shell looks for at start-up: the user table (one user: the
+    # owner, uid 1, as on Hamnix) and a place to keep its history.
+    _put_file("/etc/passwd", "live:x:1:1:owner:/home:/bin/hamsh\n")
+    vfs_mkdir("/home")
+    console_set_mode(CON_RAW)
+    while 1 == 1:
+        init_argv[0] = cast[uint64]("/bin/hamsh")
+        pid: int32 = proc_spawn("/bin/hamsh", 1, &init_argv[0], 4)
+        if pid < 0:
+            printk1("init: cannot start /bin/hamsh (error %d); trying again in 5 s\n", cast[uint64](cast[int64](pid)))
+            thread_sleep(5000)
+            continue
+        code: int64 = proc_waitpid(pid, 0)
+        printk2("init: the shell (process %d) ended with status %d; starting another\n", cast[uint64](pid), cast[uint64](code))
+    return 0
 
 
 def main() -> int32:
-    kputs("\nHackOS 0.2 (milestone 2) -- kernel core on ARM Cortex-M7, QEMU mps2-an500\n")
+    kputs("\nHackOS 0.3 (milestone 3) -- ARM Cortex-M7, QEMU mps2-an500\n")
     kernel_init()
     console_rx_enable()
-    thread_create("monitor", cast[uint64](&monitor_main), 0, 2, 16384, 0)
+    thread_create("init", cast[uint64](&init_main), 0, 2, 16384, 0)
     sched_start()
     return 0

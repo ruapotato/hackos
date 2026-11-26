@@ -1,0 +1,264 @@
+HackOS patch to Hamnix user/hamsh.ad (commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9).
+
+Reason: the shell keeps its whole state in static arenas sized for a desktop:
+4.16 MB of zero-initialised data, which on HackOS is the size of the block
+every instance of the shell occupies (there is no demand paging: bss is real
+memory from the first instruction).  This patch divides the four big arenas
+and their dependent tables, and nothing else:
+
+    string arena              1 MiB   -> 128 KiB   (STR_ARENA_MAX)
+    AST nodes                 16384   -> 4096      (NODE_MAX, nd_* arrays)
+    AST child-list slots      32768   -> 8192      (nd_kid*, written as a literal)
+    value cells               16384   -> 4096      (VAL_MAX, val_* arrays)
+    list/dict element slots   16384   -> 4096      (LISTELEM_MAX, val_elem)
+    the collector's tables follow their arenas (gc_fwd_*, gc_stk_*, gc_owner)
+
+The shell's own collector (gc_collect) compacts the arenas when they fill, and
+its thresholds are written relative to these sizes, so they move with them.
+Every changed line is a size literal or a message that quotes one; no logic
+is changed.  Result: bss 4,163,664 -> 1,525,832 bytes.
+
+Not changed, and why hamsh needs no patch for them:
+  * fork: the kernel implements rfork(RFPROC) as vfork (kernel/proc.ad).
+  * the GUI built-ins: lib/hamui.ad, lib/hamsdl*.ad are HackOS stand-ins.
+  * the system calls: user/rt/rt.ad supplies Hamnix's names.
+
+`make test` reverse-applies this patch to user/hamnix/hamsh.ad (minus its
+3-line header) and requires the sha256 of the result to be the one recorded
+for the original in fs/HAMNIX_ORIGIN.
+
+--- a/user/hamsh.ad
++++ b/user/hamsh.ad
+@@ -230,7 +230,7 @@
+ # generously now, and lex_line raises a clean "token-limit exceeded"
+ # instead of truncating (see _emit_tok / lex_error).
+ TOK_MAX:       uint64 = 4096     # tokens per logical input
+-NODE_MAX:      uint64 = 16384    # AST node arena (session-lifetime)
++NODE_MAX:      uint64 = 4096    # AST node arena (session-lifetime)
+ # STR_ARENA_MAX — interned string bytes, SESSION-LIFETIME.
+ #
+ # THE 2026-07-25 STRESS-SOAK FATALITY LIVED HERE. Every command word the
+@@ -250,14 +250,14 @@
+ # the overflow is now LOUD (see str_intern_n), and spawn_resolved refuses
+ # an empty command outright — so the class is diagnosable rather than
+ # silent when a long enough session eventually reaches it.
+-STR_ARENA_MAX: uint64 = 1048576  # interned string bytes (session)
+-VAL_MAX:       uint64 = 16384    # value cells (session-lifetime)
++STR_ARENA_MAX: uint64 = 131072  # interned string bytes (session)
++VAL_MAX:       uint64 = 4096    # value cells (session-lifetime)
+ SCOPE_MAX:     uint64 = 1024     # variable bindings (one flat table)
+ # ARGV_MAX — the shell's ARG_MAX. See the long note at _argv_push_cstr: this
+ # is NOT a "pick a number" cap, it is sized to the kernel's execve argument
+ # budget (arch/x86/kernel/syscall.ad MAX_ARGV) and exhaustion is LOUD.
+ ARGV_MAX:      uint64 = 2048     # argv slots for an external command
+-LISTELEM_MAX:  uint64 = 16384    # list/dict element slots (shared pool)
++LISTELEM_MAX:  uint64 = 4096    # list/dict element slots (shared pool)
+ 
+ 
+ # ====================================================================
+@@ -267,7 +267,7 @@
+ # A "string ref" is the byte offset of the first char. Offset 0 is the
+ # empty string (a single NUL planted at init).
+ 
+-str_arena:  Array[1048576, uint8]
++str_arena:  Array[131072, uint8]
+ str_cursor: uint64 = 1            # 0 reserved for ""
+ 
+ 
+@@ -289,7 +289,7 @@
+     # lexer interns before the evaluator exists; rt_raise only sets a
+     # latch + writes stderr, so it is safe from anywhere.)
+     if str_cursor + n + 1 >= STR_ARENA_MAX:
+-        rt_raise("string arena exhausted (STR_ARENA_MAX=1048576 live bytes)")
++        rt_raise("string arena exhausted (STR_ARENA_MAX=131072 live bytes)")
+         return 0
+     off: uint64 = str_cursor
+     i: uint64 = 0
+@@ -1467,18 +1467,18 @@
+ WITH_MOUNT:  int64 = 2
+ WITH_ENTER:  int64 = 3
+ 
+-nd_kind: Array[16384, int32]
+-nd_a:    Array[16384, int32]
+-nd_b:    Array[16384, int32]
+-nd_c:    Array[16384, int32]
+-nd_i:    Array[16384, int64]
++nd_kind: Array[4096, int32]
++nd_a:    Array[4096, int32]
++nd_b:    Array[4096, int32]
++nd_c:    Array[4096, int32]
++nd_i:    Array[4096, int64]
+ # nd_str / nd_ks / nd_ke / nd_kn are indexed by node id, so they MUST
+ # be sized to NODE_MAX (16384) — a 512-slot array would let nd_new
+ # write past the end the moment the session creates its 513th node.
+-nd_str:  Array[16384, uint64]
+-nd_ks:   Array[16384, int32]   # head slot of the kid linked-list (0 = empty)
+-nd_ke:   Array[16384, int32]   # tail slot of the kid linked-list (O(1) append)
+-nd_kn:   Array[16384, uint64]  # kid count
++nd_str:  Array[4096, uint64]
++nd_ks:   Array[4096, int32]   # head slot of the kid linked-list (0 = empty)
++nd_ke:   Array[4096, int32]   # tail slot of the kid linked-list (O(1) append)
++nd_kn:   Array[4096, uint64]  # kid count
+ nd_count: uint64 = 1          # node 0 reserved as null
+ 
+ # Kid storage is a LINKED LIST, not a contiguous run. The previous
+@@ -1488,8 +1488,8 @@
+ # the NEXT statement pushes that statement's OWN word-kids into the
+ # pool in between, scattering the block's kid run. A per-slot `next`
+ # pointer makes append correct regardless of interleaving.
+-nd_kid:      Array[32768, int32]   # the kid node id at this slot
+-nd_kid_next: Array[32768, int32]   # next slot in the owner's list (0 = end)
++nd_kid:      Array[8192, int32]   # the kid node id at this slot
++nd_kid_next: Array[8192, int32]   # next slot in the owner's list (0 = end)
+ nd_kid_cursor: uint64 = 1          # slot 0 reserved as the list terminator
+ 
+ # Parser cursor + error.
+@@ -1535,7 +1535,7 @@
+         # — gc_collect already ran at the top of this line. The old
+         # message ("node arena full") was the sole symptom of the
+         # 83-minute desktop death, so name the limit and the cause.
+-        ps_set_err("node arena full: live ASTs exceed NODE_MAX=16384")
++        ps_set_err("node arena full: live ASTs exceed NODE_MAX=4096")
+         return 0
+     n: uint64 = nd_count
+     nd_count = nd_count + 1
+@@ -1558,8 +1558,8 @@
+     # scattered a block's statements when each statement's own kids
+     # got pushed between two block-level pushes).
+     nu: uint64 = cast[uint64](node)
+-    if nd_kid_cursor >= 32768:
+-        ps_set_err("AST kid pool full: live ASTs exceed 32768 slots")
++    if nd_kid_cursor >= 8192:
++        ps_set_err("AST kid pool full: live ASTs exceed 8192 slots")
+         return
+     slot: uint64 = nd_kid_cursor
+     nd_kid_cursor = nd_kid_cursor + 1
+@@ -3669,24 +3669,24 @@
+                           # `|`/`&`/`-` are union/intersection/difference and
+                           # `x in s` / len(s) / `for x in s` all work.
+ 
+-val_type:  Array[16384, int32]
+-val_pay:   Array[16384, int64]    # int / bool / str ref / pid / nsid
++val_type:  Array[4096, int32]
++val_pay:   Array[4096, int64]    # int / bool / str ref / pid / nsid
+ # §Float: a SECOND, float-typed payload column, indexed by cell id like
+ # val_pay. VT_FLOAT stores its IEEE-754 double here (val_pay unused).
+ # A parallel column — rather than bit-punning val_pay — keeps float
+ # handling exact and sidesteps any int<->float reinterpret-cast idiom.
+-val_f:     Array[16384, float64]
++val_f:     Array[4096, float64]
+ # val_aux is a SECOND payload word per cell. VT_MOUNT uses it for the
+ # bound-path str ref (val_pay holds the namespace-identity tag, §13).
+ # val_es / val_ec / val_aux are all indexed by cell id, so they MUST
+ # be VAL_MAX-sized — a 1024-slot array let v_new write past the end
+ # the moment the session created its 1025th value cell.
+-val_aux:   Array[16384, int64]
+-val_es:    Array[16384, uint64]  # elem_start (list/dict)
+-val_ec:    Array[16384, uint64]  # elem_count
++val_aux:   Array[4096, int64]
++val_es:    Array[4096, uint64]  # elem_start (list/dict)
++val_ec:    Array[4096, uint64]  # elem_count
+ val_count: uint64 = 1            # cell 0 reserved = nil
+ 
+-val_elem:  Array[16384, int32]    # value-cell indices
++val_elem:  Array[4096, int32]    # value-cell indices
+ val_elem_cursor: uint64 = 0
+ 
+ # §17 (#110): a deferred collection stack for building list/dict values
+@@ -3736,7 +3736,7 @@
+         # means one STATEMENT allocated 16384 live cells, not that a long
+         # session leaked them.)
+         return rt_raise(
+-            "value arena exhausted (VAL_MAX=16384 live cells) — split the loop")
++            "value arena exhausted (VAL_MAX=4096 live cells) — split the loop")
+     n: uint64 = val_count
+     val_count = val_count + 1
+     val_type[n] = t
+@@ -4017,7 +4017,7 @@
+ 
+ def v_list_push(listv: int32, elem: int32):
+     if val_elem_cursor >= LISTELEM_MAX:
+-        rt_raise("list/dict element pool exhausted (LISTELEM_MAX=16384 slots)")
++        rt_raise("list/dict element pool exhausted (LISTELEM_MAX=4096 slots)")
+         return
+     val_elem[val_elem_cursor] = elem
+     val_elem_cursor = val_elem_cursor + 1
+@@ -12030,7 +12030,7 @@
+         # (observed: a malformed value pegged a core re-executing garbage
+         # statements — the VT login shells' idle hang). Stop rather than
+         # iterate a corrupt/huge count off into uninitialised kid slots.
+-        if i >= 32768:
++        if i >= 8192:
+             break
+         st: int32 = nd_kid_at(node, i)
+         ex: int32 = exec_statement(st)
+@@ -15183,18 +15183,18 @@
+ 
+ GC_MARKED: int32 = -1
+ 
+-gc_fwd_nd:   Array[16384, int32]    # old node id  -> new node id
+-gc_fwd_kd:   Array[32768, int32]    # old kid slot -> new kid slot
+-gc_fwd_vl:   Array[16384, int32]    # old cell id  -> new cell id
+-gc_stk_nd:   Array[16384, int32]
++gc_fwd_nd:   Array[4096, int32]    # old node id  -> new node id
++gc_fwd_kd:   Array[8192, int32]    # old kid slot -> new kid slot
++gc_fwd_vl:   Array[4096, int32]    # old cell id  -> new cell id
++gc_stk_nd:   Array[4096, int32]
+ gc_stk_nd_n: uint64 = 0
+-gc_stk_vl:   Array[16384, int32]
++gc_stk_vl:   Array[4096, int32]
+ gc_stk_vl_n: uint64 = 0
+ # Element-pool sweep helper: elem-pool start slot -> owning cell id. Every
+ # live span is owned by exactly ONE cell (val_es is only ever assigned a
+ # fresh cursor or a relocation target — never copied between cells), so the
+ # spans partition the pool and an ascending sweep compacts them in place.
+-gc_owner:    Array[16384, int32]
++gc_owner:    Array[4096, int32]
+ # Strings are variable-length, so compaction stages them out and blits back.
+ # A session whose LIVE strings exceed the stage keeps its arena uncompacted
+ # (nodes/values still shrink) and str_intern_n's loud overflow still applies.
+@@ -15257,7 +15257,7 @@
+     if s <= 0:
+         return 0
+     u: uint64 = cast[uint64](s)
+-    if u >= 32768:
++    if u >= 8192:
+         return 0
+     return gc_fwd_kd[u]
+ 
+@@ -15342,7 +15342,7 @@
+         slot: int32 = nd_ks[u]
+         while slot != 0:
+             su: uint64 = cast[uint64](slot)
+-            if su >= 32768:
++            if su >= 8192:
+                 break
+             if gc_fwd_kd[su] != 0:
+                 break                      # already walked (or a cycle)
+@@ -15436,7 +15436,7 @@
+         gc_fwd_nd[i] = 0
+         i = i + 1
+     k: uint64 = 0
+-    while k < 32768:
++    while k < 8192:
+         gc_fwd_kd[k] = 0
+         k = k + 1
+     v: uint64 = 0
+@@ -15610,7 +15610,7 @@
+     write_cstr1(render_int(cast[int64](NODE_MAX)))
+     write_cstr1(" kids=")
+     write_cstr1(render_int(cast[int64](nd_kid_cursor)))
+-    write_cstr1("/32768 vals=")
++    write_cstr1("/8192 vals=")
+     write_cstr1(render_int(cast[int64](val_count)))
+     write_cstr1("/")
+     write_cstr1(render_int(cast[int64](VAL_MAX)))
+@@ -15651,7 +15651,7 @@
+     if nd_count < NODE_MAX - 1024 and val_count < VAL_MAX - 1024 and \
+             str_cursor < STR_ARENA_MAX - 4096 and \
+             val_elem_cursor < LISTELEM_MAX - 1024 and \
+-            nd_kid_cursor < 32768 - 2048:
++            nd_kid_cursor < 8192 - 2048:
+         return
+     gc_collect()
+ 

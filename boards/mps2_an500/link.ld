@@ -22,10 +22,10 @@
  *                    read-only data follow from 0x1000 (VTOR is set there).
  *   RAM  0x20000000  kernel .data/.bss, handler (MSP) stack, fault stack.
  *   XRAM 0x60000000  large kernel tables (.bss of the file system), then the
- *                    kernel heap up to __prog_start (6 MB in all);
- *                    then the program arena (6 MB): one block per process,
+ *                    kernel heap up to __prog_start (4 MB in all);
+ *                    then the program arena (11 MB): one block per process,
  *                    each opened to its own process only by an MPU region;
- *                    the last 4 MB are the shared arena of the unprivileged
+ *                    the last 1 MB is the shared arena of the unprivileged
  *                    threads that are compiled into the kernel image (tests):
  *                    their stacks and mmap memory.  __user_start must be a
  *                    multiple of the shared arena's size.
@@ -43,8 +43,8 @@ MEMORY
 }
 
 __stack_size = 0x4000;          /* handler-mode (MSP) stack */
-__user_size  = 0x400000;        /* shared user arena: 4 MB, MPU region aligned */
-__prog_size  = 0x600000;        /* program arena: 6 MB */
+__user_size  = 0x100000;        /* shared user arena: 1 MB, MPU region aligned */
+__prog_size  = 0xB00000;        /* program arena: 11 MB */
 __null_guard_size = 0x1000;
 
 SECTIONS

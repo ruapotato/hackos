@@ -1,0 +1,378 @@
+# HackOS: copied from Hamnix user/cp.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
+# see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
+# user/cp.ad
+#
+# Hamnix `cp`: single-file copy with optional `-r` for recursive
+# directory copies. File size is unbounded: copy_file streams the
+# source through a fixed BUF-byte buffer with multiple read/write
+# pairs, so files of arbitrary length copy correctly. (BUF is just
+# the per-syscall transfer size; the kernel's vfs_open_write path
+# grows the destination's extent leaf as the write spills past each
+# block.)
+#
+# Usage:
+#   cp SRC DST              # copy one file
+#   cp -r SRC DST           # depth-first copy SRC tree into DST
+#
+# DST semantics for `-r`:
+#   * If DST exists as a directory, SRC's basename is appended inside
+#     it: `cp -r /etc /tmp/foo` (where /tmp/foo is a dir) leaves the
+#     result at /tmp/foo/etc/...
+#   * Otherwise DST itself becomes the new root: `cp -r /etc
+#     /tmp/etc-backup` (where /tmp/etc-backup does NOT exist) leaves
+#     the result at /tmp/etc-backup/...
+# This matches `cp -r` from coreutils for the common cases.
+#
+# What we DON'T support: mode/perms/owner preservation, symlinks,
+# hardlink dedup, `cp -a` archive mode. The win condition for
+# small-commands #5 is "tree appears at the destination."
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+from lib.p9 import p9_listdir, p9_chan_dir_mode
+
+
+BUF: uint64 = 4096
+MAX_DEPTH: int32 = 8
+LIST_CAP: uint64 = 1024
+PATH_CAP: uint64 = 256
+
+# Per-syscall transfer buffer. 4 KiB is one ext4 block on the kernel-
+# mkfs disk image, so each pump is one block-aligned chunk — the
+# write path appends one extent per filled block.
+data: Array[4096, uint8]
+
+# Per-level listdir scratch: each recursion level gets its own slice
+# of `levels` so the parent walk's cursor isn't clobbered when a
+# child recurses. Mirrors user/find.ad's depth scratch.
+levels: Array[8192, uint8]
+
+# Path scratch for the source-side walker. The recursive walker
+# appends/prunes "/<entry>" in place, exactly like find.ad does on
+# its `path` buffer.
+src_path: Array[256, uint8]
+dst_path: Array[256, uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+# Append `seg` (no NUL — `seg_len` bytes) onto `path` at `path_len`,
+# inserting a '/' separator unless path is bare "/" or path_len is 0.
+# Returns the new length, or 0 if the result wouldn't fit (caller
+# treats 0 as "skip"). NUL-terminates.
+def path_append(path: Ptr[uint8], path_len: uint64,
+                seg: Ptr[uint8], seg_len: uint64) -> uint64:
+    need_slash: int32 = 1
+    if path_len == 0:
+        need_slash = 0
+    elif path_len == 1 and path[0] == 47:
+        need_slash = 0
+    elif path[path_len - 1] == 47:
+        # Path already ends in '/' (e.g. dest given as "dir/") — don't
+        # emit a second separator.
+        need_slash = 0
+    extra: uint64 = seg_len
+    if need_slash != 0:
+        extra = extra + 1
+    if path_len + extra + 1 > PATH_CAP:
+        return 0
+    p: uint64 = path_len
+    if need_slash != 0:
+        path[p] = 47
+        p = p + 1
+    k: uint64 = 0
+    while k < seg_len:
+        path[p + k] = seg[k]
+        k = k + 1
+    path[p + seg_len] = 0
+    return p + seg_len
+
+
+# Copy a single file SRC -> DST by pumping through a fixed BUF-byte
+# buffer until the source EOFs. File size is unbounded — each
+# iteration reads up to BUF bytes from `in_fd` and writes them to
+# `out_fd`, growing the destination's extent leaf as needed (the
+# kernel write path handles the block-by-block allocation). Returns
+# 0 on success, -1 on open/short-write failure.
+def copy_file(src: Ptr[char], dst: Ptr[char]) -> int32:
+    in_fd: int32 = sys_open(src)
+    if in_fd < 0:
+        write_str(2, "cp: cannot open ")
+        write_str(2, cast[Ptr[uint8]](src))
+        write_str(2, "\n")
+        return -1
+    out_fd: int32 = sys_open_write(dst)
+    if out_fd < 0:
+        sys_close(in_fd)
+        write_str(2, "cp: cannot open ")
+        write_str(2, cast[Ptr[uint8]](dst))
+        write_str(2, "\n")
+        return -1
+    while True:
+        n: int64 = sys_read(in_fd, &data[0], BUF)
+        if n <= 0:
+            break
+        # Drain `n` bytes into the destination. The kernel write
+        # path may return a short count if it hits the depth-0
+        # extent-leaf ceiling; treat that as a hard stop so the
+        # caller can see something went wrong (otherwise we'd loop
+        # forever trying to flush bytes the FS can't store).
+        nu:    uint64 = cast[uint64](n)
+        wrote: uint64 = 0
+        while wrote < nu:
+            wr: int64 = sys_write(out_fd,
+                                  cast[Ptr[uint8]](
+                                      cast[uint64](&data[0]) + wrote),
+                                  nu - wrote)
+            if wr <= 0:
+                sys_close(in_fd)
+                sys_close(out_fd)
+                write_str(2, "cp: short write to ")
+                write_str(2, cast[Ptr[uint8]](dst))
+                write_str(2, "\n")
+                return -1
+            wrote = wrote + cast[uint64](wr)
+    sys_close(in_fd)
+    sys_close(out_fd)
+    return 0
+
+
+# Probe: is `path` a directory?
+#
+# NOTE: p9_listdir succeeds on a REGULAR file too — sys_open+sys_read on
+# a file returns its CONTENTS, so a content-bearing file would be
+# misclassified as a directory (the file bytes get read as a NAME\n
+# listing) and `cp` would treat an existing regular-file destination as
+# a dir and copy INTO it (dst/<basename src>), corrupting the target
+# path. Instead ask the kernel to flip the opened fd into Dir-record
+# mode: namec_chan_set_p9_dir_mode only accepts DEV_DIR_FILE pool chans
+# (real directories) and returns -1 for any other backing (regular
+# files), so a 0 return is a reliable "this is a directory". Mirrors
+# user/tar.ad's fixed path_is_dir (commit 0371b1fa).
+def path_is_dir(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    r: int32 = p9_chan_dir_mode(fd, 1, path)
+    sys_close(fd)
+    if r == 0:
+        return 1
+    return 0
+
+
+# Depth-first walker. `src_path` and `dst_path` are pre-loaded by
+# the caller (initial mkdir already done). Walks one level of
+# src_path's directory listing and recurses. Returns 0 on success,
+# -1 on any unrecoverable error.
+def walk(src_len: uint64, dst_len: uint64, depth: int32) -> int32:
+    if depth >= MAX_DEPTH:
+        write_str(2, "cp: max recursion depth reached, skipping ")
+        write_str(2, &src_path[0])
+        write_str(2, "\n")
+        return 0
+    lbuf: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&levels[0]) + cast[uint64](depth) * LIST_CAP)
+    n: int64 = p9_listdir(cast[Ptr[char]](&src_path[0]),
+                          lbuf, LIST_CAP)
+    if n < 0:
+        # Source isn't readable as a directory anymore — odd, but
+        # treat as "nothing to copy" rather than a hard fail; the
+        # initial mkdir already happened.
+        return 0
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        j: uint64 = i
+        while j < nu and lbuf[j] != 10:
+            j = j + 1
+        ent_len: uint64 = j - i
+        skip: int32 = 0
+        if ent_len == 0:
+            skip = 1
+        if ent_len == 1 and lbuf[i] == 46:
+            skip = 1                                # "."
+        if ent_len == 2 and lbuf[i] == 46 and lbuf[i + 1] == 46:
+            skip = 1                                # ".."
+        if skip == 0:
+            new_src_len: uint64 = path_append(
+                &src_path[0], src_len,
+                cast[Ptr[uint8]](
+                    cast[uint64](lbuf) + i),
+                ent_len)
+            new_dst_len: uint64 = path_append(
+                &dst_path[0], dst_len,
+                cast[Ptr[uint8]](
+                    cast[uint64](lbuf) + i),
+                ent_len)
+            if new_src_len != 0 and new_dst_len != 0:
+                # Probe: dir-or-file dispatch.
+                if path_is_dir(
+                        cast[Ptr[char]](&src_path[0])) != 0:
+                    # Create the matching dir at the destination.
+                    rc: int32 = sys_mkdir(
+                        cast[Ptr[char]](&dst_path[0]))
+                    # -17 (EEXIST) is benign — the dir already
+                    # existed (e.g. user re-ran cp -r); other
+                    # negatives mean we can't recurse there.
+                    if rc == 0 or rc == -17:
+                        walk(new_src_len, new_dst_len, depth + 1)
+                    else:
+                        write_str(2, "cp: cannot mkdir ")
+                        write_str(2, &dst_path[0])
+                        write_str(2, "\n")
+                else:
+                    copy_file(
+                        cast[Ptr[char]](&src_path[0]),
+                        cast[Ptr[char]](&dst_path[0]))
+            # Prune the appended segment back off before next sibling.
+            src_path[src_len] = 0
+            dst_path[dst_len] = 0
+        i = j + 1
+    return 0
+
+
+# Find the basename of `s` (everything after the last '/'). Returns
+# a pointer into s and writes the byte length through out_len. For
+# "/etc" returns "etc" + 3; for "/" returns "" + 0.
+def basename(s: Ptr[uint8], out_len: Ptr[uint64]) -> Ptr[uint8]:
+    n: uint64 = strlen_u8(s)
+    # Strip trailing slashes so "/etc/" basenames to "etc".
+    while n > 1 and s[n - 1] == 47:
+        n = n - 1
+    last_slash: uint64 = 0
+    has_slash: int32 = 0
+    i: uint64 = 0
+    while i < n:
+        if s[i] == 47:
+            last_slash = i
+            has_slash = 1
+        i = i + 1
+    if has_slash == 0:
+        out_len[0] = n
+        return s
+    out_len[0] = n - (last_slash + 1)
+    return cast[Ptr[uint8]](cast[uint64](s) + last_slash + 1)
+
+
+# Initialize `dst_path` with the resolved destination root for a
+# recursive copy. If `dst` doesn't exist, dst_path = dst. If `dst`
+# exists as a directory, append SRC's basename to it. Returns the
+# new dst_path length (NUL-terminated), or 0 on overflow.
+def init_dst_root(src: Ptr[char], dst: Ptr[char]) -> uint64:
+    dlen: uint64 = strlen_u8(cast[Ptr[uint8]](dst))
+    if dlen >= PATH_CAP:
+        return 0
+    i: uint64 = 0
+    while i < dlen:
+        dst_path[i] = cast[Ptr[uint8]](dst)[i]
+        i = i + 1
+    # Strip a trailing '/' (except bare "/") so the directory probe's
+    # sys_open() doesn't choke on the trailing separator (`cp f dir/`)
+    # and so the basename append composes "dir/base", not "dir//base".
+    while dlen > 1 and dst_path[dlen - 1] == 47:
+        dlen = dlen - 1
+    dst_path[dlen] = 0
+    if path_is_dir(cast[Ptr[char]](&dst_path[0])) == 0:
+        return dlen
+    # DST already exists as a dir — append SRC's basename.
+    blen: uint64 = 0
+    bp: Ptr[uint8] = basename(cast[Ptr[uint8]](src), &blen)
+    if blen == 0:
+        return dlen
+    return path_append(&dst_path[0], dlen, bp, blen)
+
+
+# Initialize `src_path` with `src`. Returns length (NUL-terminated)
+# or 0 on overflow.
+def init_src_root(src: Ptr[char]) -> uint64:
+    n: uint64 = strlen_u8(cast[Ptr[uint8]](src))
+    if n == 0 or n >= PATH_CAP:
+        return 0
+    # Strip a trailing '/' (except bare "/") so the walker's
+    # "<src_path>/<entry>" composition is well-defined.
+    while n > 1 and cast[Ptr[uint8]](src)[n - 1] == 47:
+        n = n - 1
+    i: uint64 = 0
+    while i < n:
+        src_path[i] = cast[Ptr[uint8]](src)[i]
+        i = i + 1
+    src_path[n] = 0
+    return n
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 3:
+        write_str(2, "cp: usage: cp [-r] SRC DST\n")
+        return 1
+    # Parse `-r` (first arg). No other flags supported.
+    recursive: int32 = 0
+    src_idx: int32 = 1
+    dst_idx: int32 = 2
+    arg1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    if arg1[0] == 45 and arg1[1] == 114 and arg1[2] == 0:       # "-r"
+        if argc < 4:
+            write_str(2, "cp: usage: cp [-r] SRC DST\n")
+            return 1
+        recursive = 1
+        src_idx = 2
+        dst_idx = 3
+    src: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](src_idx)])
+    dst: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](dst_idx)])
+
+    if recursive == 0:
+        # Single-file mode. If DST is an existing directory (tested
+        # reliably via p9_chan_dir_mode — a p9_listdir probe also
+        # succeeds on a regular file and would misroute the copy), land
+        # the copy INSIDE it as DST/<basename SRC>; otherwise copy to
+        # DST verbatim (creating or overwriting a plain file).
+        d2: uint64 = init_dst_root(src, dst)
+        if d2 == 0:
+            write_str(2, "cp: dst path too long\n")
+            return 1
+        if copy_file(src, cast[Ptr[char]](&dst_path[0])) != 0:
+            return 1
+        return 0
+
+    # `-r` mode. If SRC is not a dir, fall through to single-file copy
+    # for parity with `cp -r FILE DST`.
+    if path_is_dir(src) == 0:
+        if copy_file(src, dst) != 0:
+            return 1
+        return 0
+
+    # Set up the source / destination roots.
+    src_len: uint64 = init_src_root(src)
+    if src_len == 0:
+        write_str(2, "cp: src path too long\n")
+        return 1
+    dst_len: uint64 = init_dst_root(src, dst)
+    if dst_len == 0:
+        write_str(2, "cp: dst path too long\n")
+        return 1
+    # mkdir the destination root. -17 (EEXIST) is benign here — the
+    # user explicitly named an existing dir, in which case
+    # init_dst_root already appended SRC's basename to it; if THAT
+    # collides, treat it as a merge (existing tree retained, our
+    # entries land alongside).
+    rc: int32 = sys_mkdir(cast[Ptr[char]](&dst_path[0]))
+    if rc != 0 and rc != -17:
+        write_str(2, "cp: cannot mkdir ")
+        write_str(2, &dst_path[0])
+        write_str(2, "\n")
+        return 1
+    walk(src_len, dst_len, 0)
+    return 0

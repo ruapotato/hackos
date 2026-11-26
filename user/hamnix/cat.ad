@@ -1,0 +1,87 @@
+# HackOS: copied from Hamnix user/cat.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
+# see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
+# user/cat.ad
+#
+# Hamnix `cat`: opens each path in argv[1..] and streams it to
+# stdout. Mirrors coreutils' `cat` at minimum scope — no flags, no
+# stdin-when-no-args path, no error-recovery beyond skipping a path
+# that fails to open. Designed to verify tmpfs reads end-to-end
+# alongside echo + hamsh's `>` redirect (M16.37).
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+# TODO net-item closure: surface the kernel's per-backend errstr
+# ("ext4: no such file", "tmpfs: open: path is a directory", ...) on
+# `cat: cannot open` instead of just naming the path.
+from lib.perror import perror
+
+
+CHUNK: uint64 = 128
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def cat_one(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        write_str(2, "cat: cannot open ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, ": ")
+        # perror reads SYS_ERRSTR and emits "<msg>: <errstr>\n". We
+        # already wrote the "cat: cannot open <path>: " prefix above;
+        # pass NULL so perror only appends "<errstr>\n", keeping the
+        # path on the same line.
+        perror(cast[Ptr[uint8]](0))
+        return -1
+    buf: Array[128, uint8]
+    while True:
+        n: int64 = sys_read(fd, &buf[0], CHUNK)
+        if n <= 0:
+            break
+        sys_write(1, &buf[0], cast[uint64](n))
+    sys_close(fd)
+    return 0
+
+
+def drain_stdin():
+    # Stream fd 0 until EOF. When fd 0 is a pipe (the `|` case in
+    # hamsh) reads block via the kernel's yield loop and return 0
+    # only once every writer has closed.
+    buf: Array[128, uint8]
+    while True:
+        n: int64 = sys_read(0, &buf[0], CHUNK)
+        if n <= 0:
+            break
+        sys_write(1, &buf[0], cast[uint64](n))
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        # No file args → stream stdin to stdout (Linux behavior;
+        # what makes `... | /cat` work as the right-hand side of a
+        # shell pipeline).
+        drain_stdin()
+        return 0
+    # Exit nonzero if ANY path fails to open, matching coreutils `cat`.
+    # Scripts (e.g. /etc/rc.boot's try/except marker probe) rely on this
+    # exit status to test file existence, so a failed open MUST NOT exit 0.
+    rc: int32 = 0
+    i: int32 = 1
+    while i < argc:
+        if cat_one(cast[Ptr[char]](argv[cast[uint64](i)])) != 0:
+            rc = 1
+        i = i + 1
+    return rc

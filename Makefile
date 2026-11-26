@@ -51,9 +51,10 @@ SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.
 #   user/hamnix/NAME.ad   copied from Hamnix (fs/HAMNIX_ORIGIN)
 # Per program: STACK_NAME (bytes of stack, default 8192) and HEAP_NAME
 # (bytes of heap for sys_mmap, default 0).
-PROGS_OWN    := hello ptest crel
+PROGS_OWN    := hello ptest crel halt
 HEAP_ptest   := 8192
-PROGS_HAMNIX :=
+PROGS_HAMNIX := echo cat ls cp rm mkdir wc head grep hamsh
+STACK_hamsh  := 65536
 PROGS        := $(PROGS_OWN) $(PROGS_HAMNIX)
 PROG_BINS    := $(PROGS:%=$(B)/user/%)
 SRC_USER     := $(wildcard user/progs/*.ad user/hamnix/*.ad user/rt/*.ad lib/*.ad lib/*/*.ad kernel/rt.ad)
@@ -86,6 +87,8 @@ $(B)/%.ll: $(SRC_AD) $(HOST_AC) | $(B)
 	@grep '^; ADDER_STAT' $@
 
 ROOT_hackos := init/main.ad
+ROOT_monitor := init/monitor_main.ad
+KOBJS_monitor := $(B)/switch.o
 ROOT_selftest := demo/main.ad
 KOBJS_hackos := $(B)/switch.o
 ROOT_ktest := tests/ktest_main.ad
@@ -161,7 +164,7 @@ run: $(B)/hackos.elf
 size: $(B)/hackos.elf
 	$(SIZE) $<
 
-test: $(B)/hackos.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf
+test: $(B)/hackos.elf $(B)/monitor.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf
 	ADDER=$(ADDER) bash tests/run_all.sh
 
 measure: $(HOST_AC)

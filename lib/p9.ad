@@ -1,0 +1,1114 @@
+# HackOS: copied from Hamnix lib/p9.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
+# see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
+# lib/p9.ad
+#
+# #458 F10-6 — Plan 9 `Dir` record as first-class universal directory
+# enumeration shape. The previous "directory read = NAME\n stream"
+# fixed `p9_listdir`'s ABI but blocked `ls -l`, `stat`, and Plan 9's
+# stream-of-Dir-records idiom from ever landing without a re-stat()
+# per leaf. This file adds the wire format + an encoder/decoder pair
+# (callable from both kernel-side directory backings and userspace
+# parsers) + `p9_diread(fd)` that reads exactly ONE record from a fd
+# whose backing was opened in Dir-record mode.
+#
+# DIR WIRE FORMAT (little-endian, length-prefixed)
+# ================================================
+# Each Dir record on the wire is:
+#
+#   off  size  field
+#     0    2   reclen          total bytes of this record INCLUDING
+#                              this length prefix; reader advances
+#                              `off += reclen` to the next record.
+#     2    1   qid_type        Plan 9 QTDIR / QTFILE / QTAUTH / ...
+#     3    4   qid_version
+#     7    8   qid_path        u64; unique-per-fileserver inode-shape
+#    15    4   mode            Plan 9 perm bits (DMDIR | 0755 ...)
+#    19    4   atime           u32 seconds since unix epoch
+#    23    4   mtime           u32 seconds since unix epoch
+#    27    8   length          u64 file length in bytes
+#    35    2   name_len; name_len bytes of `name` (no NUL)
+#    37+L  2   uid_len;  uid_len  bytes of `uid`  (no NUL)
+#    ...   2   gid_len;  gid_len  bytes of `gid`  (no NUL)
+#    ...   2   muid_len; muid_len bytes of `muid` (no NUL)
+#
+# Strings are NOT NUL-terminated on the wire — every string carries
+# its own u16 length prefix immediately before its bytes. The fixed
+# header (offsets 0..34) is 35 bytes; adding the four length prefixes
+# (8 bytes) gives a 43-byte minimum record for an entry with empty
+# uid/gid/muid and empty name. The `reclen` at offset 0 is the
+# self-describing skip count, so a reader that doesn't know a field
+# can still hop to the next record.
+#
+# This is a deliberately SMALLER shape than Plan 9 9P2000's stat wire
+# format (which carries `type`/`dev`/`qid`/... and a redundant size
+# prefix). Hamnix's namespace has no per-mount `type`/`dev` doublet —
+# the file-server letter (#c, #s, #p, ...) is implicit in the
+# directory being read — so those fields are omitted. The encoder
+# refuses to overflow a caller-supplied buffer; a record that would
+# not fit is reported as "truncated" via a 0 return and the caller
+# stops emission.
+#
+# PER-CHAN OPT-IN
+# ===============
+# The kernel-side directory backings keep emitting the legacy
+# "NAME\n" stream by default. A caller opts into the Dir wire format
+# by opening through `p9_listdir_records` (SYS_LISTDIR_RECORDS, 287)
+# which routes through the kernel's `devsrv_list_dir` (#s) emitter.
+# Other devs (#p / on-disk / #c) keep their legacy line shape until a
+# subsequent migration; the new syscall returns -ENOSYS for those
+# paths so `p9_listdir` callers see no behaviour change.
+#
+# Original F6 header continues below.
+#
+# #450 F6 — Plan 9-shape userland helpers for what used to be drift
+# syscalls (SYS_SPAWN / SYS_LISTDIR / SYS_KILL). The kernel side of
+# Phase G retires those three syscall arms (numbers stay reserved per
+# the F2 pattern); user code now uses the Plan-9-shape file + rfork
+# primitives directly. This library is the thin glue.
+#
+# The "200-line magic SYS_SPAWN inheritance block" in
+# arch/x86/kernel/syscall.ad goes away — the inheritance story is
+# expressed where it should be: in userland, via rfork's flag set + an
+# explicit dup2 + the existing sys_fdbind binding API. No kernel-side
+# spawn() exists. Every fork+exec happens in userland.
+#
+# WHAT THIS PROVIDES
+# ==================
+#
+#   spawn(path, argv, sin, sout, envp) -> int32
+#       Plan-9 rfork+exec replacement for the retired SYS_SPAWN.
+#       The flags are RFPROC | RFFDG | RFNAMEG so the child gets a
+#       PRIVATE COW namespace (including a private /fd-name table) and
+#       a PRIVATE fd table — same isolation guarantees the kernel arm
+#       used to provide. The child handles stdin/stdout redirection via
+#       sys_dup2 between rfork and exec for the legacy integer-fd case
+#       (sin/sout in [0, 16)); for the SPAWN_STDIO_NS sentinel (-2) the
+#       child runs untouched — the parent rebinds the child's /fd/N via
+#       sys_fdbind(pid, ...) BEFORE yielding to it (cooperative
+#       scheduler keeps the child STATE_READY across the spawn return).
+#
+#       Return: child pid in parent (>0), -1 on error (rfork failed),
+#       127 in the child on exec failure (sys_exit(127), matches the
+#       legacy "command not found" convention).
+#
+#   p9_note(pid, msg) -> int32
+#       Plan-9 note (signal) replacement for the retired SYS_KILL. Opens
+#       /proc/<pid>/note for write, writes `msg` (NUL-terminated), closes.
+#       Layer 2 maps Linux signal numbers to note strings (docs/native-api.md
+#       "Notes"); native callers pass the string directly.
+#       Return: 0 on success, -1 on error.
+#
+#   p9_listdir(path, buf, count) -> int64
+#       Plan-9 directory-read replacement for the retired SYS_LISTDIR.
+#       open(path, OREAD) + read(fd, buf, count) + close(fd). The
+#       backing FS still renders directory contents as "NAME\n" lines
+#       (DEV_DIR_FILE / _dirfile_read), so the format the syscall used
+#       to return is preserved here exactly. Callers parse "NAME\n"
+#       records the same way they did before. Migrating to native-api.md's
+#       9P Dir-record stream is a separate kernel-side track (the
+#       kernel's stat/fstat already build Dir records; the dir-read path
+#       still emits NAME\n until that switchover lands).
+#       Return: bytes written into `buf` on success (>= 0), -1 on error
+#       (open failure or the path is not a directory).
+#
+# COMPILER QUIRKS HONOURED: single-file module, no nested helpers, no
+# adjacent string-literal concatenation.
+
+from lib.p9dir import (
+    p9_dir_encode_into, p9d_get_u16, p9d_get_u32, p9d_get_u64,
+    P9_DMDIR,
+    P9_DIR_FIXED_HDR, P9_DIR_MIN_REC,
+)
+from lib.9p.9p import P9_QTDIR, P9_QTFILE
+
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_execve_env(path: Ptr[char], argv: Ptr[uint64],
+                          envp: Ptr[uint64]) -> int32
+extern def sys_dup2(oldfd: int32, newfd: int32) -> int32
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+# sys_fdbind — install a backing channel at /fd/<fdnum> in pid's Pgrp
+# (pid 0 == the CALLING task's own Pgrp). Mirrors the do_fdbind syscall
+# body. spawn_stdio_pipes() uses it CHILD-SIDE so stdio inheritance is
+# atomic at spawn — see that function's SMP-race note.
+extern def sys_fdbind(pid: int32, fdnum: int32, kind: int32,
+                      slot: int32) -> int32
+
+
+# rfork flag bits (mirror sys/src/9/port/sysproc.ad's RF* constants).
+P9_RFPROC:   int32 = 0x001
+P9_RFFDG:    int32 = 0x004
+P9_RFNAMEG:  int32 = 0x008
+P9_RFENVG:   int32 = 0x010
+P9_RFNOWAIT: int32 = 0x100            # detach — parent never reaps the child
+
+
+# Sentinels carried over from the retired SYS_SPAWN ABI so callers don't
+# need to learn new constants. -2 means "spawn-in-namespace mode" (parent
+# does sys_fdbind on the child); -1 means "inherit parent's fd". Anything
+# in [0, 16) is a real parent fd to dup into the child's slot.
+P9_SPAWN_STDIO_NS: int32 = -2
+P9_SPAWN_STDIO_INHERIT: int32 = -1
+
+
+# DEVFD backing kinds (mirror sys/src/9/port/devfd.ad). Used by
+# spawn_stdio_pipes() to bind the child's /fd/0,1,2 to pipe ends.
+P9_DEVFD_CONS:   int32 = 1       # bind the console device
+P9_DEVFD_PIPE_R: int32 = 2       # bind the READ end of a pipe slot
+P9_DEVFD_PIPE_W: int32 = 3       # bind the WRITE end of a pipe slot
+
+# Scratch /fd names a pipeline-launching shell uses to PIN a pipe end's
+# refcount across a spawn (see spawn_pipeline_stage). Every stage child
+# CLEARS all four right after binding its real stdio, so no stage carries a
+# stray reference to a pipe it does not actually use — that matters:
+# a leftover reader ref would suppress EPIPE for a producer whose consumer
+# has died (`yes | head -1` would never stop), and a leftover writer ref
+# would suppress EOF for the consumer. Both sides must agree on the numbers,
+# so they live here, next to the spawn that consumes them.
+#
+# devfd gives each Pgrp 16 slots (/fd/0 .. /fd/15). 0-2 are stdio; hamsh
+# claims 9 (capture), 10 (svc log) and 11 (redirect scratch).
+P9_PIPE_PIN_RA: int32 = 12       # shell's rolling pin on a pipe's READ end
+P9_PIPE_PIN_RB: int32 = 13       # ... alternating partner of RA
+P9_PIPE_PIN_W:  int32 = 14       # shell's pin on this stage's WRITE end
+P9_PIPE_PIN_R:  int32 = 15       # shell's pin on this stage's READ end
+
+
+# --- p9_closefrom() — the clean-fd contract for a spawned binary -------
+#
+# THE LEAK THIS EXISTS TO KILL (task #28)
+#
+# `spawn`/`spawn_detached`/`spawn_stdio_pipes`/`spawn_pipeline_stage` all
+# rfork with RFFDG, which gives the child a PRIVATE *copy* of the
+# launcher's ENTIRE integer fd table (kernel _rfork_setup_fd_table). That
+# copy is exactly what makes the intended-fd wiring below work — the child
+# dup2's `sin`/`sout` onto 0/1, or routes /fd/0,1,2 through its Pgrp — but
+# it ALSO hands a file server every unrelated fd the launcher happened to
+# have open: OTHER servers' transport pipes, the launcher's private files,
+# the far ends of pipes. That is both a Plan 9 correctness leak (a server
+# must not see the launcher's private channels) AND a functional bug: a
+# leaked pipe-end reference suppresses the EOF/EPIPE the transport relies
+# on (e.g. nsrun launches several distrofs daemons in a row — daemon N+1
+# used to inherit daemon N's pipe ends and pin them live forever).
+#
+# THE CONTRACT
+#
+# A spawned binary receives ONLY the fds explicitly wired for it — its
+# stdio at 0/1/2 (dup'd from the caller's sin/sout, or bound to a pipe /
+# console / namespace name), and nothing else. There is NO spawn API that
+# passes a fd > 2 to the child: every extra channel a child needs is
+# reached by OPENING a namespace name (its private COW Pgrp carries the
+# mtab + /fd-name table, copied by RFNAMEG — those are not integer fds and
+# are untouched here). So closing every integer fd >= 3 in the child, right
+# before execve, drops exactly the leaked slots and keeps everything the
+# child was meant to get.
+#
+# This lives in the exec-a-fresh-binary path (the spawn helpers below), NOT
+# in the kernel rfork primitive: hamsh's `enter`/`ns`/subshell blocks rfork
+# and keep running shell code in the child WITHOUT execve, and those MUST
+# retain the inherited fds. Only a spawn that hands control to a new binary
+# gets the clean fd set — the Unix close-on-exec idiom, expressed once at
+# the single userland exec chokepoint.
+def p9_closefrom(lowfd: int32):
+    # Close every integer fd in [lowfd, NR_FDS). NR_FDS is 64 in the kernel
+    # (kernel/sched/core.ad); 0/1/2 are already the child's wired stdio.
+    # sys_close on an unopened slot returns an error harmlessly, so a plain
+    # sweep is correct without first probing which slots are live.
+    fd: int32 = lowfd
+    while fd < 64:
+        sys_close(fd)
+        fd = fd + 1
+
+
+# _p9_path_buf: scratch path renderer for /proc/<pid>/note. Single-file
+# module scope so the buffer is BSS, matching the rest of the userland
+# convention (no malloc).
+_p9_path_buf: Array[64, uint8]
+
+
+def _p9_render_u32(v: uint32, out: Ptr[uint8], cap: uint64) -> uint64:
+    # Render `v` as decimal into `out`, NUL-terminated. Returns the
+    # length without the NUL. Caller guarantees cap >= 12.
+    if v == 0:
+        out[0] = 48                              # '0'
+        out[1] = 0
+        return 1
+    digits: Array[12, uint8]
+    n: uint64 = 0
+    vv: uint64 = cast[uint64](v)
+    while vv != 0 and n < 12:
+        digits[n] = cast[uint8](48 + (vv % 10))
+        vv = vv / 10
+        n = n + 1
+    # Reverse into out.
+    i: uint64 = 0
+    while i < n and i + 1 < cap:
+        out[i] = digits[n - 1 - i]
+        i = i + 1
+    out[i] = 0
+    return i
+
+
+def _p9_build_note_path(pid: int32) -> Ptr[char]:
+    # Render "/proc/<pid>/note" into _p9_path_buf and return it as
+    # Ptr[char]. NUL-terminated.
+    p: Ptr[uint8] = cast[Ptr[uint8]](&_p9_path_buf[0])
+    # "/proc/" prefix.
+    p[0] = 47                                    # '/'
+    p[1] = 112                                   # 'p'
+    p[2] = 114                                   # 'r'
+    p[3] = 111                                   # 'o'
+    p[4] = 99                                    # 'c'
+    p[5] = 47                                    # '/'
+    off: uint64 = 6
+    nlen: uint64 = _p9_render_u32(cast[uint32](pid),
+                                  cast[Ptr[uint8]](&_p9_path_buf[off]),
+                                  64 - off)
+    off = off + nlen
+    # "/note" suffix.
+    if off + 5 >= 64:
+        # Shouldn't happen — a 32-bit pid renders to <= 10 digits, so
+        # 6 + 10 + 5 = 21 bytes total — well under 64. Defensive only.
+        return cast[Ptr[char]](&_p9_path_buf[0])
+    p[off] = 47                                  # '/'
+    p[off + 1] = 110                             # 'n'
+    p[off + 2] = 111                             # 'o'
+    p[off + 3] = 116                             # 't'
+    p[off + 4] = 101                             # 'e'
+    p[off + 5] = 0
+    return cast[Ptr[char]](&_p9_path_buf[0])
+
+
+def _p9_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+# --- spawn() — rfork+exec, the SYS_SPAWN replacement ---------------
+
+def _p9_route_stdio_through_fdname(fdnum: int32, fdname: Ptr[char]):
+    # SPAWN_STDIO_NS contract: the child's integer fd `fdnum` resolves
+    # through the /fd/<N> name in its (already-cloned) Pgrp, so the
+    # parent's sys_fdbind(child_pid, fdnum, ...) rebinds take effect on
+    # the child's reads/writes. The OLD kernel SYS_SPAWN block did this
+    # by installing FD_CHAN_MARK + DEV_DEVFD inline-chan ids directly
+    # into the child's TaskStruct fd table. Userland can't write
+    # TaskStruct, but it can achieve the SAME routing by opening the
+    # /fd/<N> namespace name and dup2'ing the resulting fd onto fdnum:
+    # vfs.namec rewrites the open into the same FD_CHAN_MARK+DEV_DEVFD
+    # fd the kernel arm used to plant. Once dup2'd, integer-fd reads
+    # /writes route through /fd/<N> — and any subsequent
+    # sys_fdbind(child, N, ...) by the parent retargets that name.
+    newfd: int32 = sys_open(fdname)
+    if newfd < 0:
+        return
+    if newfd != fdnum:
+        sys_dup2(newfd, fdnum)
+        sys_close(newfd)
+
+
+def _p9_werr(msg: Ptr[uint8]):
+    # Unconditional stderr write of a NUL-terminated string. lib/p9.ad has
+    # no libc, and write_str() is a per-program helper, so keep it local.
+    sys_write(2, msg, _p9_strlen(msg))
+
+
+# Exit status a spawn child uses when its execve failed because the machine
+# is OUT OF MEMORY, rather than because the binary was missing. 127 is the
+# universal "command not found" status; returning it for an OOM made a
+# desktop that had run out of usable RAM look exactly like a typo, which is
+# how the 2026-07-25 stress-soak failure went unnoticed for ~141 launches.
+# 12 == ENOMEM, mirroring the kernel's errno.
+P9_EXEC_ENOMEM_STATUS: int32 = 12
+
+
+def _p9_exec_failed(path: Ptr[char], rc: int32) -> int32:
+    # Common tail for every spawn child whose sys_execve_env RETURNED (it
+    # does not return on success). Reports the failure on stderr — LOUDLY
+    # and distinctly for -ENOMEM — and exits with a status that tells the
+    # two cases apart. Never returns.
+    if rc == -7:
+        # -E2BIG. The kernel refused the argument vector rather than
+        # SILENTLY TRUNCATING it (see arch/x86/kernel/syscall.ad
+        # exec_snapshot_args). Say so explicitly: a bare 127 here reads as
+        # "command not found", which would send the user hunting for the
+        # wrong bug entirely.
+        _p9_werr(cast[Ptr[uint8]]("exec: argument list too long (E2BIG) running "))
+        _p9_werr(cast[Ptr[uint8]](path))
+        _p9_werr(cast[Ptr[uint8]](" - the command was NOT run; nothing was changed\n"))
+        sys_exit(126)
+        return 126
+    if rc == -12:
+        _p9_werr(cast[Ptr[uint8]]("exec: OUT OF MEMORY (ENOMEM) loading "))
+        _p9_werr(cast[Ptr[uint8]](path))
+        _p9_werr(cast[Ptr[uint8]](" - the machine is out of usable RAM; the binary is fine\n"))
+        sys_exit(cast[uint64](P9_EXEC_ENOMEM_STATUS))
+        return P9_EXEC_ENOMEM_STATUS
+    sys_exit(127)
+    return 127
+
+
+def _spawn_flags(path: Ptr[char], argv: Ptr[uint64],
+                 sin: int32, sout: int32, envp: Ptr[uint64],
+                 extra_flags: int32) -> int32:
+    # Plan 9-shape spawn. RFPROC creates the child; RFFDG gives it a
+    # PRIVATE fd-table copy; RFNAMEG gives it a PRIVATE COW Pgrp (which
+    # carries a COW copy of the caller's mtab + /fd-name table). These
+    # three flags reproduce the isolation the kernel's old SYS_SPAWN
+    # block did for SPAWN_STDIO_NS, without any kernel-side magic — the
+    # rfork primitive alone is enough. `extra_flags` lets a caller add
+    # RFNOWAIT (detach) — see spawn_detached.
+    flags: int32 = P9_RFPROC | P9_RFFDG | P9_RFNAMEG | extra_flags
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        return -1
+    if pid != 0:
+        # Parent: child pid is returned. The parent typically calls
+        # sys_fdbind(pid, ...) to wire pipe/redirect/dup at the child's
+        # /fd/N names; the cooperative scheduler keeps the child
+        # STATE_READY through this call so binds land before the child
+        # ever runs.
+        return pid
+    # Child: handle the integer-fd contract before exec.
+    #
+    # SPAWN_STDIO_NS (-2): the parent will rebind the child's /fd/N
+    # names via sys_fdbind, so the child must route its integer fd
+    # 0/1/2 through the /fd-name table for those binds to take effect
+    # on reads/writes. The OLD kernel arm planted FD_CHAN_MARK +
+    # DEV_DEVFD inline-chan ids directly; we achieve the same routing
+    # in userland by opening the /fd/<N> name and dup2'ing it onto
+    # the integer slot. The parent's sys_fdbind on the cloned-COW
+    # Pgrp's /fd-name table then steers what /fd/<N> resolves to.
+    if sin == P9_SPAWN_STDIO_NS:
+        _p9_route_stdio_through_fdname(0, cast[Ptr[char]]("/fd/0"))
+    if sout == P9_SPAWN_STDIO_NS:
+        _p9_route_stdio_through_fdname(1, cast[Ptr[char]]("/fd/1"))
+        # fd 2 / stderr: the OLD SYS_SPAWN block also routed fd 2
+        # through /fd/2. We do the same here so a child's writes to
+        # stderr land in the right place after a 2>&1 / 2>file
+        # parent-side rebind.
+        _p9_route_stdio_through_fdname(2, cast[Ptr[char]]("/fd/2"))
+    # Legacy integer-fd cases: an explicit fd number in [0, 16) means
+    # "dup2 the parent's fd N onto the child's fd 0 / 1". -1 means
+    # "inherit the parent's fd N" which RFFDG already gave us.
+    if sin >= 0 and sin < 16:
+        sys_dup2(sin, 0)
+    if sout >= 0 and sout < 16:
+        sys_dup2(sout, 1)
+    # CLEAN-FD contract (task #28): the child's stdio is now wired at
+    # 0/1/2; every fd >= 3 is a leaked copy of the launcher's private
+    # table (RFFDG). Drop them all before handing control to the binary so
+    # a spawned file server never sees the launcher's other channels.
+    p9_closefrom(3)
+    # exec. sys_execve_env doesn't return on success. On failure (bad
+    # path, malformed ELF, ENOENT) we exit 127 to match the legacy
+    # SYS_SPAWN "command not found" convention so callers can keep their
+    # exit-code probes — EXCEPT for -ENOMEM, which gets its own loud
+    # message + status (see _p9_exec_failed).
+    return _p9_exec_failed(path, sys_execve_env(path, argv, envp))
+
+
+
+def spawn(path: Ptr[char], argv: Ptr[uint64],
+          sin: int32, sout: int32, envp: Ptr[uint64]) -> int32:
+    # Standard spawn: the child is a normal, WAITABLE child. The caller is
+    # responsible for reaping it via wait4 (hamsh does this for foreground
+    # commands). Do NOT use this for fire-and-forget launches from a
+    # long-running service that never wait4s — use spawn_detached, or the
+    # child leaks its whole address space as an un-reapable zombie.
+    return _spawn_flags(path, argv, sin, sout, envp, 0)
+
+
+def spawn_detached(path: Ptr[char], argv: Ptr[uint64],
+                   sin: int32, sout: int32, envp: Ptr[uint64]) -> int32:
+    # Fire-and-forget spawn: RFNOWAIT severs the parent link at creation, so
+    # the child is published as a DETACHED zombie on exit and the kernel's
+    # reap_orphan_zombies() (run at every fork) reclaims it — no wait4 needed.
+    #
+    # This is the CORRECT launcher for the DE's long-running service parents
+    # (the scene panel, the file manager) that fire off apps/editors and never
+    # wait4 them. With the plain spawn() those children stayed NON-detached
+    # zombies with a still-live parent, which reap_orphan_zombies() leaves for
+    # a wait4 that never comes — so each menu launch / hamedit re-open leaked a
+    # full address space until fork() hit -EAGAIN (the "menu app-launch breaks"
+    # / "editor won't re-open" DE bugs).
+    return _spawn_flags(path, argv, sin, sout, envp, P9_RFNOWAIT)
+
+
+# --- spawn_stdio_pipes() — ATOMIC-at-spawn pipe stdio inheritance ---
+#
+# THE SMP FIX (#136). The plain SPAWN_STDIO_NS contract is: parent
+# spawns, then calls sys_fdbind(child_pid, 0/1/2, ...) to steer the
+# child's /fd names. That relies on the child staying STATE_READY
+# "until the parent yields" — true ONLY on a UP cooperative scheduler.
+# Under -smp 2 a SECOND CPU runs the child (routes its integer stdio +
+# execs) BEFORE the parent's post-spawn binds land, so the child's
+# /fd/0,1,2 still resolve to the INHERITED console — `ssh host <cmd>`
+# and interactive input never reach the shell.
+#
+# This variant closes the race by binding the child's OWN /fd/0,1,2 to
+# the pipe ends CHILD-SIDE, in the child's private COW Pgrp, BEFORE
+# execve — a straight-line sequence in the child's single thread, so it
+# is complete on whichever CPU runs the child before hamsh's first
+# instruction (and before hamsh's getty-flush kind-probe of /fd/0). No
+# cross-CPU ordering is involved: the parent does NO post-spawn stdio
+# bind at all.
+#
+#   pin_slot  : pipe slot whose READ end becomes the child's /fd/0
+#               (its stdin). The parent holds the WRITE end.
+#   pout_slot : pipe slot whose WRITE end becomes the child's /fd/1 AND
+#               /fd/2 (stdout+stderr). The parent holds the READ end.
+#
+# Pipe slots are GLOBAL, address-independent handles, so the values the
+# parent computed are valid in the child's COW-copied frame. The parent
+# must have already bound its own end of each pipe (so pin has a live
+# writer / pout a live reader before the child can read) — exactly the
+# pre-spawn ordering _spawn_shell uses.
+def spawn_stdio_pipes(path: Ptr[char], argv: Ptr[uint64],
+                      pin_slot: int32, pout_slot: int32,
+                      envp: Ptr[uint64]) -> int32:
+    flags: int32 = P9_RFPROC | P9_RFFDG | P9_RFNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        return -1
+    if pid != 0:
+        # Parent: child pid. NO post-spawn sys_fdbind — the child wires
+        # its own stdio below, so there is nothing left to race.
+        return pid
+    # Child: bind OUR OWN /fd/0,1,2 (pid 0 == self) to the pipe ends in
+    # our private COW Pgrp, then route the integer fds through those
+    # names, then exec. All straight-line, pre-exec, race-free.
+    sys_fdbind(0, 0, P9_DEVFD_PIPE_R, pin_slot)
+    sys_fdbind(0, 1, P9_DEVFD_PIPE_W, pout_slot)
+    sys_fdbind(0, 2, P9_DEVFD_PIPE_W, pout_slot)
+    _p9_route_stdio_through_fdname(0, cast[Ptr[char]]("/fd/0"))
+    _p9_route_stdio_through_fdname(1, cast[Ptr[char]]("/fd/1"))
+    _p9_route_stdio_through_fdname(2, cast[Ptr[char]]("/fd/2"))
+    # CLEAN-FD contract (task #28): stdio is wired via the /fd names above;
+    # drop every leaked launcher fd >= 3 before exec.
+    p9_closefrom(3)
+    return _p9_exec_failed(path, sys_execve_env(path, argv, envp))
+
+
+def p9_pipe_pins_release():
+    # Drop every pipeline pin bound in the CALLING task's Pgrp. Rebinding
+    # CONS over CONS/NONE is a harmless no-op, so this is safe to call
+    # unconditionally (a single-stage command pinned nothing).
+    sys_fdbind(0, P9_PIPE_PIN_RA, P9_DEVFD_CONS, 0)
+    sys_fdbind(0, P9_PIPE_PIN_RB, P9_DEVFD_CONS, 0)
+    sys_fdbind(0, P9_PIPE_PIN_W,  P9_DEVFD_CONS, 0)
+    sys_fdbind(0, P9_PIPE_PIN_R,  P9_DEVFD_CONS, 0)
+
+
+# --- spawn_pipeline_stage() — race-free `a | b` stage launch ---------
+#
+# THE BUG THIS EXISTS TO KILL
+#
+# hamsh used to launch a pipeline stage as
+#
+#     pid = spawn(path, argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+#     sys_fdbind(pid, 1, DEVFD_PIPE_W, out_slot)      # <-- PARENT-side
+#
+# resting on run_one_command_x's claim that "the child is still
+# STATE_READY (cooperative scheduler), so these binds land before its
+# first instruction runs". That is FALSE the moment a second CPU exists —
+# the same falsehood spawn_stdio_pipes() above was written to correct for
+# the SSH path (#136). Under KVM the child really does run concurrently:
+# it can route its stdio, execve, and START WRITING before the parent's
+# sys_fdbind arrives. Its /fd/1 is then still the COW-inherited CONSOLE,
+# so `seq 1 5 | wc -l` prints 1 2 3 4 5 on the terminal and wc, whose
+# pipe never received a byte, reads EOF and prints 0. On TCG the parent
+# always won the race, so no `-kernel` test ever saw it.
+#
+# THE FIX, and why it is the same shape as spawn_stdio_pipes
+#
+# The child binds its OWN /fd/0 and /fd/1 in its private COW Pgrp BEFORE
+# execve — a straight-line sequence in the child's single thread. No
+# cross-CPU ordering is involved and the parent does NO post-spawn stdio
+# bind at all. Pipe slots are GLOBAL, address-independent handles, so the
+# values the parent computed are valid in the child's COW-copied frame.
+#
+# THE REFCOUNT PIN, and why the caller must take it
+#
+# A pipe end's reader/writer count is what makes EOF and EPIPE work:
+#   * a reader sees EOF exactly when writers == 0;
+#   * a writer gets EPIPE exactly when readers == 0.
+# If the child were the FIRST holder of the write end, the shell would
+# already have launched the downstream stage — which would find
+# writers == 0 and read instant EOF — before the child's bind ever ran.
+# Symmetrically a producer that starts writing before its consumer binds
+# the read end gets EPIPE and its output is silently discarded.
+#
+# So the CALLER must, before calling:
+#     sys_fdbind(0, P9_PIPE_PIN_W, P9_DEVFD_PIPE_W, out_slot)   (out >= 0)
+#     sys_fdbind(0, P9_PIPE_PIN_R, P9_DEVFD_PIPE_R, in_slot)    (in  >= 0)
+# pgrp_clone (inside rfork) copies those rows and bumps the refcounts
+# again, so the child owns a live reference the instant it exists. The
+# child then binds its real stdio names and DROPS the inherited pins, and
+# the caller drops its own pin after the rfork returns. The count is
+# >= 1 from before the fork until the stage exits — in every interleaving.
+#
+#   in_slot  : pipe slot whose READ end becomes the child's /fd/0. -1 = none
+#              (first stage keeps the inherited stdin).
+#   out_slot : pipe slot whose WRITE end becomes the child's /fd/1. -1 = none
+#              (last stage keeps the inherited stdout).
+#
+# Unlike spawn_stdio_pipes, /fd/2 is NOT redirected: a pipeline stage's
+# stderr belongs on the terminal, not in the next stage's stdin.
+def spawn_pipeline_stage(path: Ptr[char], argv: Ptr[uint64],
+                         in_slot: int32, out_slot: int32,
+                         envp: Ptr[uint64]) -> int32:
+    flags: int32 = P9_RFPROC | P9_RFFDG | P9_RFNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        return -1
+    if pid != 0:
+        # Parent: child pid. NO post-spawn sys_fdbind — nothing to race.
+        return pid
+    # Child. Bind our real stdio names FIRST (so the refcount never dips),
+    # then release the pins we inherited from the caller's Pgrp.
+    if in_slot >= 0:
+        sys_fdbind(0, 0, P9_DEVFD_PIPE_R, in_slot)
+    if out_slot >= 0:
+        sys_fdbind(0, 1, P9_DEVFD_PIPE_W, out_slot)
+    p9_pipe_pins_release()
+    _p9_route_stdio_through_fdname(0, cast[Ptr[char]]("/fd/0"))
+    _p9_route_stdio_through_fdname(1, cast[Ptr[char]]("/fd/1"))
+    _p9_route_stdio_through_fdname(2, cast[Ptr[char]]("/fd/2"))
+    # CLEAN-FD contract (task #28): stdio (0/1 pipe ends, 2 = terminal) is
+    # wired above; drop every leaked launcher fd >= 3 before exec so a
+    # pipeline stage never pins an unrelated pipe end (would suppress
+    # EOF/EPIPE for the real endpoints).
+    p9_closefrom(3)
+    return _p9_exec_failed(path, sys_execve_env(path, argv, envp))
+
+
+# --- p9_note() — write a note string, the SYS_KILL replacement ------
+
+def p9_note(pid: int32, msg: Ptr[uint8]) -> int32:
+    # /proc/<pid>/note — open for write, write the note string,
+    # close. Plan 9's signal model: the message is what the target's
+    # registered note handler sees. With no handler installed today
+    # the kernel parks note_pending + the message on the target task;
+    # the cross-task drain that consumes note_pending without a handler
+    # is a separate kernel-side milestone (documented in
+    # sys/src/9/port/sysnote.ad). Caller gets a clean return on the
+    # write; semantics match what the F2 audit shipped for the rest of
+    # the drift retirement family.
+    path: Ptr[char] = _p9_build_note_path(pid)
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        return -1
+    n: uint64 = _p9_strlen(msg)
+    rc: int64 = sys_write(fd, msg, n)
+    sys_close(fd)
+    if rc < 0:
+        return -1
+    return 0
+
+
+# --- p9_listdir() — read a directory, the SYS_LISTDIR replacement ---
+
+def p9_listdir(path: Ptr[char], buf: Ptr[uint8], count: uint64) -> int64:
+    # Open `path` as a directory and copy its rendered "NAME\n"
+    # listing into `buf`. The dir fd's read backing is DEV_DIR_FILE
+    # (_dirfile_read in sys/src/9/port/namec.ad) — it already produces
+    # the exact same "NAME\n"-packed format the retired SYS_LISTDIR
+    # used to return, so existing callers' parsing stays byte-identical
+    # without any format conversion in this wrapper. Returns the bytes
+    # written into `buf` (>= 0), or -1 on error (path doesn't exist,
+    # isn't a directory, or read failed).
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: int64 = 0
+    # Loop reads until EOF or the caller's buffer is full. Most
+    # directories fit in a single read of a 4 KiB+ buffer, but a tiny
+    # buffer paired with a large directory must drain across multiple
+    # reads — same shape sys_read uses on regular files.
+    while cast[uint64](total) < count:
+        rem: uint64 = count - cast[uint64](total)
+        slice_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + cast[uint64](total))
+        n: int64 = sys_read(fd, slice_ptr, rem)
+        if n < 0:
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break                                 # EOF
+        total = total + n
+    sys_close(fd)
+    return total
+
+
+# --- p9_note_tree() — note a process AND its ATTACHED descendants ----
+#
+# THE LEAK THIS EXISTS TO CLOSE (2026-07-25 desktop soak).
+#
+# A note posted to a handler-less process TERMINATES it, instantly, with
+# no chance to run any cleanup (sys/src/9/port/sysnote.ad's default
+# action -> signal_post(SIGTERM); the cross-task handler retarget is an
+# open kernel milestone, and installing a handler today would make the
+# process UNKILLABLE instead of graceful). So an app that spawned a
+# lifetime-coupled child — the DE terminal, user/hamtermscene.ad, and
+# its inner `/bin/hamsh --no-echo /etc/rc.de-user` — CANNOT reap that
+# child when its window is closed: hamtermscene is already gone.
+#
+# The 30-minute stress soak (docs/de_stress_soak.md) measured the cost.
+# With hamtermscene in the app mix TasksLive climbed 20 -> 35 and
+# VmaNodesLive 28 -> 58 over 36 cycles and MemFree fell 4525 kB/cycle;
+# with the terminal dropped from the mix both counters were FLAT and the
+# slope was 1443 kB/cycle. Every terminal close stranded one live hamsh
+# (~1 task, 2 VMA nodes, ~300 pages) that nothing would ever kill.
+#
+# The fix has to live on the KILLER's side, because the killed process
+# gets no say. p9_note_tree posts `msg` to every ATTACHED descendant of
+# `pid` and then to `pid` itself.
+#
+# WHY "ATTACHED" IS THE RIGHT CUT, AND WHY IT IS SELF-LIMITING
+#
+# rfork(RFNOWAIT) / lib.p9 spawn_detached SEVERS the parent link — it
+# sets parent_pid = 0 (sys/src/9/port/sysproc.ad). Every DE launcher
+# that fires off an INDEPENDENT app — hamUId's app launches, the panel's
+# menu launchers, hamdesktop's icon double-click, hamfmscene's editor —
+# uses spawn_detached precisely because it never wait4s them. Those apps
+# therefore have NO ppid and this walk can never reach them: closing the
+# panel does not take the desktop's windows with it.
+#
+# What IS reachable is exactly the cohort a plain spawn() creates: a
+# child the parent tracks and whose whole reason to exist is the parent
+# (hamtermscene's shell, hampkgscene's `/bin/hpm`, a hamsh pipeline
+# stage). That is the set that must die with it.
+#
+# Descendants are noted BEFORE the target so a child never observes a
+# half-torn-down parent. Each one is left a zombie whose parent is dying
+# too; the kernel's reap_orphan_zombies (kernel/sched/core.ad) reclaims
+# an orphaned zombie at the next task allocation, which is what returns
+# TasksLive / VmaNodesLive / PagesInUse to baseline.
+#
+# WHY A STALE ppid CANNOT MAKE THIS WALK KILL A STRANGER
+#
+# The obvious hazard in matching on a ppid NUMBER is aliasing: nothing
+# clears parent_pid when a parent exits (only rfork(RFNOWAIT) / detach
+# does, sysproc.ad), so an orphan keeps pointing at a dead pid. If pids
+# were reused, that dead number would eventually be reissued to an
+# unrelated app and closing it would drag the stale orphan down with it.
+#
+# It cannot happen here: kernel/sched/core.ad allocates every task from a
+# monotonically increasing next_pid (uint64), set to 1 once at boot and
+# only ever incremented. Task SLOTS are recycled; pid NUMBERS never are.
+# A dead parent's pid is therefore never handed out again, so p9_ppid(v)
+# == pid holds only for v's true parent. This was checked against a
+# 61-cycle desktop soak (docs/de_stress_soak.md): 244 notes produced 271
+# terminations, and all 27 extras were the intended attached shells of
+# hamtermscene — zero mis-targeted processes. Anything that ever makes
+# pids wrap or be reused MUST add a start-time/generation check here.
+_P9_TREE_MAX: uint64 = 64
+_p9_tree_kids:  Array[64, int32]
+_p9_tree_dir:   Array[4096, uint8]
+_p9_tree_stat:  Array[256, uint8]
+_p9_tree_path:  Array[64, uint8]
+
+
+def _p9_build_stat_path(pid: int32) -> Ptr[char]:
+    # Render "/proc/<pid>/stat" into _p9_tree_path. Same shape as
+    # _p9_build_note_path; kept separate so the two scratch buffers
+    # never alias (p9_note_tree holds a stat path open while it walks).
+    p: Ptr[uint8] = cast[Ptr[uint8]](&_p9_tree_path[0])
+    p[0] = 47                                    # '/'
+    p[1] = 112                                   # 'p'
+    p[2] = 114                                   # 'r'
+    p[3] = 111                                   # 'o'
+    p[4] = 99                                    # 'c'
+    p[5] = 47                                    # '/'
+    off: uint64 = 6
+    nlen: uint64 = _p9_render_u32(cast[uint32](pid),
+                                  cast[Ptr[uint8]](&_p9_tree_path[off]),
+                                  64 - off)
+    off = off + nlen
+    p[off] = 47                                  # '/'
+    p[off + 1] = 115                             # 's'
+    p[off + 2] = 116                             # 't'
+    p[off + 3] = 97                              # 'a'
+    p[off + 4] = 116                             # 't'
+    p[off + 5] = 0
+    return cast[Ptr[char]](&_p9_tree_path[0])
+
+
+def p9_ppid(pid: int32) -> int32:
+    # Parent pid of `pid`, or -1 if it can't be determined.
+    #
+    # /proc/<pid>/stat is the Linux-shape one-liner devproc renders
+    # (sys/src/9/port/devproc.ad::_emit_linux_stat):
+    #     pid (comm) state ppid pgrp ...
+    # comm can itself contain spaces and parentheses, so field 4 is
+    # located the way every real parser does it: scan to the LAST ')',
+    # then skip " <state> " and read the decimal that follows.
+    path: Ptr[char] = _p9_build_stat_path(pid)
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_p9_tree_stat[0], 255)
+    sys_close(fd)
+    if n <= 0:
+        return -1
+    ln: uint64 = cast[uint64](n)
+    # Last ')'.
+    rp: uint64 = 0
+    found: int32 = 0
+    i: uint64 = 0
+    while i < ln:
+        if _p9_tree_stat[i] == 41:               # ')'
+            rp = i
+            found = 1
+        i = i + 1
+    if found == 0:
+        return -1
+    p: uint64 = rp + 1
+    # skip spaces, the single state letter, spaces.
+    while p < ln and _p9_tree_stat[p] == 32:
+        p = p + 1
+    while p < ln and _p9_tree_stat[p] != 32:
+        p = p + 1
+    while p < ln and _p9_tree_stat[p] == 32:
+        p = p + 1
+    if p >= ln:
+        return -1
+    if _p9_tree_stat[p] < 48 or _p9_tree_stat[p] > 57:
+        return -1
+    v: int32 = 0
+    while p < ln and _p9_tree_stat[p] >= 48 and _p9_tree_stat[p] <= 57:
+        v = v * 10 + cast[int32](_p9_tree_stat[p]) - 48
+        p = p + 1
+    return v
+
+
+def _p9_collect_children(pid: int32, at: uint64) -> uint64:
+    # Append every LIVE task whose ppid == pid onto _p9_tree_kids
+    # starting at index `at`; return the new count. /proc's root listing
+    # is "NAME\n"-packed and carries one decimal entry per live pid.
+    if at >= _P9_TREE_MAX:
+        return at
+    n: int64 = p9_listdir(cast[Ptr[char]]("/proc"), &_p9_tree_dir[0], 4096)
+    if n <= 0:
+        return at
+    ln: uint64 = cast[uint64](n)
+    out: uint64 = at
+    i: uint64 = 0
+    while i < ln and out < _P9_TREE_MAX:
+        # One name per line.
+        s: uint64 = i
+        while i < ln and _p9_tree_dir[i] != 10:
+            i = i + 1
+        e: uint64 = i
+        if i < ln:
+            i = i + 1                            # step past '\n'
+        # Numeric names only — the static well-known files (version,
+        # uptime, tasks, meminfo, ...) are not pids.
+        if e > s:
+            allnum: int32 = 1
+            v: int32 = 0
+            k: uint64 = s
+            while k < e:
+                c: uint8 = _p9_tree_dir[k]
+                if c < 48 or c > 57:
+                    allnum = 0
+                else:
+                    v = v * 10 + cast[int32](c) - 48
+                k = k + 1
+            if allnum != 0 and v > 1 and v != pid:
+                if p9_ppid(v) == pid:
+                    _p9_tree_kids[out] = v
+                    out = out + 1
+    return out
+
+
+def p9_note_tree(pid: int32, msg: Ptr[uint8]) -> int32:
+    # Post `msg` to every attached descendant of `pid`, then to `pid`.
+    # Returns p9_note's result for the target itself (the descendants are
+    # best-effort — one that raced us out of existence is not an error).
+    #
+    # The walk is breadth-first over a bounded 64-entry queue, so a deep
+    # chain (terminal -> shell -> a running command) is covered without
+    # recursion (the scratch buffers are module-scope BSS and a recursive
+    # walk would clobber them). pid <= 1 is refused: init's "descendants"
+    # are the whole system.
+    if pid > 1:
+        total: uint64 = _p9_collect_children(pid, 0)
+        head: uint64 = 0
+        while head < total and total < _P9_TREE_MAX:
+            total = _p9_collect_children(_p9_tree_kids[head], total)
+            head = head + 1
+        i: uint64 = 0
+        while i < total:
+            p9_note(_p9_tree_kids[i], msg)
+            i = i + 1
+    return p9_note(pid, msg)
+
+
+# --- F10-6: Plan 9 Dir record — first-class struct + wire format -----
+#
+# Adder has no `struct` keyword (see neighbouring modules' "Adder
+# quirks" notes); a Dir VALUE is conveyed in userspace as a set of
+# "current-record" module-scope fields populated by p9_dir_decode_at
+# or by p9_diread. A caller invokes the decoder, then reads the
+# DIR_CUR_* / DIR_NAME_BUF fields. This is the same parallel-array
+# convention chan.ad / devfd.ad use for their "structs."
+#
+# QID type bits + DMDIR re-exported from lib/p9dir for convenience —
+# userland callers can match against DIR_CUR_QTYPE without a second
+# import.
+#
+# Decoder-side "current record" fields. After p9_dir_decode_at returns
+# > 0, these hold the just-decoded record's values. The four string
+# fields live in BSS scratch buffers (NUL-terminated for caller
+# convenience; the wire format itself is NOT NUL-terminated).
+DIR_NAME_MAX: uint64 = 256
+DIR_UID_MAX:  uint64 = 64
+
+DIR_CUR_QTYPE:   uint8  = 0
+DIR_CUR_QVER:    uint32 = 0
+DIR_CUR_QPATH:   uint64 = 0
+DIR_CUR_MODE:    uint32 = 0
+DIR_CUR_ATIME:   uint32 = 0
+DIR_CUR_MTIME:   uint32 = 0
+DIR_CUR_LENGTH:  uint64 = 0
+DIR_CUR_NAME_LEN: uint64 = 0
+DIR_CUR_UID_LEN:  uint64 = 0
+DIR_CUR_GID_LEN:  uint64 = 0
+DIR_CUR_MUID_LEN: uint64 = 0
+DIR_CUR_NAME: Array[256, uint8]
+DIR_CUR_UID:  Array[64, uint8]
+DIR_CUR_GID:  Array[64, uint8]
+DIR_CUR_MUID: Array[64, uint8]
+
+def _p9_copy_str_capped(dst: Ptr[uint8], src: Ptr[uint8],
+                        n: uint64, cap: uint64) -> uint64:
+    # Copy min(n, cap-1) bytes from src to dst; NUL-terminate. Returns
+    # the bytes copied (NOT counting the NUL). Used by the decoder to
+    # land a wire-side length-prefixed string into a fixed BSS slot.
+    take: uint64 = n
+    if take + 1 > cap:
+        take = cap - 1
+    i: uint64 = 0
+    while i < take:
+        dst[i] = src[i]
+        i = i + 1
+    dst[take] = 0
+    return take
+
+
+def p9_dir_decode_at(buf: Ptr[uint8], off: uint64,
+                     buf_len: uint64) -> uint64:
+    # Decode ONE Dir record from buf+off. Populates the DIR_CUR_*
+    # module-scope fields. Returns the record's reclen (>= P9_DIR_MIN_REC)
+    # so the caller can advance `off += reclen` to the next record;
+    # returns 0 on EOF (off >= buf_len) or a malformed record.
+    if off >= buf_len:
+        return 0
+    if off + P9_DIR_FIXED_HDR > buf_len:
+        return 0
+    reclen: uint64 = cast[uint64](p9d_get_u16(buf, off))
+    if reclen < P9_DIR_MIN_REC:
+        return 0
+    if off + reclen > buf_len:
+        return 0
+    DIR_CUR_QTYPE  = buf[off + 2]
+    DIR_CUR_QVER   = p9d_get_u32(buf, off + 3)
+    DIR_CUR_QPATH  = p9d_get_u64(buf, off + 7)
+    DIR_CUR_MODE   = p9d_get_u32(buf, off + 15)
+    DIR_CUR_ATIME  = p9d_get_u32(buf, off + 19)
+    DIR_CUR_MTIME  = p9d_get_u32(buf, off + 23)
+    DIR_CUR_LENGTH = p9d_get_u64(buf, off + 27)
+    p: uint64 = off + P9_DIR_FIXED_HDR
+    # name
+    if p + 2 > off + reclen:
+        return 0
+    nl: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + nl > off + reclen:
+        return 0
+    name_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_NAME_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_NAME[0]), name_src, nl, DIR_NAME_MAX)
+    p = p + nl
+    # uid
+    if p + 2 > off + reclen:
+        return 0
+    ul: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + ul > off + reclen:
+        return 0
+    uid_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_UID_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_UID[0]), uid_src, ul, DIR_UID_MAX)
+    p = p + ul
+    # gid
+    if p + 2 > off + reclen:
+        return 0
+    gl: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + gl > off + reclen:
+        return 0
+    gid_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_GID_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_GID[0]), gid_src, gl, DIR_UID_MAX)
+    p = p + gl
+    # muid
+    if p + 2 > off + reclen:
+        return 0
+    ml: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + ml > off + reclen:
+        return 0
+    muid_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_MUID_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_MUID[0]), muid_src, ml, DIR_UID_MAX)
+    return reclen
+
+
+# --- p9_listdir_records / p9_diread — Dir-record opt-in ---------------
+#
+# p9_listdir_records(path, buf, count) -> int64
+#   Open `path` and ask the kernel to render the directory in Dir wire
+#   format into `buf`. Returns bytes written (>= 0), or -1 on error
+#   (path not a recognised Dir-mode-capable directory, or copy_to_user
+#   failed). Internally invokes SYS_LISTDIR_RECORDS (318); the kernel
+#   routes /srv to devsrv_list_dir, returns -ENOSYS for other paths
+#   until those backings migrate.
+#
+# p9_diread(fd) is the Plan-9-idiomatic per-fd reader (one record per
+# call). It cannot be implemented in pure userland on top of the legacy
+# NAME\n directory fd shape — the kernel must know it is rendering Dir
+# records. F10-6's minimal viable scope lands the syscall + the devsrv
+# emitter; switching every directory fd's read backing to Dir records
+# is the per-backing migration that follows. So `p9_diread` here is a
+# THIN convenience: it pre-renders the entire directory via
+# p9_listdir_records into a module-scope BSS buffer on the first call,
+# then walks records out one at a time. The fd is tracked so a caller
+# can iterate the same directory across calls; once that fd is closed
+# the cursor resets.
+
+extern def sys_listdir_records(path: Ptr[char], buf: Ptr[uint8],
+                               count: uint64) -> int64
+extern def sys_chan_dir_mode(fd: int32, mode: int32,
+                             path: Ptr[char]) -> int32
+extern def sys_stat_p9(path: Ptr[char], buf: Ptr[uint8],
+                       nbuf: uint64) -> int64
+
+
+def p9_chan_dir_mode(fd: int32, mode: int32, path: Ptr[char]) -> int32:
+    # F10-6 followup userland wrapper: flip an already-open directory fd
+    # into Dir-record mode. `path` is the absolute parent path the fd
+    # was opened against (the kernel uses it to stat each entry during
+    # the NAME\n -> Dir transform). Returns 0 on success, -1 on error.
+    return sys_chan_dir_mode(fd, mode, path)
+
+
+def p9_listdir_records(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    # Userspace wrapper around SYS_LISTDIR_RECORDS (318). Returns bytes
+    # written into `buf` (>= 0) or -errno on failure.
+    return sys_listdir_records(path, buf, count)
+
+
+# p9_diread cursor — module-scope BSS. The fd argument exists to give
+# the v2 (per-fd Dir-mode) future the same call shape; v1 uses the fd
+# only as a cache key — the actual data is re-fetched whenever the fd
+# argument changes. A future migration that adds an OCREAD-Dir open
+# flag will store the buffer cursor in the kernel chan instead.
+P9_DIREAD_BUF_CAP: uint64 = 4096
+_p9_diread_buf: Array[4096, uint8]
+_p9_diread_path: Array[256, uint8]
+_p9_diread_fd: int32 = -1
+_p9_diread_total: uint64 = 0
+_p9_diread_off: uint64 = 0
+
+
+def p9_diread_open(path: Ptr[char]) -> int32:
+    # v1 opener: pre-fills the Dir-record buffer for `path`. Returns a
+    # synthetic fd-shape handle (>= 0) the caller passes to p9_diread.
+    # The handle is just a small integer for cursor identification; it
+    # is NOT a real kernel fd. Callers that already hold a kernel fd
+    # for the dir can pass it to p9_diread directly; the v1 behaviour
+    # ignores the actual fd value beyond using it as a cache key.
+    n: int64 = p9_listdir_records(path,
+        cast[Ptr[uint8]](&_p9_diread_buf[0]), P9_DIREAD_BUF_CAP)
+    if n < 0:
+        return -1
+    # Cache the path so p9_diread can re-prime if the caller passes a
+    # different fd in between (defensive — single-cursor v1).
+    pp: Ptr[uint8] = cast[Ptr[uint8]](path)
+    i: uint64 = 0
+    while i < 255 and pp[i] != 0:
+        _p9_diread_path[i] = pp[i]
+        i = i + 1
+    _p9_diread_path[i] = 0
+    _p9_diread_fd    = 1                          # any non-(-1) value
+    _p9_diread_total = cast[uint64](n)
+    _p9_diread_off   = 0
+    return _p9_diread_fd
+
+
+def p9_diread(fd: int32) -> int32:
+    # Read ONE Dir record into DIR_CUR_*. Returns 1 on hit, 0 on EOF,
+    # -1 on error / no open dir. Caller must have called p9_diread_open
+    # first. The fd argument is a forward-compatibility hook for the
+    # per-fd-Dir-mode v2 migration; v1 ignores it beyond a sanity check
+    # that an open is live.
+    _unused: int32 = fd
+    if _p9_diread_fd < 0:
+        return -1
+    if _p9_diread_off >= _p9_diread_total:
+        return 0                                  # EOF
+    rl: uint64 = p9_dir_decode_at(
+        cast[Ptr[uint8]](&_p9_diread_buf[0]),
+        _p9_diread_off, _p9_diread_total)
+    if rl == 0:
+        return -1                                 # malformed
+    _p9_diread_off = _p9_diread_off + rl
+    return 1
+
+
+def p9_diread_close(fd: int32) -> int32:
+    # Release the v1 cursor.
+    _unused2: int32 = fd
+    _p9_diread_fd    = -1
+    _p9_diread_total = 0
+    _p9_diread_off   = 0
+    return 0
+
+
+# Dedicated scratch for the by-path stat probe (a full Dir record is
+# bounded by 49 + name + 3*user-name bytes; 560 matches the kernel stage).
+_p9_stat_buf: Array[560, uint8]
+
+
+def p9_is_dir(path: Ptr[char]) -> int32:
+    # Return 1 iff `path` names a DIRECTORY, 0 for a plain file / a path
+    # that does not exist / any stat error.
+    #
+    # WHY NOT p9_listdir: p9_listdir(path) opens+reads `path`, so a REGULAR
+    # file succeeds and returns its content bytes (>= 0) — indistinguishable
+    # from a directory listing by the return value alone. SYS_STAT_P9 returns
+    # a 9P stat Dir record whose qid.type byte carries QTDIR only for a true
+    # directory, so this classifies files and directories correctly.
+    #
+    # The record is the FULL 9P stat wire layout _write_dir_record emits
+    # (sys/src/9/port/sysfile.ad): size[2] type[2] dev[4] qid.type[1] ...,
+    # i.e. qid.type is at OFFSET 8 — NOT the compact layout p9_dir_decode_at
+    # parses (that decoder reads offset 2, the always-zero `type` field, and
+    # would report every path as a non-directory). Read qid.type directly.
+    n: int64 = sys_stat_p9(path, cast[Ptr[uint8]](&_p9_stat_buf[0]), 560)
+    if n < 9:
+        return 0                                   # error / too short
+    if (_p9_stat_buf[8] & P9_QTDIR) != 0:
+        return 1
+    return 0

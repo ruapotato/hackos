@@ -26,6 +26,7 @@ from kernel.rt import rt_memcpy
 from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
+from kernel.exit import hackos_exit
 
 extern def __text_end()
 extern def __vectors_start()
@@ -83,6 +84,7 @@ SYS_RENAME: uint32 = 514
 SYS_GETTID: uint32 = 515
 SYS_SLEEP_MS: uint32 = 516
 SYS_SPAWN: uint32 = 517             # (path, argv) -> pid: a new process, no fork involved
+SYS_HALT: uint32 = 518              # (status): report the status and reset the machine
 
 sys_count: uint64 = 0               # system calls dispatched so far
 sys_bad_ptr: uint64 = 0             # calls refused for a bad user pointer
@@ -253,6 +255,9 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         return cast[int64](proc_sys_spawn(cast[Ptr[uint8]](a0), a1))
     if nr == SYS_RFORK:
         return cast[int64](proc_rfork(cast[uint32](a0)))
+    if nr == SYS_HALT:
+        hackos_exit(cast[uint32](a0))
+        return 0
     if nr == SYS_WAITPID:
         proc_release_held()
         return proc_waitpid(cast[int32](a0), cast[uint32](a1))

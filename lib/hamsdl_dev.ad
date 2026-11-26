@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- stand-in for Hamnix's lib/hamsdl_dev.ad (hamSDL's window-system transport).
+#
+# Hamnix's shell imports hamSDL's window-system transport for its `hamui` and `pygame` built-ins.
+# HackOS has no window system and no frame buffer, and the real libraries
+# would add 10.8 MB of static tables to the shell.  This module supplies the
+# names the shell imports, with Hamnix's signatures, so that user/hamnix/
+# hamsh.ad needs no change for it: every call fails or does nothing, and the
+# first one says why on the standard error stream.  Nothing here is copied
+# from Hamnix except the names, the parameter lists and the constants' values.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+hamsdl_dev_said: uint32 = 0
+
+
+def hamsdl_dev_none():
+    if hamsdl_dev_said == 0:
+        hamsdl_dev_said = 1
+        sys_write(2, "hamsh: no display on this system: the hamui and pygame built-ins do nothing\n", 76)
+
+
+
+
+def sdl_dev_init(title: Ptr[uint8], x: int32, y: int32, w: int32, h: int32) -> int32:
+    hamsdl_dev_none()
+    return -1
+
+
+def sdl_dev_pump():
+    hamsdl_dev_none()
+
+
+def sdl_dev_present() -> int32:
+    hamsdl_dev_none()
+    return -1

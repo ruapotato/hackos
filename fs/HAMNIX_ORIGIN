@@ -17,3 +17,22 @@ d62d59631138e21d0d6059d8d58b59305609938c51fcb4e89ad6b455ca354989  fs/tmpfs.ad
 2329fecb449d9a9726b7dd6a12598662c17caff45de20f33aa77fe012b00c0a9  fs/vfs_mount.ad
 e8a51b3d9aaca88fb224f72bc8543a96a7163fb9253173511ad1607cfc376ac2  lib/p9dir.ad
 e1058e80bd19ffa153684a4ba904569e7386d3b447c3b478e2506ee8796e36f4  lib/9p/9p.ad
+#
+# User programs and their libraries (milestone 3).  user/hamnix/NAME.ad is
+# Hamnix's user/NAME.ad (the first header line of each copy names its origin);
+# the libraries keep their Hamnix paths because programs import them by path.
+0415252bb0066726949a074609ba20ca558d5a1c4692182aba0cfdac38306b04  user/hamnix/echo.ad
+b3f402335ecf7f84b505ab5d10b4e391ab2116cc75ab3aa623eae404be49ac3e  user/hamnix/cat.ad
+7cf5d544727438c84692a68e078c766575c0811f51ff5924131ce772ffca4ebf  user/hamnix/ls.ad
+c457d1b5a1a912de9e20707ef3bfccde1c1c193f345b967b2ea8700536ebc617  user/hamnix/cp.ad
+3bf143a3f00930dba9afbe680bb9ae1e3bfb7821a83408565932cc8fac956683  user/hamnix/rm.ad
+789ef84ae575c2f358fce356cbecc8dccf01245100bdeb50759863f70edb0874  user/hamnix/mkdir.ad
+30af704ed4eb61769e5cc7d21ec424aef50a2f786e1bc894336b25fe9f52ce21  user/hamnix/wc.ad
+4a5fa0d51203f78347bd6eedf740befc1e05fcc8a9b9d08450f159e2e829efc7  user/hamnix/head.ad
+8d4e96c82fb74c06b72f0e672477264c89a61b0ec7386c66f876aaffac86a7cd  user/hamnix/grep.ad
+f95df9759a8d15b3b06ca54d0545b3c81257d6b27dc34db2ca72d5c10aebd842  user/hamnix/hamsh.ad
+95969e5cbbd2529deb31733ef417b224cfe7c9fe9628f75deb99068455d74677  lib/p9.ad
+0f4c90e508ffef648a528b7fe920df8f8bdb9bcd8862e6cbac1354efef8c9b34  lib/perror.ad
+ad23d93c2860deaa1f0537e1f7c9e2e161b1cdb6a95a6ebf528037be3c579120  lib/regex.ad
+93e3582dcde57079d03d310a9df6c0962ec2ca8f51ebb63f4eac437486ba5bac  lib/hamcomplete.ad
+8f93b9abc28d8ee6aa2b3fbcf53ec64152c089b4823c764b798f11bfe28956c9  lib/passwd/passwd.ad

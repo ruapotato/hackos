@@ -642,7 +642,7 @@ def test_syscalls():
     printk1("   sleep_ms(50) measured %d jiffies (100 Hz)\n", cast[uint64](r[37]))
     check(cast[uint32](r[37] == 5 or r[37] == 6), "syscall: sleep_ms(50) takes 5 jiffies by get_jiffies")
     check(cast[uint32](r[61] == 0 and (r[62] == 3 or r[62] == 4)), "syscall: nanosleep(30 ms) takes 3 jiffies and clears the remaining time")
-    check(cast[uint32](r[38] >= 0x60C00000 and r[39] == 0 and r[40] == 0x12345678 and r[41] == 0 and r[42] == -22), "syscall: mmap gives zeroed user memory, munmap frees it once")
+    check(cast[uint32](r[38] >= 0x60F00000 and r[39] == 0 and r[40] == 0x12345678 and r[41] == 0 and r[42] == -22), "syscall: mmap gives zeroed user memory, munmap frees it once")
     check(cast[uint32](r[43] > 0 and r[44] == 0 and r[45] == 43), "syscall: thread_spawn + thread_join from user mode, exit code 43")
     check(cast[uint32](r[46] == 0 and r[47] == 100 and r[48] == 104 and r[52] == 104), "syscall: create (dir and file), fstat, dup shares the file offset")
     check(cast[uint32](r[49] == 0 and r[50] == 9 and r[51] == 1 and r[53] >= 0), "syscall: chdir, getcwd, relative and dot-dot paths")
@@ -677,11 +677,11 @@ def test_mpu():
     t: uint32 = spawn("deep-user", cast[uint64](&fault_stack_overflow), 1, 3, TF_USER)
     code: int64 = join(t)
     check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_kind == FAULT_STACK_OVERFLOW), "mpu: unprivileged stack overflow hits the guard, thread ended (139)")
-    check(cast[uint32](trap_last_addr >= 0x60C00000 and (trap_last_addr & 0x3FF) < 0x400 and trap_count == tc0 + 1), "mpu: the faulting address is inside the thread's user-stack guard")
+    check(cast[uint32](trap_last_addr >= 0x60F00000 and (trap_last_addr & 0x3FF) < 0x400 and trap_count == tc0 + 1), "mpu: the faulting address is inside the thread's user-stack guard")
     # (b) privileged stack overflow
     t = spawn("deep-kern", cast[uint64](&fault_stack_overflow), 1, 3, 0)
     code = join(t)
-    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_kind == FAULT_STACK_OVERFLOW and trap_last_addr < 0x60C00000 and trap_last_addr >= 0x60000000), "mpu: a kernel thread overflowing its stack is caught the same way")
+    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_kind == FAULT_STACK_OVERFLOW and trap_last_addr < 0x60400000 and trap_last_addr >= 0x60000000), "mpu: a kernel thread overflowing its stack is caught the same way")
     # (c) unprivileged read and write of kernel data
     t = spawn("peek", cast[uint64](&fault_read), cast[uint64](&mp_secret), 3, TF_USER)
     code = join(t)
@@ -1054,7 +1054,7 @@ def test_proc():
     ahi: uint32 = ta[0].mem_hi
     blo: uint32 = tb[0].mem_lo
     printk3("   two instances of ptest: blocks at 0x%x and 0x%x, %d bytes each\n", cast[uint64](alo), cast[uint64](blo), cast[uint64](ahi - alo))
-    check(cast[uint32](pa > 0 and pb > 0 and alo != blo and (ahi <= blo or tb[0].mem_hi <= alo) and alo >= 0x60600000 and ahi <= 0x60C00000), "proc: two instances of one program get separate blocks in the program arena")
+    check(cast[uint32](pa > 0 and pb > 0 and alo != blo and (ahi <= blo or tb[0].mem_hi <= alo) and alo >= 0x60400000 and ahi <= 0x60F00000), "proc: two instances of one program get separate blocks in the program arena")
     thread_sleep(20)
     # while both are alive: a third process tries to reach into the first
     tc0: uint32 = trap_count
@@ -1067,14 +1067,14 @@ def test_proc():
     check(cast[uint32](code == 139 and trap_last_addr == cast[uint32](cast[uint64](&failures))), "isolation: a process reading kernel data faults")
     code = run_prog("/bin/ptest", "peek", hexstr(cast[uint32](cast[uint64](&test_proc)) & 0xFFFFFFFC, &hx[0]), nul)
     check(cast[uint32](code == 139), "isolation: the kernel image's code is not readable by a process either")
-    code = run_prog("/bin/ptest", "peek", "60c00000", nul)
+    code = run_prog("/bin/ptest", "peek", "60f00000", nul)
     check(cast[uint32](code == 139), "isolation: nor is the arena of the in-image unprivileged threads")
     code = run_prog("/bin/ptest", "poke", "40004000", nul)
     check(cast[uint32](code == 139 and trap_last_addr == 0x40004000), "isolation: a process writing to a peripheral register faults")
     sb0: uint64 = sys_bad_ptr
     code = run_prog("/bin/ptest", "sysptr", hexstr(cast[uint32](cast[uint64](&failures)), &hx[0]), nul)
     check(cast[uint32](code == 14 and sys_bad_ptr == sb0 + 1), "isolation: the kernel refuses a system-call buffer outside the caller's block (EFAULT)")
-    code = run_prog("/bin/ptest", "sysptr", "60c00000", nul)
+    code = run_prog("/bin/ptest", "sysptr", "60f00000", nul)
     check(cast[uint32](code == 14), "isolation: ... including memory another kind of thread may use")
 
     # stack overflow: the stack is the bottom of the block

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- stand-in for Hamnix's lib/hamsdl_vk.ad (hamSDL's Vulkan-shaped rasteriser).
+#
+# Hamnix's shell imports hamSDL's Vulkan-shaped rasteriser for its `hamui` and `pygame` built-ins.
+# HackOS has no window system and no frame buffer, and the real libraries
+# would add 10.8 MB of static tables to the shell.  This module supplies the
+# names the shell imports, with Hamnix's signatures, so that user/hamnix/
+# hamsh.ad needs no change for it: every call fails or does nothing, and the
+# first one says why on the standard error stream.  Nothing here is copied
+# from Hamnix except the names, the parameter lists and the constants' values.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+hamsdl_vk_said: uint32 = 0
+
+
+def hamsdl_vk_none():
+    if hamsdl_vk_said == 0:
+        hamsdl_vk_said = 1
+        sys_write(2, "hamsh: no display on this system: the hamui and pygame built-ins do nothing\n", 76)
+
+
+
+
+def hamsdl_vk_begin(w: int32, h: int32):
+    hamsdl_vk_none()
+
+
+def hamsdl_vk_rasterize() -> int32:
+    hamsdl_vk_none()
+    return -1
+
+
+def hamsdl_vk_pixel(x: int32, y: int32) -> uint32:
+    hamsdl_vk_none()
+    return 0
+
+
+def hamsdl_vk_fb_rgb_ptr() -> Ptr[uint8]:
+    hamsdl_vk_none()
+    return cast[Ptr[uint8]](0)
+
+
+def hamsdl_vk_fb_rgb_bytes() -> uint64:
+    hamsdl_vk_none()
+    return 0
+
+
+def hamsdl_vk_ppm_header(out: Ptr[uint8]) -> uint64:
+    hamsdl_vk_none()
+    return 0

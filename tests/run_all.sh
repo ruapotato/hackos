@@ -127,7 +127,7 @@ expect "  ... C defining a bare C library name" $B/clink_bad.log "^R3: .*'strlen
 
 rm -f $B/*.bin
 echo "[test] === 3. static checks on the images"
-for img in hackos ktest selftest; do
+for img in hackos monitor ktest selftest; do
     undef="$("$NM" -u $B/$img.elf | wc -l)"
     [ "$undef" = 0 ] && ok "$img: no undefined symbols" || bad "$img: $undef undefined symbols"
 done
@@ -190,8 +190,8 @@ nfail="$(grep -c '^FAIL ' $B/ktest.txt)"; npass="$(grep -c '^PASS ' $B/ktest.txt
 [ "$npass" = "$EXPECTED_K" ] && ok "$npass PASS lines (all $EXPECTED_K checks ran)" || bad "$npass PASS lines, expected $EXPECTED_K"
 expect "RESULT: PASS" $B/ktest.txt '^RESULT: PASS'
 # the fault reports must name the thread
-expect "stack overflow reported with the thread's name (user)" $B/ktest.txt "thread [0-9]+ 'deep-user' ended: stack overflow at 0x60[c-f]"
-expect "stack overflow reported with the thread's name (kernel thread)" $B/ktest.txt "thread [0-9]+ 'deep-kern' ended: stack overflow at 0x60[0-b]"
+expect "stack overflow reported with the thread's name (user)" $B/ktest.txt "thread [0-9]+ 'deep-user' ended: stack overflow at 0x60f"
+expect "stack overflow reported with the thread's name (kernel thread)" $B/ktest.txt "thread [0-9]+ 'deep-kern' ended: stack overflow at 0x60[0-3]"
 expect "kernel-memory access reported with the thread's name" $B/ktest.txt "thread [0-9]+ 'peek' ended: unprivileged access violation at 0x20"
 expect "null pointer reported at address 0" $B/ktest.txt "'null-user' ended: unprivileged access violation at 0x00000000"
 expect "console echo: the typed line came back" $B/ktest.txt '^status report$'
@@ -215,7 +215,7 @@ else
 fi
 
 echo "[test] === 6. monitor session over the UART (real-time clock, commands typed by the harness)"
-qemu_start $B/hackos.elf $B/monitor.out
+qemu_start $B/monitor.elf $B/monitor.out
 p=0
 cmd() {  # send one command line and wait for the next prompt
     p=$((p+1))
@@ -294,6 +294,102 @@ pc="$(tr -d '\r' < $B/faulttest.out | awk '$1=="pc"{print $3}')"
 [ -n "$udf" ] && [ "$((pc))" = "$((0x$udf))" ] && ok "stacked pc ($pc) is the address of the udf instruction" \
     || bad "stacked pc '$pc' vs udf at '$udf'"
 grep -q 'continued past udf' $B/faulttest.out && bad "execution continued past the fault" || ok "execution did not continue past the fault"
+
+echo "[test] === 8. the shell: Hamnix's hamsh as a process on the UART console, running programs from /bin"
+# The session is typed into the emulated UART like the monitor session above.
+# hamsh redraws its prompt line at every keystroke, so prompts cannot be
+# counted; instead every command is followed by `wc < /dev/null`, whose output
+# "0 0 0" is never part of what was typed, and the harness waits for the n-th
+# one before it types the next command.
+qemu_start $B/hackos.elf $B/shell.out
+m=0
+sh() {  # type one command line, then the marker command; wait for the marker
+    m=$((m+1))
+    say "$1\\r"; say 'wc < /dev/null\r'
+    wait_for "0 0 0" $m || { bad "shell: no answer to command #$m ($1)"; return 1; }
+}
+shn() { say "$1\\r"; }  # type a command line without the marker (it reads no input, so the next line may be typed ahead)
+if wait_for "hamsh\$ "; then
+    sh 'echo hello from hamsh'
+    sh 'ls /bin'
+    sh 'ls /bin | wc'
+    sh 'ls /bin | grep ha'
+    sh 'ls /bin | grep h | head -2 | wc'
+    sh 'echo builtin in a pipeline | wc'
+    sh 'echo first line > /tmp/note'
+    sh 'echo second line >> /tmp/note'
+    sh 'cat /tmp/note'
+    sh 'wc < /tmp/note'
+    sh 'cat /tmp/note | grep second > /tmp/found'
+    sh 'cat /tmp/found'
+    sh 'cp /tmp/note /tmp/copy'
+    sh 'mkdir /tmp/dir'
+    sh 'ls /tmp'
+    sh 'rm /tmp/note'
+    sh 'cat /tmp/note'
+    sh 'head -1 < /tmp/copy'
+    shn '/bin/hello with two'      # no marker: the next line reads its status
+    sh 'echo status was $status'
+    sh 'cat /bin/hello | wc'
+    sh 'no-such-command'
+    sh 'ls /nowhere 2> /tmp/err'
+    sh 'cat /tmp/err'
+    shn 'ptest peek 20000000'
+    sh 'echo after the fault $status'
+    # a script file, written with the shell itself, run by a second hamsh
+    sh "echo 'echo script started' > /tmp/s.hsh"
+    sh "echo 'ls /bin | wc > /tmp/count' >> /tmp/s.hsh"
+    sh "echo 'cat /tmp/count' >> /tmp/s.hsh"
+    sh "echo 'n = 6 * 7' >> /tmp/s.hsh"
+    sh "echo 'for w in [\"alpha\", \"beta\"] { echo script word \$w }' >> /tmp/s.hsh"
+    sh "echo 'if n == 42 { echo script n is \$n }' >> /tmp/s.hsh"
+    sh "echo 'echo script piped | wc' >> /tmp/s.hsh"
+    sh "echo 'exit 5' >> /tmp/s.hsh"
+    shn 'hamsh /tmp/s.hsh'
+    sh 'echo script status $status'
+    say 'halt 0\r'
+else
+    bad "the shell never printed its prompt"
+fi
+qemu_wait; rc=$?
+# what the console showed: the line editor rewrites a line with CR, so keep
+# what follows the last one, and drop the escape sequences
+sed 's/\r*$//; s/.*\r//; s/\x1b\[[0-9;?]*[A-Za-z]//g' < $B/shell.out > $B/shell.txt
+cat $B/shell.txt
+S=$B/shell.txt
+NPROG="$(echo $(grep -c . <<< "$(ls $B/user | grep -v '\.')"))"
+[ $rc -eq 0 ] && ok "shell: 'halt 0' ended the run with status 0" || bad "shell: exit status $rc"
+expect "shell: banner of the system image" $S '^HackOS 0\.3 \(milestone 3\)'
+expect "shell: hamsh's own banner (it is running as a process)" $S "^hamsh . Hamnix shell"
+expect "shell: a built-in" $S '^hello from hamsh$'
+expect "shell: ls /bin lists the programs (an external command found through PATH)" $S '^hamsh$'
+expect "shell: ls | wc counts the $NPROG programs" $S "^$NPROG $NPROG [0-9]+\$"
+expect "shell: ls | grep" $S '^halt$'
+expect "shell: a four-stage pipeline" $S '^2 2 [0-9]+$'
+expect "shell: a built-in as the first stage of a pipeline" $S '^1 4 22$'
+expect "shell: > and >> to a file, read back with cat" $S '^second line$'
+expect "shell: < from a file" $S '^2 4 23$'
+nsec="$(grep -c '^second line$' $S)"
+[ "$nsec" = 2 ] && ok "shell: pipeline into a redirection (cat | grep > file), read back" || bad "shell: 'second line' seen $nsec times, expected 2"
+expect "shell: cp, mkdir, ls /tmp" $S '^copy$'
+expect "shell: mkdir" $S '^dir$'
+expect "shell: rm, then cat fails with the kernel's error string" $S '^cat: cannot open /tmp/note: .*file does not exist'
+expect "shell: head" $S '^first line$'
+expect "shell: arguments reach a program" $S '^  arg: two$'
+expect "shell: the exit status of a program (argc = 3)" $S '^status was 3$'
+expect "shell: a binary file through a pipe, byte count intact" $S "^[0-9]+ [0-9]+ $(stat -c %s $B/user/hello)\$"
+expect "shell: unknown command" $S '^hamsh: command not found: no-such-command$'
+expect "shell: 2> redirects the error stream" $S '^ls: listdir failed: /nowhere$'
+expect "shell: a faulting program is ended with a report" $S "process [0-9]+ 'ptest' ended: unprivileged access violation at 0x20000000"
+expect "shell: ... and the shell carries on, status 139" $S '^after the fault 139$'
+expect "shell: script file run by a second hamsh" $S '^script started$'
+expect "shell: script: pipeline into a file" $S "^$NPROG $NPROG [0-9]+\$"
+expect "shell: script: for loop" $S '^script word beta$'
+expect "shell: script: arithmetic and if" $S '^script n is 42$'
+expect "shell: script: built-in into a pipe" $S '^1 2 13$'
+expect "shell: script: exit status" $S '^script status 5$'
+nmark="$(grep -c '^0 0 0$' $S)"
+[ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"
 
 echo
 if [ $fails -eq 0 ]; then echo "[test] ALL TESTS PASSED"; exit 0; fi
