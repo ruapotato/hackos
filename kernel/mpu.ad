@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- memory protection unit (ARMv7-M PMSAv7; 16 regions on Cortex-M7).
+#
+# A region is a power-of-two block aligned to its own size; a higher-numbered
+# region overrides a lower one where they overlap.  Privileged code also gets
+# the default memory map wherever no region matches (CTRL.PRIVDEFENA), which
+# is how the kernel reaches the peripherals and the system control space.
+# Unprivileged code can touch only what a region grants.
+#
+# Fixed plan (addresses from the linker script):
+#
+#   #  range                       privileged   unprivileged  exec  purpose
+#   0  CODE, whole region          read-only    read-only     yes   text, constants
+#   1  0x00000000 + 4 KB           none         none          no    null-pointer guard
+#   2  kernel RAM, whole region    read/write   none          no    kernel data, MSP stack
+#   3  XRAM, whole region          read/write   none          no    big tables, kernel heap
+#   4  user arena (top of XRAM)    read/write   read/write    no    user stacks and heap
+#   6  1 KB at the bottom of the current thread's user stack    none / none
+#   7  1 KB at the bottom of the current thread's kernel stack  none / none
+#
+# Regions 6 and 7 are rewritten at every context switch (mpu_set_guards).
+#
+# What this does and does not give:
+#   * A stack that grows into its guard raises MemManage, in privileged code
+#     too (an explicit region beats the privileged default map).
+#   * A null pointer dereference within the first 4 KB faults for everyone,
+#     including a jump to address 0.  The vector table sits behind the guard;
+#     the core's own vector fetches do not go through the MPU.
+#   * Kernel data and the kernel heap are unreachable from unprivileged code;
+#     writing to code or constants faults for everyone.
+#   * User threads are NOT isolated from one another: they share one arena and
+#     may run any code in the image (there is one image; no program loader
+#     yet).  Per-program regions come with program loading.
+#   * A stack frame larger than the guard can step over it.
+
+from kernel.cpu import mmio_read32, mmio_write32, cpu_isb
+
+extern def __user_start()
+extern def __user_end()
+
+MPU_TYPE: uint64 = 0xE000ED90
+MPU_CTRL: uint64 = 0xE000ED94
+MPU_RNR: uint64 = 0xE000ED98
+MPU_RBAR: uint64 = 0xE000ED9C
+MPU_RASR: uint64 = 0xE000EDA0
+
+MPU_AP_NONE: uint32 = 0            # no access
+MPU_AP_PRIV_RW: uint32 = 1         # privileged read/write
+MPU_AP_FULL: uint32 = 3            # read/write for all
+MPU_AP_RO: uint32 = 6              # read-only for all
+MPU_XN: uint32 = 0x10000000
+
+mpu_enabled: uint32 = 0
+
+
+# log2(size) for a power of two >= 32.
+def _log2(size: uint32) -> uint32:
+    n: uint32 = 0
+    while (cast[uint32](1) << n) < size:
+        n = n + 1
+    return n
+
+
+def mpu_region(n: uint32, base: uint32, size: uint32, ap: uint32, xn: uint32):
+    mmio_write32(MPU_RNR, n)
+    mmio_write32(MPU_RBAR, base & 0xFFFFFFE0)
+    # normal memory, not shareable (TEX=0 C=1 B=0), all sub-regions enabled
+    mmio_write32(MPU_RASR, xn | (ap << 24) | 0x00020000 | ((_log2(size) - 1) << 1) | 1)
+
+
+def mpu_region_off(n: uint32):
+    mmio_write32(MPU_RNR, n)
+    mmio_write32(MPU_RASR, 0)
+
+
+def mpu_regions() -> uint32:
+    return (mmio_read32(MPU_TYPE) >> 8) & 0xFF
+
+
+def mpu_init():
+    mmio_write32(MPU_CTRL, 0)
+    n: uint32 = 0
+    while n < mpu_regions():
+        mpu_region_off(n)
+        n = n + 1
+    ustart: uint32 = cast[uint32](cast[uint64](&__user_start))
+    usize: uint32 = cast[uint32](cast[uint64](&__user_end)) - ustart
+    mpu_region(0, 0x00000000, 0x400000, MPU_AP_RO, 0)
+    mpu_region(1, 0x00000000, 0x1000, MPU_AP_NONE, MPU_XN)
+    mpu_region(2, 0x20000000, 0x400000, MPU_AP_PRIV_RW, MPU_XN)
+    mpu_region(3, 0x60000000, 0x1000000, MPU_AP_PRIV_RW, MPU_XN)
+    mpu_region(4, ustart, usize, MPU_AP_FULL, MPU_XN)
+    # ENABLE | PRIVDEFENA; HFNMIENA stays 0: the MPU is off inside HardFault
+    # and NMI, so the fatal-fault report can always run.
+    mmio_write32(MPU_CTRL, 5)
+    cpu_isb()
+    mpu_enabled = 1
+
+
+# Stack guards of the thread about to run (0 = that stack does not exist).
+def mpu_set_guards(ustack_base: uint64, kstack_base: uint64):
+    if mpu_enabled == 0:
+        return
+    if ustack_base != 0:
+        mmio_write32(MPU_RBAR, (cast[uint32](ustack_base) & 0xFFFFFFE0) | 0x16)     # VALID | region 6
+        mmio_write32(MPU_RASR, MPU_XN | 0x00020000 | (9 << 1) | 1)                    # 1 KB, no access
+    else:
+        mmio_write32(MPU_RNR, 6)
+        mmio_write32(MPU_RASR, 0)
+    mmio_write32(MPU_RBAR, (cast[uint32](kstack_base) & 0xFFFFFFE0) | 0x17)
+    mmio_write32(MPU_RASR, MPU_XN | 0x00020000 | (9 << 1) | 1)

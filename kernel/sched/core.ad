@@ -1,0 +1,681 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- threads and the scheduler.
+#
+# The file sits at kernel/sched/core.ad because that is where Hamnix keeps its
+# scheduler: files ported from Hamnix import `set_current_errstr` and
+# `current_task_uid` from this path.  Nothing else here comes from Hamnix.
+#
+# Model
+#   * Preemptive, fixed priorities 0 (highest) .. 7 (the idle thread), round
+#     robin inside a priority with a time slice of SCHED_SLICE ticks.
+#   * Threads run in thread mode on the process stack (PSP); every exception
+#     handler runs on the main stack (MSP).  The context switch is the PendSV
+#     exception (arch/armv7m/switch.S); SysTick, the UART interrupt and SVCall
+#     all have priority 0x80 and so never preempt one another; PendSV has the
+#     lowest priority and runs when they have all returned.
+#   * A critical section is `irq = cpu_irq_save() ... cpu_irq_restore(irq)`
+#     (BASEPRI = 0x40): it holds off every kernel-aware interrupt and the
+#     context switch.  All scheduler state is only touched inside one.
+#   * A "user" thread runs unprivileged on a stack in the user arena and
+#     enters the kernel through SVC; while it executes a system call it runs
+#     privileged, in thread mode, on its own kernel stack, so a system call
+#     may block like any kernel code.
+#
+# The first eight fields of Thread are read and written by switch.S at fixed
+# offsets; do not move them.
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq_disable, mmio_read32, mmio_write32
+from kernel.rt import rt_memset
+from mm.slab import kmalloc_aligned, kfree, umalloc_aligned, ufree
+from kernel.mpu import mpu_set_guards
+from boards.mps2_an500.board import board_cpu_hz
+
+THREAD_MAX: uint32 = 32
+SCHED_PRIOS: uint32 = 8
+SCHED_HZ: uint32 = 1000
+SCHED_SLICE: uint32 = 10
+STACK_GUARD: uint32 = 1024         # no-access MPU region at the bottom of a stack
+KSTACK_DEFAULT: uint32 = 16384
+STACK_FILL: uint32 = 0xA5A5A5A5
+
+T_UNUSED: uint32 = 0
+T_READY: uint32 = 1
+T_RUNNING: uint32 = 2
+T_BLOCKED: uint32 = 3
+T_ZOMBIE: uint32 = 4
+
+TF_USER: uint32 = 1                # runs unprivileged, has a user stack
+TF_DETACHED: uint32 = 2            # reaped by the idle thread, not joinable
+
+WAKE_OK: uint32 = 0
+WAKE_TIMEOUT: uint32 = 1
+WAIT_FOREVER: uint64 = 0xFFFFFFFFFFFFFFFF
+
+
+class WaitQueue:
+    head: uint64                    # Ptr[Thread], FIFO
+    tail: uint64
+
+
+class Thread:
+    # ---- switch.S offsets 0..28 ----
+    sp: uint32                      # 0  saved PSP (points at the saved r4-r11)
+    exc_return: uint32              # 4  EXC_RETURN to resume with (bit 4: no FP frame)
+    control: uint32                 # 8  CONTROL.nPRIV to resume with
+    usp: uint32                     # 12 caller's exception frame while in a system call, else 0
+    svc_exc: uint32                 # 16 EXC_RETURN of the SVC that entered the system call
+    kstack_top: uint32              # 20 top of the kernel stack
+    svc_ctrl: uint32                # 24 CONTROL.nPRIV of the system-call caller
+    pad0: uint32                    # 28
+    # ---- scheduler ----
+    tid: uint32
+    state: volatile uint32          # written by interrupt handlers
+    prio: uint32                    # effective priority
+    base_prio: uint32
+    slice: uint32
+    flags: uint32
+    wake_reason: uint32
+    on_timer: uint32
+    next: uint64                    # ready-queue or wait-queue link (Ptr[Thread])
+    wq: uint64                      # Ptr[WaitQueue] this thread is queued on, or 0
+    tnext: uint64                   # timer-queue link
+    wake_tick: uint64
+    exit_code: int64
+    join_wq: WaitQueue
+    kstack_base: uint64             # lowest address = guard base
+    kstack_size: uint64
+    ustack_base: uint64
+    ustack_size: uint64
+    cpu_ticks: uint64
+    switches: uint64
+    fault_kind: uint32              # non-zero when the thread was ended by a fault
+    fault_addr: uint32
+    uid: uint32
+    pad1: uint32
+    # ---- per-thread kernel state used by other subsystems ----
+    fd: Array[16, int32]            # open-file table indices, -1 = closed (fs/hvfs.ad)
+    cwd: Array[128, uint8]
+    errstr: Array[64, uint8]
+    name: Array[16, uint8]
+
+
+threads: Array[32, Thread]
+sched_current: uint64 = 0           # Ptr[Thread]; read by switch.S
+sched_running: uint32 = 0
+sched_ticks: volatile uint64 = 0
+sched_switches: uint64 = 0
+sched_next_tid: uint32 = 1
+rq_head: Array[8, uint64]
+rq_tail: Array[8, uint64]
+timer_head: uint64 = 0
+# Called with the exiting thread before it becomes a zombie (closes its files).
+sched_exit_hook: Fn[int64, uint64]
+sched_exit_hook_set: uint32 = 0
+# Called for a new thread with (child, parent) to inherit files and cwd.
+sched_spawn_hook: Fn[int64, uint64, uint64]
+sched_spawn_hook_set: uint32 = 0
+
+extern def sched_launch()
+extern def uthread_exit_stub()
+
+
+def thr(p: uint64) -> Ptr[Thread]:
+    return cast[Ptr[Thread]](p)
+
+
+def current_thread() -> Ptr[Thread]:
+    return cast[Ptr[Thread]](sched_current)
+
+
+def sched_pend_switch():
+    mmio_write32(0xE000ED04, 0x10000000)        # ICSR.PENDSVSET
+
+
+def sched_in_handler() -> uint32:
+    if cpu_ipsr() != 0:
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------- ready queues
+def _rq_push(t: uint64):
+    p: uint32 = thr(t)[0].prio
+    thr(t)[0].next = 0
+    if rq_tail[p] != 0:
+        thr(rq_tail[p])[0].next = t
+    else:
+        rq_head[p] = t
+    rq_tail[p] = t
+
+
+def _rq_pop() -> uint64:
+    p: uint32 = 0
+    while p < SCHED_PRIOS:
+        t: uint64 = rq_head[p]
+        if t != 0:
+            rq_head[p] = thr(t)[0].next
+            if rq_head[p] == 0:
+                rq_tail[p] = 0
+            thr(t)[0].next = 0
+            return t
+        p = p + 1
+    return 0
+
+
+def _rq_remove(t: uint64):
+    p: uint32 = thr(t)[0].prio
+    prev: uint64 = 0
+    cur: uint64 = rq_head[p]
+    while cur != 0:
+        if cur == t:
+            nx: uint64 = thr(cur)[0].next
+            if prev != 0:
+                thr(prev)[0].next = nx
+            else:
+                rq_head[p] = nx
+            if rq_tail[p] == t:
+                rq_tail[p] = prev
+            thr(t)[0].next = 0
+            return
+        prev = cur
+        cur = thr(cur)[0].next
+
+
+# Highest priority (lowest number) with a ready thread, or SCHED_PRIOS.
+def _rq_best() -> uint32:
+    p: uint32 = 0
+    while p < SCHED_PRIOS:
+        if rq_head[p] != 0:
+            return p
+        p = p + 1
+    return SCHED_PRIOS
+
+
+# Make `t` ready; ask for a switch when it should run before the current thread.
+def _make_ready(t: uint64):
+    thr(t)[0].state = T_READY
+    _rq_push(t)
+    if sched_running != 0 and thr(t)[0].prio < thr(sched_current)[0].prio:
+        sched_pend_switch()
+
+
+# ---------------------------------------------------------------- wait queues
+def wq_init(wq: Ptr[WaitQueue]):
+    wq[0].head = 0
+    wq[0].tail = 0
+
+
+def _wq_push(wq: Ptr[WaitQueue], t: uint64):
+    thr(t)[0].next = 0
+    if wq[0].tail != 0:
+        thr(wq[0].tail)[0].next = t
+    else:
+        wq[0].head = t
+    wq[0].tail = t
+    thr(t)[0].wq = cast[uint64](wq)
+
+
+def _wq_remove(wq: Ptr[WaitQueue], t: uint64):
+    prev: uint64 = 0
+    cur: uint64 = wq[0].head
+    while cur != 0:
+        if cur == t:
+            nx: uint64 = thr(cur)[0].next
+            if prev != 0:
+                thr(prev)[0].next = nx
+            else:
+                wq[0].head = nx
+            if wq[0].tail == t:
+                wq[0].tail = prev
+            break
+        prev = cur
+        cur = thr(cur)[0].next
+    thr(t)[0].next = 0
+    thr(t)[0].wq = 0
+
+
+# ---------------------------------------------------------------- timer queue
+# Sleeping threads and timed waits, sorted by wake-up tick.
+def _timer_add(t: uint64, when: uint64):
+    thr(t)[0].wake_tick = when
+    thr(t)[0].on_timer = 1
+    prev: uint64 = 0
+    cur: uint64 = timer_head
+    while cur != 0 and thr(cur)[0].wake_tick <= when:
+        prev = cur
+        cur = thr(cur)[0].tnext
+    thr(t)[0].tnext = cur
+    if prev != 0:
+        thr(prev)[0].tnext = t
+    else:
+        timer_head = t
+
+
+def _timer_remove(t: uint64):
+    if thr(t)[0].on_timer == 0:
+        return
+    prev: uint64 = 0
+    cur: uint64 = timer_head
+    while cur != 0:
+        if cur == t:
+            if prev != 0:
+                thr(prev)[0].tnext = thr(cur)[0].tnext
+            else:
+                timer_head = thr(cur)[0].tnext
+            break
+        prev = cur
+        cur = thr(cur)[0].tnext
+    thr(t)[0].tnext = 0
+    thr(t)[0].on_timer = 0
+
+
+# Block the current thread.  Call inside a critical section with the thread
+# already queued wherever its waker will look; the section is left for the
+# duration of the wait and re-entered before returning.  `timeout` is in
+# ticks (WAIT_FOREVER = none).  Returns WAKE_OK or WAKE_TIMEOUT.
+def _block_current(timeout: uint64) -> uint32:
+    t: uint64 = sched_current
+    thr(t)[0].state = T_BLOCKED
+    thr(t)[0].wake_reason = WAKE_OK
+    if timeout != WAIT_FOREVER:
+        _timer_add(t, sched_ticks + timeout)
+    sched_pend_switch()
+    cpu_irq_restore(0)
+    # PendSV is taken as soon as BASEPRI drops; the loop covers the few
+    # instructions the core may still execute before it does.
+    while thr(t)[0].state == T_BLOCKED:
+        t = t
+    cpu_irq_save()
+    return thr(t)[0].wake_reason
+
+
+# Wait on `wq`.  Must be called in thread mode inside a critical section.
+def wq_wait(wq: Ptr[WaitQueue], timeout: uint64) -> uint32:
+    _wq_push(wq, sched_current)
+    return _block_current(timeout)
+
+
+def _wake(t: uint64, reason: uint32):
+    if thr(t)[0].wq != 0:
+        _wq_remove(cast[Ptr[WaitQueue]](thr(t)[0].wq), t)
+    _timer_remove(t)
+    thr(t)[0].wake_reason = reason
+    _make_ready(t)
+
+
+# Wake the longest waiter.  Safe from interrupt handlers.  Returns 1 if a
+# thread was woken.
+def wq_wake_one(wq: Ptr[WaitQueue]) -> uint32:
+    irq: uint32 = cpu_irq_save()
+    t: uint64 = wq[0].head
+    if t != 0:
+        _wake(t, WAKE_OK)
+    cpu_irq_restore(irq)
+    if t != 0:
+        return 1
+    return 0
+
+
+def wq_wake_all(wq: Ptr[WaitQueue]) -> uint32:
+    n: uint32 = 0
+    irq: uint32 = cpu_irq_save()
+    while wq[0].head != 0:
+        _wake(wq[0].head, WAKE_OK)
+        n = n + 1
+    cpu_irq_restore(irq)
+    return n
+
+
+# Highest-priority waiter (FIFO among equals), or 0.  Critical section only.
+def wq_best(wq: Ptr[WaitQueue]) -> uint64:
+    best: uint64 = 0
+    cur: uint64 = wq[0].head
+    while cur != 0:
+        if best == 0 or thr(cur)[0].prio < thr(best)[0].prio:
+            best = cur
+        cur = thr(cur)[0].next
+    return best
+
+
+def wq_wake_thread(t: uint64):
+    irq: uint32 = cpu_irq_save()
+    if thr(t)[0].state == T_BLOCKED:
+        _wake(t, WAKE_OK)
+    cpu_irq_restore(irq)
+
+
+# Change a thread's effective priority (priority inheritance).  Critical
+# section only.
+def sched_set_prio(t: uint64, prio: uint32):
+    if thr(t)[0].prio == prio:
+        return
+    if thr(t)[0].state == T_READY:
+        _rq_remove(t)
+        thr(t)[0].prio = prio
+        _make_ready(t)
+    else:
+        thr(t)[0].prio = prio
+        if t == sched_current and _rq_best() < prio:
+            sched_pend_switch()
+
+
+# ---------------------------------------------------------------- the switch
+# Called by the PendSV handler with kernel interrupts masked, after the
+# outgoing thread's context has been saved.  Chooses the next thread and makes
+# it current; the handler then restores from sched_current.
+def sched_pick():
+    cur: uint64 = sched_current
+    if thr(cur)[0].state == T_RUNNING:
+        thr(cur)[0].state = T_READY
+        _rq_push(cur)
+    nxt: uint64 = _rq_pop()
+    thr(nxt)[0].state = T_RUNNING
+    thr(nxt)[0].slice = SCHED_SLICE
+    if nxt != cur:
+        thr(nxt)[0].switches = thr(nxt)[0].switches + 1
+        sched_switches = sched_switches + 1
+        mpu_set_guards(thr(nxt)[0].ustack_base, thr(nxt)[0].kstack_base)
+    sched_current = nxt
+
+
+# Exception 15, once per tick.
+def systick_handler():
+    irq: uint32 = cpu_irq_save()
+    sched_ticks = sched_ticks + 1
+    now: uint64 = sched_ticks
+    cur: uint64 = sched_current
+    thr(cur)[0].cpu_ticks = thr(cur)[0].cpu_ticks + 1
+    while timer_head != 0 and thr(timer_head)[0].wake_tick <= now:
+        _wake(timer_head, WAKE_TIMEOUT)
+    if thr(cur)[0].slice > 0:
+        thr(cur)[0].slice = thr(cur)[0].slice - 1
+    if thr(cur)[0].slice == 0:
+        if _rq_best() <= thr(cur)[0].prio:
+            sched_pend_switch()
+        else:
+            thr(cur)[0].slice = SCHED_SLICE
+    cpu_irq_restore(irq)
+
+
+def sched_now() -> uint64:
+    irq: uint32 = cpu_irq_save()
+    t: uint64 = sched_ticks
+    cpu_irq_restore(irq)
+    return t
+
+
+# ---------------------------------------------------------------- thread API
+def thread_yield():
+    if sched_running == 0 or sched_in_handler() != 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    thr(sched_current)[0].slice = 0
+    sched_pend_switch()
+    cpu_irq_restore(irq)
+
+
+# Sleep for `ticks` scheduler ticks (1 ms each).  The thread becomes ready on
+# the tick interrupt numbered now + ticks.
+def thread_sleep(ticks: uint64):
+    if ticks == 0:
+        thread_yield()
+        return
+    irq: uint32 = cpu_irq_save()
+    _block_current(ticks)
+    cpu_irq_restore(irq)
+
+
+def _copy_name(dst: Ptr[uint8], src: Ptr[uint8], cap: uint32):
+    i: uint32 = 0
+    while i + 1 < cap and src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+
+
+def _free_stacks(t: uint64):
+    if thr(t)[0].kstack_base != 0:
+        kfree(thr(t)[0].kstack_base)
+        thr(t)[0].kstack_base = 0
+    if thr(t)[0].ustack_base != 0:
+        ufree(thr(t)[0].ustack_base)
+        thr(t)[0].ustack_base = 0
+
+
+# Create a thread that starts in `entry(arg)`; `entry` is the address of a
+# function `def f(arg: uint64) -> int64` whose result becomes the exit code.
+# `stack_size` is the size of the stack the thread's own code runs on (the
+# user stack for TF_USER, otherwise the kernel stack), guard included.
+# Returns the thread, or a null pointer when out of slots or memory.
+def thread_create(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, stack_size: uint32, flags: uint32) -> Ptr[Thread]:
+    if prio >= SCHED_PRIOS:
+        prio = SCHED_PRIOS - 1
+    ssz: uint32 = (stack_size + 1023) & 0xFFFFFC00
+    if ssz < 2048:
+        ssz = 2048
+    irq: uint32 = cpu_irq_save()
+    slot: uint32 = 0
+    while slot < THREAD_MAX and threads[slot].state != T_UNUSED:
+        slot = slot + 1
+    if slot == THREAD_MAX:
+        cpu_irq_restore(irq)
+        return cast[Ptr[Thread]](0)
+    t: Ptr[Thread] = &threads[slot]
+    rt_memset(cast[uint64](t), 0, sizeof(Thread))
+    t[0].state = T_BLOCKED          # claimed; not yet runnable
+    t[0].tid = sched_next_tid
+    sched_next_tid = sched_next_tid + 1
+    cpu_irq_restore(irq)
+
+    ksz: uint32 = ssz
+    if (flags & TF_USER) != 0:
+        ksz = KSTACK_DEFAULT
+        t[0].ustack_base = umalloc_aligned(cast[uint64](ssz), cast[uint64](STACK_GUARD))
+        t[0].ustack_size = cast[uint64](ssz)
+    t[0].kstack_base = kmalloc_aligned(cast[uint64](ksz), cast[uint64](STACK_GUARD))
+    t[0].kstack_size = cast[uint64](ksz)
+    if t[0].kstack_base == 0 or ((flags & TF_USER) != 0 and t[0].ustack_base == 0):
+        _free_stacks(cast[uint64](t))
+        t[0].state = T_UNUSED
+        return cast[Ptr[Thread]](0)
+    t[0].kstack_top = cast[uint32](t[0].kstack_base) + ksz
+    # Fill the stacks so the high-water mark can be measured later.
+    kw: Ptr[uint32] = cast[Ptr[uint32]](t[0].kstack_base)
+    i: uint32 = 0
+    while i < ksz / 4:
+        kw[i] = STACK_FILL
+        i = i + 1
+    top: uint32 = t[0].kstack_top
+    if (flags & TF_USER) != 0:
+        uw: Ptr[uint32] = cast[Ptr[uint32]](t[0].ustack_base)
+        i = 0
+        while i < ssz / 4:
+            uw[i] = STACK_FILL
+            i = i + 1
+        top = cast[uint32](t[0].ustack_base) + ssz
+    # Initial context: {r4-r11} then the exception frame the first switch
+    # "returns" through.
+    f: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](top - 64))
+    i = 0
+    while i < 16:
+        f[i] = 0
+        i = i + 1
+    f[8] = cast[uint32](arg)                     # r0: arg, low word
+    f[9] = cast[uint32](arg >> 32)               # r1: arg, high word
+    if (flags & TF_USER) != 0:
+        f[13] = cast[uint32](cast[uint64](&uthread_exit_stub)) | 1     # lr
+    else:
+        f[13] = cast[uint32](cast[uint64](&thread_exit)) | 1
+    f[14] = cast[uint32](entry) & 0xFFFFFFFE     # pc
+    f[15] = 0x01000000                           # xPSR: Thumb
+    t[0].sp = top - 64
+    t[0].exc_return = 0xFFFFFFFD                 # thread mode, PSP, no FP frame
+    t[0].control = flags & TF_USER               # nPRIV
+    t[0].prio = prio
+    t[0].base_prio = prio
+    t[0].flags = flags
+    t[0].uid = 1
+    _copy_name(&t[0].name[0], name, 16)
+    i = 0
+    while i < 16:
+        t[0].fd[i] = -1
+        i = i + 1
+    t[0].cwd[0] = 47
+    t[0].cwd[1] = 0
+    if sched_spawn_hook_set != 0 and sched_current != 0:
+        sched_spawn_hook(cast[uint64](t), sched_current)
+    irq = cpu_irq_save()
+    _make_ready(cast[uint64](t))
+    cpu_irq_restore(irq)
+    return t
+
+
+def thread_by_tid(tid: uint32) -> Ptr[Thread]:
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        if threads[i].state != T_UNUSED and threads[i].tid == tid:
+            return &threads[i]
+        i = i + 1
+    return cast[Ptr[Thread]](0)
+
+
+# End the current thread.  Does not return.
+def thread_exit(code: int64) -> int64:
+    t: uint64 = sched_current
+    if sched_exit_hook_set != 0:
+        sched_exit_hook(t)
+    irq: uint32 = cpu_irq_save()
+    thr(t)[0].exit_code = code
+    thr(t)[0].state = T_ZOMBIE
+    while thr(t)[0].join_wq.head != 0:
+        _wake(thr(t)[0].join_wq.head, WAKE_OK)
+    sched_pend_switch()
+    cpu_irq_restore(0)
+    while 1 == 1:
+        t = t
+    return 0
+
+
+# End another thread from a fault handler (handler mode): `t` is the current
+# thread and will never run again.  The caller pends the switch.
+def thread_kill_current_from_fault(code: int64, kind: uint32, addr: uint32):
+    t: uint64 = sched_current
+    irq: uint32 = cpu_irq_save()
+    thr(t)[0].exit_code = code
+    thr(t)[0].fault_kind = kind
+    thr(t)[0].fault_addr = addr
+    thr(t)[0].state = T_ZOMBIE
+    thr(t)[0].usp = 0
+    while thr(t)[0].join_wq.head != 0:
+        _wake(thr(t)[0].join_wq.head, WAKE_OK)
+    sched_pend_switch()
+    cpu_irq_restore(irq)
+
+
+def _reap(t: Ptr[Thread]):
+    _free_stacks(cast[uint64](t))
+    t[0].state = T_UNUSED
+
+
+# Wait for thread `tid` to end, store its exit code and release it.
+# Returns 0, -3 (ESRCH: no such thread), -22 (EINVAL: detached or self).
+def thread_join(tid: uint32, code_out: Ptr[int64]) -> int32:
+    t: Ptr[Thread] = thread_by_tid(tid)
+    if t == cast[Ptr[Thread]](0):
+        return -3
+    if (t[0].flags & TF_DETACHED) != 0 or cast[uint64](t) == sched_current:
+        return -22
+    irq: uint32 = cpu_irq_save()
+    while t[0].state != T_ZOMBIE:
+        wq_wait(&t[0].join_wq, WAIT_FOREVER)
+    cpu_irq_restore(irq)
+    if code_out != cast[Ptr[int64]](0):
+        code_out[0] = t[0].exit_code
+    _reap(t)
+    return 0
+
+
+def thread_detach(t: Ptr[Thread]):
+    t[0].flags = t[0].flags | TF_DETACHED
+
+
+# Bytes of a stack that were never written (the fill pattern is intact),
+# counted from the guard upwards.
+def _stack_unused(base: uint64, size: uint64) -> uint64:
+    if base == 0:
+        return 0
+    w: Ptr[uint32] = cast[Ptr[uint32]](base)
+    n: uint64 = cast[uint64](STACK_GUARD) / 4
+    lim: uint64 = size / 4
+    while n < lim and w[n] == STACK_FILL:
+        n = n + 1
+    return n * 4 - cast[uint64](STACK_GUARD)
+
+
+# High-water mark: the most stack the thread has used so far, in bytes.
+def thread_kstack_used(t: Ptr[Thread]) -> uint64:
+    return t[0].kstack_size - cast[uint64](STACK_GUARD) - _stack_unused(t[0].kstack_base, t[0].kstack_size)
+
+
+def thread_ustack_used(t: Ptr[Thread]) -> uint64:
+    if t[0].ustack_base == 0:
+        return 0
+    return t[0].ustack_size - cast[uint64](STACK_GUARD) - _stack_unused(t[0].ustack_base, t[0].ustack_size)
+
+
+# ---------------------------------------------------------------- Hamnix names
+def set_current_errstr(s: Ptr[uint8]):
+    if sched_current == 0:
+        return
+    _copy_name(&thr(sched_current)[0].errstr[0], s, 64)
+
+
+def current_task_uid() -> uint32:
+    if sched_current == 0:
+        return 1
+    return thr(sched_current)[0].uid
+
+
+# ---------------------------------------------------------------- idle, start
+def _idle_main(arg: uint64) -> int64:
+    while 1 == 1:
+        i: uint32 = 0
+        while i < THREAD_MAX:
+            if threads[i].state == T_ZOMBIE and (threads[i].flags & TF_DETACHED) != 0:
+                _reap(&threads[i])
+            i = i + 1
+        cpu_wfi()
+    return 0
+
+
+def sched_init():
+    rt_memset(cast[uint64](&threads[0]), 0, sizeof(Thread) * cast[uint64](THREAD_MAX))
+    p: uint32 = 0
+    while p < SCHED_PRIOS:
+        rq_head[p] = 0
+        rq_tail[p] = 0
+        p = p + 1
+    timer_head = 0
+    sched_current = 0
+    sched_running = 0
+    thread_create("idle", cast[uint64](&_idle_main), 0, SCHED_PRIOS - 1, 2048, 0)
+
+
+# Start scheduling: never returns.  Interrupt priorities: SVCall, SysTick and
+# the device interrupts 0x80; PendSV 0xF0 (lowest).
+def sched_start():
+    cpu_irq_disable()
+    mmio_write32(0xE000ED1C, 0x80000000)                       # SHPR2: SVCall
+    mmio_write32(0xE000ED20, 0x80F00000)                       # SHPR3: SysTick, PendSV
+    nxt: uint64 = _rq_pop()
+    thr(nxt)[0].state = T_RUNNING
+    thr(nxt)[0].slice = SCHED_SLICE
+    sched_current = nxt
+    mpu_set_guards(thr(nxt)[0].ustack_base, thr(nxt)[0].kstack_base)
+    sched_running = 1
+    mmio_write32(0xE000E010, 0)
+    mmio_write32(0xE000E014, board_cpu_hz() / SCHED_HZ - 1)
+    mmio_write32(0xE000E018, 0)
+    mmio_write32(0xE000E010, 7)
+    sched_launch()
