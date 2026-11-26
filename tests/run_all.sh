@@ -72,7 +72,7 @@ grep -q 'HackOS FAULT: UsageFault (exception 6)' $B/faulttest.out && ok "reporte
 grep -q 'CFSR  = 0x00010000' $B/faulttest.out && ok "CFSR = 0x00010000 (UFSR.UNDEFINSTR)" || bad "CFSR not 0x00010000"
 grep -q 'UFSR.UNDEFINSTR' $B/faulttest.out && ok "UNDEFINSTR decoded" || bad "UNDEFINSTR not decoded"
 udf="$(awk '/\tudf\t/{sub(":","",$1); print $1; exit}' $B/faulttest.lst)"
-pc="$(awk '$1=="pc"{print $3}' $B/faulttest.out)"
+pc="$(tr -d '\r' < $B/faulttest.out | awk '$1=="pc"{print $3}')"
 [ -n "$udf" ] && [ "$((pc))" = "$((0x$udf))" ] && ok "stacked pc ($pc) is the address of the udf instruction" \
     || bad "stacked pc '$pc' vs udf at '$udf'"
 grep -q 'continued past udf' $B/faulttest.out && bad "execution continued past the fault" || ok "execution did not continue past the fault"
