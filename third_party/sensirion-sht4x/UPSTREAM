@@ -1,0 +1,29 @@
+Sensirion SHT4x embedded I2C driver -- third-party code, unmodified.
+
+Upstream:   https://github.com/Sensirion/embedded-i2c-sht4x
+Commit:     1b6d7148a704618ff5fdedf3b13247f5cdc3f5e5 (2025-11-05, default branch;
+            the latest release named in its CHANGELOG.md is 1.1.0, 2024-04-10)
+Fetched:    2026-11-26 with `git clone --depth 1`
+Licence:    BSD-3-Clause, Copyright (c) 2024 Sensirion AG (file LICENSE here).
+            BSD-3-Clause code may be combined with and distributed as part of
+            an AGPL-3.0-or-later work; its copyright notice, conditions and
+            disclaimer must be kept (they are, in every file and in LICENSE).
+            This is the usual reading, not legal advice.
+
+Files taken, byte for byte (sha256 below; `make test` verifies them):
+51d9fcd3c5373d561b852b66f43c1cc867276528061eff9395ae7390f9f9d8fb  LICENSE
+f06b750aff5013b81cf0ec8c8dbc4b7a48fcbfb89bf0e570ea34c94c78259522  sht4x_i2c.c
+ba79f7e6420b3a8b79844edd1c20e943bb8732dfe257bb745f4cab8c257ff1f8  sht4x_i2c.h
+e1edf28ca40f542106b4c1fcc96bf29cdd17e134945650225e57ab4423a748cb  sensirion_i2c.c
+75eb5af1bea249d238df54e630a09d5694829f793915189f1daf06bc4035056f  sensirion_i2c.h
+a73ce005b82b47142b50e2076376c1c6dd57315c1d518aafb5c1322f7f02ad78  sensirion_common.c
+1eacae5f8381881562d30fd3ef11edd4d5a666b93baf6b3f07f5b6025a0946f2  sensirion_common.h
+76a6211089ac94f9b5f54f401f8e329fae2a25c5d8e5eb079c4abad75cfc4dbd  sensirion_config.h
+a086c8c9d6e59baf2584d827476084fa8048d79efd997807b2471aa95f0df65d  sensirion_i2c_hal.h
+
+Not taken: sensirion_i2c_hal.c (the empty porting template -- HackOS
+implements that interface in Adder, drivers/i2c/sensirion_hal.ad), the example
+program, the sample implementations for other platforms, and the test files.
+
+What it needs from a C library: <stdint.h>, <stdbool.h> (compiler headers) and
+<stdlib.h> for NULL (lib/cshim/include).  It calls no library function.
