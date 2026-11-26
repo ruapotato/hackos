@@ -27,7 +27,7 @@
 # Descriptors are per thread; a new thread gets copies of its creator's.
 
 from kernel.sched.core import Thread, thr, current_thread, sched_current, set_current_errstr, sched_exit_hook, sched_exit_hook_set, sched_spawn_hook, sched_spawn_hook_set
-from kernel.sync import Mutex, mutex_init, mutex_lock, mutex_unlock, memcpy, memset, spinlock_lock, spinlock_unlock
+from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock, memcpy, memset, spinlock_lock, spinlock_unlock
 from kernel.rt import rt_memcpy, rt_memset
 from mm.slab import kmalloc, kfree
 from drivers.tty.console import console_read, console_write
@@ -754,6 +754,7 @@ def _vfs_thread_spawn(childp: uint64, parentp: uint64) -> int64:
 # Mount the root tmpfs and /dev, create the standard directories.
 def vfs_init():
     mutex_init(&fs_lock)
+    mutex_register(&fs_lock)
     i: uint32 = 0
     while i < VFS_NR_OPEN:
         ofiles[i].refs = 0

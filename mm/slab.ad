@@ -19,6 +19,8 @@ extern def __heap_start()
 extern def __heap_end()
 extern def __user_start()
 extern def __user_end()
+extern def __prog_start()
+extern def __prog_end()
 
 # Site tags used by the Hamnix files that HackOS carries.  The values are
 # Hamnix's (mm/slab.ad, commit 1c5d976a) so its debug output stays comparable.
@@ -29,6 +31,7 @@ KM_SITE_PIPE: uint64 = 12
 
 kheap: Heap
 uheap: Heap
+pheap: Heap                         # program arena: one block per process
 km_site: uint64 = 0
 km_ready: uint32 = 0
 
@@ -36,6 +39,7 @@ km_ready: uint32 = 0
 def mm_init():
     heap_init(&kheap, cast[uint64](&__heap_start), cast[uint64](&__heap_end))
     heap_init(&uheap, cast[uint64](&__user_start), cast[uint64](&__user_end))
+    heap_init(&pheap, cast[uint64](&__prog_start), cast[uint64](&__prog_end))
     km_ready = 1
 
 
@@ -77,3 +81,14 @@ def user_arena_start() -> uint64:
 
 def user_arena_end() -> uint64:
     return cast[uint64](&__user_end)
+
+
+# Program arena.  A block is aligned to `align` so that one MPU region can
+# cover exactly it; the allocator's own headers sit outside every block, out
+# of reach of the process that owns the block.
+def palloc_aligned(size: uint64, align: uint64) -> uint64:
+    return heap_alloc_aligned(&pheap, size, align)
+
+
+def pfree(addr: uint64) -> int32:
+    return heap_free(&pheap, addr)

@@ -11,6 +11,7 @@
         .equ    T_SVC_EXC,    16        /* EXC_RETURN of the entering SVC  */
         .equ    T_KSTACK_TOP, 20
         .equ    T_SVC_CTRL,   24        /* caller's CONTROL.nPRIV          */
+        .equ    T_SVC_REGS,   32        /* caller's r4-r11 at system-call entry */
         .equ    KERNEL_BASEPRI, 0x40
         .equ    FPCCR,        0xE000EF34
 
@@ -156,6 +157,9 @@
         mrs     r1, control
         and     r1, r1, #1
         str     r1, [r2, #T_SVC_CTRL]
+        add     r3, r2, #T_SVC_REGS     /* the caller's callee-saved core   */
+        stmia   r3, {r4-r11}            /* registers, for rfork (a child    */
+                                        /* starts with a copy of them)      */
         cmp     r1, #0                  /* kernel stack: its top for a user */
         ite     ne                      /* thread; below the frame for a   */
         ldrne   r3, [r2, #T_KSTACK_TOP] /* privileged caller               */

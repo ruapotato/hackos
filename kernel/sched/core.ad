@@ -22,13 +22,18 @@
 #     privileged, in thread mode, on its own kernel stack, so a system call
 #     may block like any kernel code.
 #
-# The first eight fields of Thread are read and written by switch.S at fixed
+#   * A process is a thread with TF_PROC: it runs a program that was loaded
+#     from the file system into a block of the program arena, and the MPU
+#     opens exactly that block to it (kernel/proc.ad has the loader, exec,
+#     rfork and wait).  One thread per process.
+#
+# The first sixteen words of Thread are read and written by switch.S at fixed
 # offsets; do not move them.
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq_disable, mmio_read32, mmio_write32
 from kernel.rt import rt_memset
-from mm.slab import kmalloc_aligned, kfree, umalloc_aligned, ufree
-from kernel.mpu import mpu_set_guards
+from mm.slab import kmalloc_aligned, kfree, umalloc_aligned, ufree, pfree
+from kernel.mpu import mpu_switch
 from boards.mps2_an500.board import board_cpu_hz
 
 THREAD_MAX: uint32 = 32
@@ -46,7 +51,16 @@ T_BLOCKED: uint32 = 3
 T_ZOMBIE: uint32 = 4
 
 TF_USER: uint32 = 1                # runs unprivileged, has a user stack
-TF_DETACHED: uint32 = 2            # reaped by the idle thread, not joinable
+TF_DETACHED: uint32 = 2            # released by the reaper thread, not joinable
+TF_PROC: uint32 = 4                # a process: a loaded program in its own memory block
+
+# Thread.pflags
+PF_VFORK: uint32 = 1               # child of rfork, still running on its parent's memory
+PF_HELD: uint32 = 2                # exec'ed, waiting for its parent to yield (see kernel/proc.ad)
+PF_DIRTY: uint32 = 4               # ended by a fault; its resources are not released yet
+PF_VFDONE: uint32 = 8              # has exec'ed or ended: the rfork parent may resume
+PF_CLEANING: uint32 = 16           # resources are being released right now
+PF_REAPING: uint32 = 32            # somebody is collecting this zombie
 
 WAKE_OK: uint32 = 0
 WAKE_TIMEOUT: uint32 = 1
@@ -68,6 +82,7 @@ class Thread:
     kstack_top: uint32              # 20 top of the kernel stack
     svc_ctrl: uint32                # 24 CONTROL.nPRIV of the system-call caller
     pad0: uint32                    # 28
+    svc_regs: Array[8, uint32]      # 32 caller's r4-r11 at system-call entry
     # ---- scheduler ----
     tid: uint32
     state: volatile uint32          # written by interrupt handlers
@@ -92,7 +107,23 @@ class Thread:
     fault_kind: uint32              # non-zero when the thread was ended by a fault
     fault_addr: uint32
     uid: uint32
+    pflags: uint32
+    # ---- process (TF_PROC) ----
+    ppid: uint32                    # creator's id; 0 = none (or it has ended)
+    pgid: uint32                    # job-control group (recorded, not acted on)
+    mem_base: uint64                # block this process owns in the program arena, or 0
+    mem_lo: uint32                  # what it may touch: [mem_lo, mem_hi)
+    mem_hi: uint32
+    mpu_rbar: uint32                # MPU region 5 for it
+    mpu_rasr: uint32
+    held_children: uint32           # children with PF_HELD
     pad1: uint32
+    vf_wq: WaitQueue                # waits here for its rfork child to exec or end
+    hold_wq: WaitQueue              # PF_HELD: waits here for its parent
+    # /fd names (fs/hvfs.ad): what /fd/N means for this process
+    fdn_kind: Array[16, int32]
+    fdn_arg: Array[16, int32]
+    fdn_pos: Array[16, uint64]
     # ---- per-thread kernel state used by other subsystems ----
     fd: Array[16, int32]            # open-file table indices, -1 = closed (fs/hvfs.ad)
     cwd: Array[128, uint8]
@@ -119,6 +150,11 @@ sched_exit_hook_set: uint32 = 0
 # Called for a new thread with (child, parent) to inherit files and cwd.
 sched_spawn_hook: Fn[int64, uint64, uint64]
 sched_spawn_hook_set: uint32 = 0
+# Called (thread context) for a thread that a fault ended, to take back the
+# kernel locks it still held.
+sched_deadlock_hook: Fn[int64, uint64]
+sched_deadlock_hook_set: uint32 = 0
+reaper_wq: WaitQueue
 
 extern def sched_launch()
 extern def uthread_exit_stub()
@@ -364,6 +400,20 @@ def sched_set_prio(t: uint64, prio: uint32):
             sched_pend_switch()
 
 
+# 0 kernel thread, 1 unprivileged thread of the kernel image, 2 process.
+def thread_kind(t: uint64) -> uint32:
+    if (thr(t)[0].flags & TF_PROC) != 0:
+        return 2
+    if (thr(t)[0].flags & TF_USER) != 0:
+        return 1
+    return 0
+
+
+# Program the MPU for `t`.  Kernel interrupts masked.
+def sched_mpu_apply(t: uint64):
+    mpu_switch(thr(t)[0].ustack_base, thr(t)[0].kstack_base, thread_kind(t), thr(t)[0].mpu_rbar, thr(t)[0].mpu_rasr)
+
+
 # ---------------------------------------------------------------- the switch
 # Called by the PendSV handler with kernel interrupts masked, after the
 # outgoing thread's context has been saved.  Chooses the next thread and makes
@@ -379,7 +429,7 @@ def sched_pick():
     if nxt != cur:
         thr(nxt)[0].switches = thr(nxt)[0].switches + 1
         sched_switches = sched_switches + 1
-        mpu_set_guards(thr(nxt)[0].ustack_base, thr(nxt)[0].kstack_base)
+        sched_mpu_apply(nxt)
     sched_current = nxt
 
 
@@ -447,17 +497,9 @@ def _free_stacks(t: uint64):
         thr(t)[0].ustack_base = 0
 
 
-# Create a thread that starts in `entry(arg)`; `entry` is the address of a
-# function `def f(arg: uint64) -> int64` whose result becomes the exit code.
-# `stack_size` is the size of the stack the thread's own code runs on (the
-# user stack for TF_USER, otherwise the kernel stack), guard included.
-# Returns the thread, or a null pointer when out of slots or memory.
-def thread_create(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, stack_size: uint32, flags: uint32) -> Ptr[Thread]:
-    if prio >= SCHED_PRIOS:
-        prio = SCHED_PRIOS - 1
-    ssz: uint32 = (stack_size + 1023) & 0xFFFFFC00
-    if ssz < 2048:
-        ssz = 2048
+# Claim a slot of the thread table: zeroed, state T_BLOCKED (not runnable),
+# a fresh id.  Null when the table is full.
+def _thread_slot() -> Ptr[Thread]:
     irq: uint32 = cpu_irq_save()
     slot: uint32 = 0
     while slot < THREAD_MAX and threads[slot].state != T_UNUSED:
@@ -471,25 +513,66 @@ def thread_create(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, st
     t[0].tid = sched_next_tid
     sched_next_tid = sched_next_tid + 1
     cpu_irq_restore(irq)
+    return t
 
-    ksz: uint32 = ssz
-    if (flags & TF_USER) != 0:
-        ksz = KSTACK_DEFAULT
-        t[0].ustack_base = umalloc_aligned(cast[uint64](ssz), cast[uint64](STACK_GUARD))
-        t[0].ustack_size = cast[uint64](ssz)
+
+# Give `t` a kernel stack of `ksz` bytes, filled so that its high-water mark
+# can be measured later.  Returns 0, or -1 when out of memory.
+def _thread_kstack(t: Ptr[Thread], ksz: uint32) -> int32:
     t[0].kstack_base = kmalloc_aligned(cast[uint64](ksz), cast[uint64](STACK_GUARD))
     t[0].kstack_size = cast[uint64](ksz)
-    if t[0].kstack_base == 0 or ((flags & TF_USER) != 0 and t[0].ustack_base == 0):
-        _free_stacks(cast[uint64](t))
-        t[0].state = T_UNUSED
-        return cast[Ptr[Thread]](0)
+    if t[0].kstack_base == 0:
+        return -1
     t[0].kstack_top = cast[uint32](t[0].kstack_base) + ksz
-    # Fill the stacks so the high-water mark can be measured later.
     kw: Ptr[uint32] = cast[Ptr[uint32]](t[0].kstack_base)
     i: uint32 = 0
     while i < ksz / 4:
         kw[i] = STACK_FILL
         i = i + 1
+    return 0
+
+
+def _thread_common(t: Ptr[Thread], name: Ptr[uint8], prio: uint32, flags: uint32):
+    t[0].prio = prio
+    t[0].base_prio = prio
+    t[0].flags = flags
+    t[0].uid = 1
+    _copy_name(&t[0].name[0], name, 16)
+    i: uint32 = 0
+    while i < 16:
+        t[0].fd[i] = -1
+        i = i + 1
+    t[0].cwd[0] = 47
+    t[0].cwd[1] = 0
+    if sched_spawn_hook_set != 0 and sched_current != 0:
+        sched_spawn_hook(cast[uint64](t), sched_current)
+
+
+# Create a thread that starts in `entry(arg)`; `entry` is the address of a
+# function `def f(arg: uint64) -> int64` whose result becomes the exit code.
+# `stack_size` is the size of the stack the thread's own code runs on (the
+# user stack for TF_USER, otherwise the kernel stack), guard included.
+# Returns the thread, or a null pointer when out of slots or memory.
+def thread_create(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, stack_size: uint32, flags: uint32) -> Ptr[Thread]:
+    if prio >= SCHED_PRIOS:
+        prio = SCHED_PRIOS - 1
+    flags = flags & (TF_USER | TF_DETACHED)
+    ssz: uint32 = (stack_size + 1023) & 0xFFFFFC00
+    if ssz < 2048:
+        ssz = 2048
+    t: Ptr[Thread] = _thread_slot()
+    if t == cast[Ptr[Thread]](0):
+        return t
+    ksz: uint32 = ssz
+    if (flags & TF_USER) != 0:
+        ksz = KSTACK_DEFAULT
+        t[0].ustack_base = umalloc_aligned(cast[uint64](ssz), cast[uint64](STACK_GUARD))
+        t[0].ustack_size = cast[uint64](ssz)
+    if _thread_kstack(t, ksz) != 0 or ((flags & TF_USER) != 0 and t[0].ustack_base == 0):
+        _free_stacks(cast[uint64](t))
+        t[0].state = T_UNUSED
+        return cast[Ptr[Thread]](0)
+    i: uint32 = 0
     top: uint32 = t[0].kstack_top
     if (flags & TF_USER) != 0:
         uw: Ptr[uint32] = cast[Ptr[uint32]](t[0].ustack_base)
@@ -516,23 +599,41 @@ def thread_create(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, st
     t[0].sp = top - 64
     t[0].exc_return = 0xFFFFFFFD                 # thread mode, PSP, no FP frame
     t[0].control = flags & TF_USER               # nPRIV
-    t[0].prio = prio
-    t[0].base_prio = prio
-    t[0].flags = flags
-    t[0].uid = 1
-    _copy_name(&t[0].name[0], name, 16)
-    i = 0
-    while i < 16:
-        t[0].fd[i] = -1
-        i = i + 1
-    t[0].cwd[0] = 47
-    t[0].cwd[1] = 0
-    if sched_spawn_hook_set != 0 and sched_current != 0:
-        sched_spawn_hook(cast[uint64](t), sched_current)
-    irq = cpu_irq_save()
+    _thread_common(t, name, prio, flags)
+    irq: uint32 = cpu_irq_save()
     _make_ready(cast[uint64](t))
     cpu_irq_restore(irq)
     return t
+
+
+# A process thread without a context yet: a table slot, a kernel stack, the
+# creator's files and directory.  kernel/proc.ad gives it memory and a first
+# frame and then calls thread_start().  Null when out of slots or memory.
+def thread_create_proc(name: Ptr[uint8], prio: uint32, flags: uint32) -> Ptr[Thread]:
+    if prio >= SCHED_PRIOS:
+        prio = SCHED_PRIOS - 1
+    t: Ptr[Thread] = _thread_slot()
+    if t == cast[Ptr[Thread]](0):
+        return t
+    if _thread_kstack(t, KSTACK_DEFAULT) != 0:
+        t[0].state = T_UNUSED
+        return cast[Ptr[Thread]](0)
+    t[0].exc_return = 0xFFFFFFFD
+    t[0].control = 1
+    if sched_current != 0:
+        t[0].ppid = thr(sched_current)[0].tid
+    _thread_common(t, name, prio, (flags & TF_DETACHED) | TF_USER | TF_PROC)
+    return t
+
+
+def thread_start(t: Ptr[Thread]):
+    irq: uint32 = cpu_irq_save()
+    _make_ready(cast[uint64](t))
+    cpu_irq_restore(irq)
+
+
+def thread_set_name(t: Ptr[Thread], name: Ptr[uint8]):
+    _copy_name(&t[0].name[0], name, 16)
 
 
 def thread_by_tid(tid: uint32) -> Ptr[Thread]:
@@ -544,16 +645,58 @@ def thread_by_tid(tid: uint32) -> Ptr[Thread]:
     return cast[Ptr[Thread]](0)
 
 
+# A process gives up what it owns besides its table slot and kernel stack:
+# its memory block; its children become nobody's (the reaper collects them);
+# a parent waiting in rfork is let go.  Thread context.
+def _proc_release(t: uint64):
+    if thr(t)[0].mem_base != 0:
+        pfree(thr(t)[0].mem_base)
+        thr(t)[0].mem_base = 0
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        c: Ptr[Thread] = &threads[i]
+        if c[0].state != T_UNUSED and c[0].ppid == thr(t)[0].tid and cast[uint64](c) != t:
+            c[0].ppid = 0
+            c[0].flags = c[0].flags | TF_DETACHED
+            if (c[0].pflags & PF_HELD) != 0:
+                c[0].pflags = c[0].pflags & (0xFFFFFFFF ^ PF_HELD)
+                wq_wake_all(&c[0].hold_wq)
+        i = i + 1
+    thr(t)[0].held_children = 0
+    thr(t)[0].pflags = thr(t)[0].pflags | PF_VFDONE
+    if thr(t)[0].ppid != 0:
+        par: Ptr[Thread] = thread_by_tid(thr(t)[0].ppid)
+        if par != cast[Ptr[Thread]](0):
+            wq_wake_all(&par[0].vf_wq)
+    cpu_irq_restore(irq)
+
+
+# Release everything a thread holds except its slot and kernel stack: open
+# files and /fd names, kernel locks (only a faulted thread can still hold
+# one), process memory.  Thread context; `t` is the calling thread on its way
+# out, or a zombie that a fault made.
+def _thread_release(t: uint64):
+    if sched_exit_hook_set != 0:
+        sched_exit_hook(t)
+    if thr(t)[0].fault_kind != 0 and sched_deadlock_hook_set != 0:
+        sched_deadlock_hook(t)
+    if (thr(t)[0].flags & TF_PROC) != 0:
+        _proc_release(t)
+
+
 # End the current thread.  Does not return.
 def thread_exit(code: int64) -> int64:
     t: uint64 = sched_current
-    if sched_exit_hook_set != 0:
-        sched_exit_hook(t)
+    _thread_release(t)
     irq: uint32 = cpu_irq_save()
     thr(t)[0].exit_code = code
     thr(t)[0].state = T_ZOMBIE
     while thr(t)[0].join_wq.head != 0:
         _wake(thr(t)[0].join_wq.head, WAKE_OK)
+    if (thr(t)[0].flags & TF_DETACHED) != 0:
+        while reaper_wq.head != 0:
+            _wake(reaper_wq.head, WAKE_OK)
     sched_pend_switch()
     cpu_irq_restore(0)
     while 1 == 1:
@@ -562,36 +705,60 @@ def thread_exit(code: int64) -> int64:
 
 
 # End another thread from a fault handler (handler mode): `t` is the current
-# thread and will never run again.  The caller pends the switch.
+# thread and will never run again.  The caller pends the switch.  What the
+# thread held is released by the reaper thread, or by whoever collects the
+# zombie first (thread_cleanup_dead).
 def thread_kill_current_from_fault(code: int64, kind: uint32, addr: uint32):
     t: uint64 = sched_current
     irq: uint32 = cpu_irq_save()
     thr(t)[0].exit_code = code
     thr(t)[0].fault_kind = kind
     thr(t)[0].fault_addr = addr
+    thr(t)[0].pflags = thr(t)[0].pflags | PF_DIRTY
     thr(t)[0].state = T_ZOMBIE
     thr(t)[0].usp = 0
     while thr(t)[0].join_wq.head != 0:
         _wake(thr(t)[0].join_wq.head, WAKE_OK)
+    while reaper_wq.head != 0:
+        _wake(reaper_wq.head, WAKE_OK)
     sched_pend_switch()
     cpu_irq_restore(irq)
 
 
-# Release a zombie.  Thread context only: a thread that was ended by a fault
-# could not release its own resources, so the exit hook runs here for it.
+# Release what a fault-ended zombie still holds, exactly once, whoever gets
+# here first.  Returns when the release is complete.  Thread context.
+def thread_cleanup_dead(t: Ptr[Thread]):
+    irq: uint32 = cpu_irq_save()
+    mine: uint32 = 0
+    if (t[0].pflags & PF_DIRTY) != 0:
+        t[0].pflags = (t[0].pflags & (0xFFFFFFFF ^ PF_DIRTY)) | PF_CLEANING
+        mine = 1
+    cpu_irq_restore(irq)
+    if mine != 0:
+        _thread_release(cast[uint64](t))
+        irq = cpu_irq_save()
+        t[0].pflags = t[0].pflags & (0xFFFFFFFF ^ PF_CLEANING)
+        cpu_irq_restore(irq)
+        return
+    while (t[0].pflags & PF_CLEANING) != 0:
+        thread_sleep(1)
+
+
+# Release a zombie.  Thread context.
 def _reap(t: Ptr[Thread]):
+    thread_cleanup_dead(t)
     reap_switches = t[0].switches
     reap_cpu_ticks = t[0].cpu_ticks
     reap_stack_used = thread_kstack_used(t)
-    if t[0].fault_kind != 0 and sched_exit_hook_set != 0:
-        sched_exit_hook(cast[uint64](t))
     _free_stacks(cast[uint64](t))
     t[0].state = T_UNUSED
 
 
-# Wait for thread `tid` to end, store its exit code and release it.
-# Returns 0, -3 (ESRCH: no such thread), -22 (EINVAL: detached or self).
-def thread_join(tid: uint32, code_out: Ptr[int64]) -> int32:
+# Wait for thread `tid` to end, store its exit code and release it.  With
+# `nohang` it does not wait.  Returns 0, -3 (ESRCH: no such thread), -22
+# (EINVAL: detached, self, or already being collected), -11 (EAGAIN: nohang
+# and still alive).
+def thread_wait(tid: uint32, nohang: uint32, code_out: Ptr[int64]) -> int32:
     t: Ptr[Thread] = thread_by_tid(tid)
     if t == cast[Ptr[Thread]](0):
         return -3
@@ -599,12 +766,26 @@ def thread_join(tid: uint32, code_out: Ptr[int64]) -> int32:
         return -22
     irq: uint32 = cpu_irq_save()
     while t[0].state != T_ZOMBIE:
+        if nohang != 0:
+            cpu_irq_restore(irq)
+            return -11
         wq_wait(&t[0].join_wq, WAIT_FOREVER)
+        if t[0].state == T_UNUSED or t[0].tid != tid:
+            cpu_irq_restore(irq)
+            return -3
+    if (t[0].pflags & PF_REAPING) != 0 or t[0].tid != tid:
+        cpu_irq_restore(irq)
+        return -22
+    t[0].pflags = t[0].pflags | PF_REAPING
     cpu_irq_restore(irq)
     if code_out != cast[Ptr[int64]](0):
         code_out[0] = t[0].exit_code
     _reap(t)
     return 0
+
+
+def thread_join(tid: uint32, code_out: Ptr[int64]) -> int32:
+    return thread_wait(tid, 0, code_out)
 
 
 def thread_detach(t: Ptr[Thread]):
@@ -656,9 +837,11 @@ def _idle_main(arg: uint64) -> int64:
     return 0
 
 
-# Detached threads are nobody's to join: this thread releases them.  It polls
-# (every REAPER_PERIOD ticks); releasing may block on the file-system lock,
-# which is why this is not the idle thread's job.
+# The reaper thread releases what fault-ended threads held (they could not
+# do it themselves) and collects detached zombies, which are nobody's to
+# join.  It is woken when either appears, and looks every REAPER_PERIOD ticks
+# besides.  Releasing may block on the file-system lock, which is why this is
+# not the idle thread's job.
 REAPER_PERIOD: uint64 = 20
 
 
@@ -666,10 +849,22 @@ def _reaper_main(arg: uint64) -> int64:
     while 1 == 1:
         i: uint32 = 0
         while i < THREAD_MAX:
-            if threads[i].state == T_ZOMBIE and (threads[i].flags & TF_DETACHED) != 0:
-                _reap(&threads[i])
+            if threads[i].state == T_ZOMBIE and (threads[i].pflags & PF_REAPING) == 0:
+                if (threads[i].pflags & (PF_DIRTY | PF_CLEANING)) != 0:
+                    thread_cleanup_dead(&threads[i])
+                if (threads[i].flags & TF_DETACHED) != 0:
+                    irq0: uint32 = cpu_irq_save()
+                    go: uint32 = 0
+                    if threads[i].state == T_ZOMBIE and (threads[i].pflags & PF_REAPING) == 0:
+                        threads[i].pflags = threads[i].pflags | PF_REAPING
+                        go = 1
+                    cpu_irq_restore(irq0)
+                    if go != 0:
+                        _reap(&threads[i])
             i = i + 1
-        thread_sleep(REAPER_PERIOD)
+        irq: uint32 = cpu_irq_save()
+        wq_wait(&reaper_wq, REAPER_PERIOD)
+        cpu_irq_restore(irq)
     return 0
 
 
@@ -683,6 +878,7 @@ def sched_init():
     timer_head = 0
     sched_current = 0
     sched_running = 0
+    wq_init(&reaper_wq)
     thread_create("idle", cast[uint64](&_idle_main), 0, SCHED_PRIOS - 1, 2048, 0)
     thread_create("reaper", cast[uint64](&_reaper_main), 0, SCHED_PRIOS - 2, 8192, 0)
 
@@ -697,7 +893,7 @@ def sched_start():
     thr(nxt)[0].state = T_RUNNING
     thr(nxt)[0].slice = SCHED_SLICE
     sched_current = nxt
-    mpu_set_guards(thr(nxt)[0].ustack_base, thr(nxt)[0].kstack_base)
+    sched_mpu_apply(nxt)
     sched_running = 1
     mmio_write32(0xE000E010, 0)
     mmio_write32(0xE000E014, board_cpu_hz() / SCHED_HZ - 1)

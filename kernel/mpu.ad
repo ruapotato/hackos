@@ -8,31 +8,52 @@
 # is how the kernel reaches the peripherals and the system control space.
 # Unprivileged code can touch only what a region grants.
 #
-# Fixed plan (addresses from the linker script):
+# Plan (addresses from the linker script):
 #
 #   #  range                       privileged   unprivileged  exec  purpose
-#   0  CODE, whole region          read-only    read-only     yes   text, constants
+#   0  CODE, whole region          read-only    (*)           yes   kernel text, constants
 #   1  0x00000000 + 4 KB           none         none          no    null-pointer guard
 #   2  kernel RAM, whole region    read/write   none          no    kernel data, MSP stack
-#   3  XRAM, whole region          read/write   none          no    big tables, kernel heap
-#   4  user arena (top of XRAM)    read/write   read/write    no    user stacks and heap
+#   3  XRAM, whole region          read/write   none          no    big tables, kernel heap,
+#                                                                   program arena
+#   4  shared user arena           read/write   (*)           no    stacks and mmap memory of
+#                                                                   in-image unprivileged threads
+#   5  the current process's block read/write   read/write    yes   one loaded program: stack,
+#                                                                   code, data (off otherwise)
 #   6  1 KB at the bottom of the current thread's user stack    none / none
 #   7  1 KB at the bottom of the current thread's kernel stack  none / none
 #
-# Regions 6 and 7 are rewritten at every context switch (mpu_set_guards).
+# (*) depends on what kind of thread is running, see mpu_switch():
+#     - a thread of a loaded program (a process) gets region 5 and nothing
+#       else: region 0 is privileged-only for it and region 4 is off.  It can
+#       touch its own block and nothing else, not even the kernel's code.
+#     - an unprivileged thread compiled into the kernel image (the test
+#       threads of milestone 2) gets region 0 read-only and region 4
+#       read/write, and no region 5.
+#     - a kernel thread is privileged and does not care; the regions stay as
+#       the last unprivileged thread left them.
+#
+# Region 5 uses the sub-region disable bits: a block is k/8 of a power-of-two
+# region (k = 5..8), so a program wastes at most a few eighths, not up to
+# half, of what a plain power-of-two region would.
 #
 # What this does and does not give:
 #   * A stack that grows into its guard raises MemManage, in privileged code
-#     too (an explicit region beats the privileged default map).
+#     too (an explicit region beats the privileged default map).  A process's
+#     stack sits at the bottom of its block, so it needs no guard region: the
+#     memory below the block is simply not its own, whatever the frame size.
 #   * A null pointer dereference within the first 4 KB faults for everyone,
 #     including a jump to address 0.  The vector table sits behind the guard;
 #     the core's own vector fetches do not go through the MPU.
 #   * Kernel data and the kernel heap are unreachable from unprivileged code;
-#     writing to code or constants faults for everyone.
-#   * User threads are NOT isolated from one another: they share one arena and
-#     may run any code in the image (there is one image; no program loader
-#     yet).  Per-program regions come with program loading.
-#   * A stack frame larger than the guard can step over it.
+#     writing to kernel code or constants faults for everyone.
+#   * Processes are isolated from the kernel AND from each other.
+#   * Inside a process block everything is read/write/execute: code is
+#     loaded into RAM next to its data, and one region covers both.  Write
+#     protection of a program's own code would need a second region and a
+#     page-aligned layout; not done.
+#   * In-image unprivileged threads still share one arena among themselves.
+#   * A kernel-stack frame larger than the 1 KB guard can step over it.
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_isb
 
@@ -47,11 +68,18 @@ MPU_RASR: uint64 = 0xE000EDA0
 
 MPU_AP_NONE: uint32 = 0            # no access
 MPU_AP_PRIV_RW: uint32 = 1         # privileged read/write
+MPU_AP_PRIV_RO: uint32 = 5         # privileged read-only
 MPU_AP_FULL: uint32 = 3            # read/write for all
 MPU_AP_RO: uint32 = 6              # read-only for all
 MPU_XN: uint32 = 0x10000000
 
+MPU_MODE_SHARED: uint32 = 0        # regions 0 and 4 open to unprivileged code
+MPU_MODE_PROC: uint32 = 1          # only region 5 is
+
 mpu_enabled: uint32 = 0
+mpu_mode: uint32 = 0
+mpu_user_base: uint32 = 0
+mpu_user_size: uint32 = 0
 
 
 # log2(size) for a power of two >= 32.
@@ -91,6 +119,9 @@ def mpu_init():
     mpu_region(2, 0x20000000, 0x400000, MPU_AP_PRIV_RW, MPU_XN)
     mpu_region(3, 0x60000000, 0x1000000, MPU_AP_PRIV_RW, MPU_XN)
     mpu_region(4, ustart, usize, MPU_AP_FULL, MPU_XN)
+    mpu_user_base = ustart
+    mpu_user_size = usize
+    mpu_mode = MPU_MODE_SHARED
     # ENABLE | PRIVDEFENA; HFNMIENA stays 0: the MPU is off inside HardFault
     # and NMI, so the fatal-fault report can always run.
     mmio_write32(MPU_CTRL, 5)
@@ -98,8 +129,25 @@ def mpu_init():
     mpu_enabled = 1
 
 
-# Stack guards of the thread about to run (0 = that stack does not exist).
-def mpu_set_guards(ustack_base: uint64, kstack_base: uint64):
+# Region 5 for a process block of `k` eighths of a `size`-byte region at
+# `base` (base is a multiple of size; size a power of two >= 256; k = 1..8).
+# Returns the RASR value; the RBAR value is mpu_proc_rbar(base).
+def mpu_proc_rasr(size: uint32, k: uint32) -> uint32:
+    srd: uint32 = (0xFF << k) & 0xFF            # disable sub-regions k..7
+    return (MPU_AP_FULL << 24) | 0x00020000 | (srd << 8) | ((_log2(size) - 1) << 1) | 1
+
+
+def mpu_proc_rbar(base: uint32) -> uint32:
+    return (base & 0xFFFFFFE0) | 0x15           # VALID | region 5
+
+
+# Set up the MPU for the thread about to run.  Called at every context
+# switch (and by exec for the running thread) with kernel interrupts masked.
+#   ustack_base, kstack_base   stack guards (0 = that stack has no guard)
+#   kind                       0 kernel thread, 1 in-image unprivileged
+#                              thread, 2 process
+#   rbar, rasr                 region 5 of a process (mpu_proc_rbar/_rasr)
+def mpu_switch(ustack_base: uint64, kstack_base: uint64, kind: uint32, rbar: uint32, rasr: uint32):
     if mpu_enabled == 0:
         return
     if ustack_base != 0:
@@ -110,3 +158,18 @@ def mpu_set_guards(ustack_base: uint64, kstack_base: uint64):
         mmio_write32(MPU_RASR, 0)
     mmio_write32(MPU_RBAR, (cast[uint32](kstack_base) & 0xFFFFFFE0) | 0x17)
     mmio_write32(MPU_RASR, MPU_XN | 0x00020000 | (9 << 1) | 1)
+    if kind == 2:
+        mmio_write32(MPU_RBAR, rbar)
+        mmio_write32(MPU_RASR, rasr)
+        if mpu_mode != MPU_MODE_PROC:
+            mmio_write32(MPU_RNR, 4)
+            mmio_write32(MPU_RASR, 0)
+            mpu_region(0, 0x00000000, 0x400000, MPU_AP_PRIV_RO, 0)
+            mpu_mode = MPU_MODE_PROC
+    elif kind == 1:
+        if mpu_mode != MPU_MODE_SHARED:
+            mmio_write32(MPU_RNR, 5)
+            mmio_write32(MPU_RASR, 0)
+            mpu_region(0, 0x00000000, 0x400000, MPU_AP_RO, 0)
+            mpu_region(4, mpu_user_base, mpu_user_size, MPU_AP_FULL, MPU_XN)
+            mpu_mode = MPU_MODE_SHARED

@@ -10,7 +10,7 @@
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.rt import rt_memcpy
-from kernel.sched.core import WaitQueue, Thread, thr, wq_init, wq_wait, wq_wake_one, wq_wake_all, wq_best, wq_wake_thread, sched_set_prio, sched_current, sched_running, sched_in_handler, sched_ticks, WAIT_FOREVER, WAKE_TIMEOUT
+from kernel.sched.core import WaitQueue, Thread, thr, wq_init, wq_wait, wq_wake_one, wq_wake_all, wq_best, wq_wake_thread, sched_set_prio, sched_current, sched_running, sched_in_handler, sched_ticks, sched_deadlock_hook, sched_deadlock_hook_set, WAIT_FOREVER, WAKE_TIMEOUT
 from mm.slab import kmalloc, kfree
 
 SYNC_OK: int32 = 0
@@ -90,6 +90,44 @@ def mutex_unlock(m: Ptr[Mutex]) -> int32:
         sched_set_prio(me, thr(me)[0].base_prio)
     cpu_irq_restore(irq)
     return SYNC_OK
+
+
+# Kernel-wide locks register here so that a lock whose holder was ended by a
+# fault can be taken back (mutex_release_dead).  Only long-lived locks: a
+# registered mutex is never unregistered.
+MUTEX_REG_MAX: uint32 = 16
+mutex_reg: Array[16, uint64]
+mutex_reg_n: uint32 = 0
+mutex_dead_released: uint32 = 0     # locks taken back from dead threads so far
+
+
+# The thread `tp` is dead: unlock every registered mutex it still owns and
+# wake a waiter.  What the lock protected may be half-updated; the lock at
+# least no longer blocks everyone else forever.  Thread context.
+def mutex_release_dead(tp: uint64) -> int64:
+    n: int64 = 0
+    i: uint32 = 0
+    while i < mutex_reg_n:
+        m: Ptr[Mutex] = cast[Ptr[Mutex]](mutex_reg[i])
+        irq: uint32 = cpu_irq_save()
+        if m[0].owner == tp:
+            m[0].owner = 0
+            w: uint64 = wq_best(&m[0].wq)
+            if w != 0:
+                wq_wake_thread(w)
+            mutex_dead_released = mutex_dead_released + 1
+            n = n + 1
+        cpu_irq_restore(irq)
+        i = i + 1
+    return n
+
+
+def mutex_register(m: Ptr[Mutex]):
+    if mutex_reg_n < MUTEX_REG_MAX:
+        mutex_reg[mutex_reg_n] = cast[uint64](m)
+        mutex_reg_n = mutex_reg_n + 1
+    sched_deadlock_hook = mutex_release_dead
+    sched_deadlock_hook_set = 1
 
 
 # ---------------------------------------------------------------- semaphore

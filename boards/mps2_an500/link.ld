@@ -22,9 +22,13 @@
  *                    read-only data follow from 0x1000 (VTOR is set there).
  *   RAM  0x20000000  kernel .data/.bss, handler (MSP) stack, fault stack.
  *   XRAM 0x60000000  large kernel tables (.bss of the file system), then the
- *                    kernel heap up to __user_start; the last 4 MB are the
- *                    user arena (unprivileged read/write): user stacks, user
- *                    heap.  __user_start must be a multiple of the arena size.
+ *                    kernel heap up to __prog_start (6 MB in all);
+ *                    then the program arena (6 MB): one block per process,
+ *                    each opened to its own process only by an MPU region;
+ *                    the last 4 MB are the shared arena of the unprivileged
+ *                    threads that are compiled into the kernel image (tests):
+ *                    their stacks and mmap memory.  __user_start must be a
+ *                    multiple of the shared arena's size.
  *
  * On the i.MX RT117x target the same three roles map to flash (XIP), DTCM/OCRAM
  * and the 64 MB SDRAM.
@@ -39,7 +43,8 @@ MEMORY
 }
 
 __stack_size = 0x4000;          /* handler-mode (MSP) stack */
-__user_size  = 0x400000;        /* user arena: 4 MB, MPU region aligned */
+__user_size  = 0x400000;        /* shared user arena: 4 MB, MPU region aligned */
+__prog_size  = 0x600000;        /* program arena: 6 MB */
 __null_guard_size = 0x1000;
 
 SECTIONS
@@ -110,5 +115,7 @@ SECTIONS
     __user_end = ORIGIN(XRAM) + LENGTH(XRAM);
     __user_start = __user_end - __user_size;
     __heap_start = ALIGN(__xbss_end, 16);
-    __heap_end = __user_start;
+    __prog_end = __user_start;
+    __prog_start = __prog_end - __prog_size;
+    __heap_end = __prog_start;
 }
