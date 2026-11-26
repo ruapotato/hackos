@@ -1088,7 +1088,7 @@ def test_proc():
     code = run_prog("/bin/ptest", "huge", nul, nul)
     check(cast[uint32](code == 139 and trap_last_kind == FAULT_STACK_OVERFLOW), "proc: a 6 KB frame cannot step over anything: still a stack overflow")
     thread_sleep(5)
-    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0), "proc: after 9 faulted processes: no block, stack, slot or open file left behind")
+    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0), "proc: after 8 faulted processes: no block, stack, slot or open file left behind")
 
     # spawn, rfork + exec, wait -- from inside a process
     code = run_prog("/bin/ptest", "spawn", "/bin/hello", nul)
@@ -1135,7 +1135,7 @@ def test_proc():
     check(cast[uint32](code == 139 and mutex_dead_released == md0 + 1 and fd >= 0 and vfs_unlink("/tmp/afterlock") == 0), "fault: a thread that dies holding the file-system lock does not block the file system")
     vfs_unlink("/tmp/notelf")           # left by `ptest forkfail`
     check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0 and heap_check(&pheap) == 0 and heap_check(&kheap) == 0), "proc: everything released at the end of the group, heaps consistent")
-    printk2("   %d processes created, %d exec calls\n", proc_spawned, proc_execs)
+    printk2("   %d processes created so far, %d of them through exec\n", proc_spawned, proc_execs)
     printk4("   program arena blocks %d (was %d), kernel heap blocks %d (was %d)", cast[uint64](pheap.n_live), cast[uint64](plive0), cast[uint64](kheap.n_live), cast[uint64](klive0))
     printk4(", threads %d (was %d), open files %d (was %d)\n", cast[uint64](threads_in_use()), cast[uint64](thr0), cast[uint64](vfs_open_count()), cast[uint64](open0))
 
