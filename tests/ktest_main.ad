@@ -1,0 +1,953 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS milestone 2 kernel test image for QEMU `mps2-an500`.
+#
+# A privileged "runner" thread executes the groups below in order.  Every
+# check prints "PASS <name>" or "FAIL <name>"; each check() call site runs
+# exactly once, so the harness (tests/run_all.sh) requires the number of PASS
+# lines to equal the number of call sites.  The emulator exit status is the
+# number of failed checks.
+#
+# Unprivileged code lives in tests/kt_user.ad and user/faults.ad.
+
+from kernel.init import kernel_init
+from kernel.cpu import cpu_control, cpu_ipsr, cpu_irq_save, cpu_irq_restore, mmio_read32, mmio_write32
+from kernel.exit import hackos_exit
+from kernel.print import kputs
+from kernel.printk.printk import printk0, printk1, printk2, printk3, printk4
+from kernel.mpu import mpu_regions
+from kernel.sched.core import Thread, thr, threads, thread_create, thread_join, thread_sleep, thread_yield, thread_exit, thread_by_tid, sched_start, sched_now, sched_current, sched_switches, reap_switches, reap_cpu_ticks, reap_stack_used, TF_USER, T_UNUSED, THREAD_MAX, WAIT_FOREVER
+from kernel.sync import Mutex, mutex_init, mutex_lock, mutex_unlock, mutex_trylock, mutex_lock_timeout, Semaphore, sem_init, sem_wait, sem_wait_timeout, sem_post, Cond, cond_init, cond_wait, cond_wait_timeout, cond_signal, cond_broadcast, MsgQueue, mq_init, mq_destroy, mq_send, mq_recv, SYNC_OK, SYNC_TIMEOUT, SYNC_EPERM, SYNC_EDEADLK
+from kernel.trap import trap_count, trap_last_tid, trap_last_kind, trap_last_addr, FAULT_STACK_OVERFLOW, FAULT_ACCESS, FAULT_USAGE
+from kernel.syscall import sys_count, sys_bad_ptr
+from mm.slab import kheap, uheap, kmalloc, kfree, kmalloc_aligned, umalloc_aligned, ufree
+from mm.heap import Heap, heap_free, heap_check, heap_free_blocks, heap_largest_free, heap_total
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_mkdir, vfs_unlink, vfs_rename, vfs_open_stdio, vfs_open_count, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, OAPPEND
+from drivers.tty.console import console_rx_enable, console_input, console_set_mode, console_read, con_rx_bytes, con_rx_dropped, con_rx_irqs, CON_RAW, CON_COOKED
+from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf
+from tests.kt_user import stress_mix, u_stress, u_fphold, u_syscalls, u_child, f64_bits
+
+extern def fp_hold(seed: uint64, loops: uint64) -> uint64
+
+failures: uint32 = 0
+
+
+def check(ok: uint32, name: Ptr[uint8]):
+    if ok != 0:
+        printk1("PASS %s\n", cast[uint64](name))
+    else:
+        printk1("FAIL %s\n", cast[uint64](name))
+        failures = failures + 1
+
+
+def spawn(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, flags: uint32) -> uint32:
+    t: Ptr[Thread] = thread_create(name, entry, arg, prio, 4096, flags)
+    if t == cast[Ptr[Thread]](0):
+        return 0
+    return t[0].tid
+
+
+def join(tid: uint32) -> int64:
+    code: int64 = -9999
+    thread_join(tid, &code)
+    return code
+
+
+# ============================================================ 1. boot state
+def test_boot():
+    printk0("-- 1. boot state\n")
+    check(cast[uint32]((cpu_control() & 3) == 2 and cpu_ipsr() == 0), "runner: thread mode, process stack, privileged")
+    check(cast[uint32](mpu_regions() == 16 and (mmio_read32(0xE000ED94) & 5) == 5), "mpu: 16 regions, enabled, privileged default map")
+    check(cast[uint32]((mmio_read32(0xE000EF34) >> 30) == 3), "fpu: automatic + lazy state saving (FPCCR.ASPEN|LSPEN)")
+    check(cast[uint32](mmio_read32(0xE000ED08) == 0x1000), "vector table behind the null guard (VTOR = 0x1000)")
+    printk3("   kernel heap %d bytes, user arena %d bytes, %d threads at start\n", heap_total(&kheap), heap_total(&uheap), 3)
+
+
+# ============================================================ 2. heap
+hp_slot: Array[64, uint64]
+hp_size: Array[64, uint32]
+hp_seed: uint32 = 12345
+
+
+def hp_rand() -> uint32:
+    hp_seed = hp_seed * 1103515245 + 12345
+    return (hp_seed >> 8) & 0xFFFFFF
+
+
+def test_heap():
+    printk0("-- 2. kernel heap\n")
+    used0: uint32 = kheap.used_bytes
+    live0: uint32 = kheap.n_live
+    blocks0: uint64 = heap_free_blocks(&kheap)
+    large0: uint64 = heap_largest_free(&kheap)
+    a: uint64 = kmalloc(100)
+    b: uint64 = kmalloc(200)
+    c: uint64 = kmalloc(300)
+    check(cast[uint32](a != 0 and b != 0 and c != 0 and ((a | b | c) & 15) == 0 and b > a and c > b), "heap: allocations are distinct and 16-byte aligned")
+    printk2("   overhead: 3 blocks for 600 requested bytes take %d (16-byte header + rounding to 16)\n", cast[uint64](kheap.used_bytes - used0), 0)
+    kfree(b)
+    fb1: uint64 = heap_free_blocks(&kheap)
+    kfree(a)
+    fb2: uint64 = heap_free_blocks(&kheap)
+    kfree(c)
+    fb3: uint64 = heap_free_blocks(&kheap)
+    check(cast[uint32](fb1 == blocks0 + 1 and fb2 == blocks0 + 1 and fb3 == blocks0 and kheap.used_bytes == used0), "heap: freed neighbours coalesce in both directions")
+    al: uint64 = kmalloc_aligned(5000, 4096)
+    check(cast[uint32](al != 0 and (al & 4095) == 0 and heap_check(&kheap) == 0), "heap: 4 KiB-aligned allocation")
+    kfree(al)
+    check(cast[uint32](heap_free(&kheap, al) == -1 and heap_check(&kheap) == 0), "heap: double free refused, heap intact")
+    fail0: uint32 = kheap.n_fail
+    check(cast[uint32](kmalloc(64 * 1024 * 1024) == 0 and kheap.n_fail == fail0 + 1), "heap: impossible request returns 0 and is counted")
+    # churn: 20000 random allocate/verify/free steps over 64 slots
+    i: uint32 = 0
+    while i < 64:
+        hp_slot[i] = 0
+        i = i + 1
+    bad: uint32 = 0
+    nofit: uint32 = 0
+    maxfrag: uint64 = 0
+    step: uint32 = 0
+    while step < 20000:
+        s: uint32 = hp_rand() % 64
+        if hp_slot[s] != 0:
+            p: Ptr[uint8] = cast[Ptr[uint8]](hp_slot[s])
+            k: uint32 = 0
+            while k < hp_size[s]:
+                if p[k] != cast[uint8](s * 7 + k):
+                    bad = bad + 1
+                k = k + 1
+            kfree(hp_slot[s])
+            hp_slot[s] = 0
+        else:
+            sz: uint32 = 1 + hp_rand() % 3000
+            q: uint64 = 0
+            if (hp_rand() & 7) == 0:
+                q = kmalloc_aligned(cast[uint64](sz), cast[uint64](64) << cast[uint64](hp_rand() % 5))
+            else:
+                q = kmalloc(cast[uint64](sz))
+            if q == 0:
+                nofit = nofit + 1
+            else:
+                hp_slot[s] = q
+                hp_size[s] = sz
+                p2: Ptr[uint8] = cast[Ptr[uint8]](q)
+                k2: uint32 = 0
+                while k2 < sz:
+                    p2[k2] = cast[uint8](s * 7 + k2)
+                    k2 = k2 + 1
+        if (step % 500) == 0:
+            if heap_check(&kheap) != 0:
+                bad = bad + 1000
+            fbn: uint64 = heap_free_blocks(&kheap)
+            if fbn > maxfrag:
+                maxfrag = fbn
+        step = step + 1
+    check(cast[uint32](bad == 0 and nofit == 0), "heap churn: 20000 steps, every block kept its contents, heap consistent")
+    printk3("   churn: peak %d bytes in use, at most %d free fragments, %d live blocks at the end\n", cast[uint64](kheap.peak_bytes), maxfrag, cast[uint64](kheap.n_live - live0))
+    i = 0
+    while i < 64:
+        if hp_slot[i] != 0:
+            kfree(hp_slot[i])
+        i = i + 1
+    check(cast[uint32](kheap.used_bytes == used0 and kheap.n_live == live0), "heap churn: no leak (bytes and blocks back to the start)")
+    check(cast[uint32](heap_free_blocks(&kheap) == blocks0 and heap_largest_free(&kheap) == large0 and heap_check(&kheap) == 0), "heap churn: no fragmentation left (free list as at the start)")
+
+
+# ============================================================ 3. threads
+th_flag: volatile uint32 = 0
+th_flag2: volatile uint32 = 0
+th_stop: volatile uint32 = 0
+th_count: Array[4, uint64]
+th_order: Array[16, uint32]
+th_order_n: volatile uint32 = 0
+th_wake: Array[4, uint64]
+
+
+def th_log(id: uint32):
+    irq: uint32 = cpu_irq_save()
+    if th_order_n < 16:
+        th_order[th_order_n] = id
+        th_order_n = th_order_n + 1
+    cpu_irq_restore(irq)
+
+
+def w_exit(arg: uint64) -> int64:
+    return cast[int64](arg) * 2 + 1
+
+
+def w_flag(arg: uint64) -> int64:
+    th_flag = cast[uint32](arg)
+    return 0
+
+
+def w_flag2(arg: uint64) -> int64:
+    th_flag2 = cast[uint32](arg)
+    return 0
+
+
+def w_sleeper(arg: uint64) -> int64:
+    t0: uint64 = sched_now()
+    thread_sleep(arg * 10)
+    th_wake[arg] = sched_now() - t0
+    th_log(cast[uint32](arg))
+    return 0
+
+
+def w_spin(arg: uint64) -> int64:
+    n: uint64 = 0
+    while th_stop == 0:
+        n = n + 1
+    th_count[arg] = n
+    return 0
+
+
+def w_yielder(arg: uint64) -> int64:
+    i: uint32 = 0
+    while i < 4:
+        th_log(cast[uint32](arg))
+        thread_yield()
+        i = i + 1
+    return 0
+
+
+def w_nop(arg: uint64) -> int64:
+    return 0
+
+
+th_tids: Array[32, uint32]
+
+
+def test_threads():
+    printk0("-- 3. threads, sleep, time slices, priorities\n")
+    check(cast[uint32](join(spawn("exit", cast[uint64](&w_exit), 20, 3, 0)) == 41), "thread: create, run, exit code through join")
+    t0: uint64 = sched_now()
+    thread_sleep(50)
+    d: uint64 = sched_now() - t0
+    printk1("   thread_sleep(50) took %d ticks\n", d)
+    check(cast[uint32](d == 50), "sleep: 50 ticks by the SysTick count")
+    th_order_n = 0
+    s3: uint32 = spawn("sleep3", cast[uint64](&w_sleeper), 3, 3, 0)
+    s1: uint32 = spawn("sleep1", cast[uint64](&w_sleeper), 1, 3, 0)
+    s2: uint32 = spawn("sleep2", cast[uint64](&w_sleeper), 2, 3, 0)
+    join(s3)
+    join(s1)
+    join(s2)
+    check(cast[uint32](th_order[0] == 1 and th_order[1] == 2 and th_order[2] == 3), "sleep: three sleepers wake in deadline order")
+    printk3("   sleepers measured %d, %d and %d ticks\n", th_wake[1], th_wake[2], th_wake[3])
+    check(cast[uint32](th_wake[1] == 10 and th_wake[2] == 20 and th_wake[3] == 30), "sleep: each sleeper measured its own 10/20/30 ticks")
+    # two threads that never yield or block must both make progress
+    th_stop = 0
+    sw0: uint64 = sched_switches
+    a: uint32 = spawn("spin0", cast[uint64](&w_spin), 0, 4, 0)
+    b: uint32 = spawn("spin1", cast[uint64](&w_spin), 1, 4, 0)
+    thread_sleep(100)
+    th_stop = 1
+    join(a)
+    swa: uint64 = reap_switches
+    join(b)
+    swb: uint64 = reap_switches
+    printk4("   spinners counted %d and %d, were switched in %d and %d times\n", th_count[0], th_count[1], swa, swb)
+    check(cast[uint32](th_count[0] > 1000 and th_count[1] > 1000 and swa >= 4 and swb >= 4), "preemption: two CPU-bound threads share the CPU by time slice")
+    check(cast[uint32](th_count[0] < th_count[1] * 3 and th_count[1] < th_count[0] * 3), "preemption: round robin is roughly fair")
+    # priorities: the runner has priority 2
+    th_flag = 0
+    hi: uint32 = spawn("hi", cast[uint64](&w_flag), 7, 1, 0)
+    check(cast[uint32](th_flag == 7), "priority: a more urgent thread runs before thread_create returns")
+    join(hi)
+    th_flag2 = 0
+    lo: uint32 = spawn("lo", cast[uint64](&w_flag2), 9, 5, 0)
+    before: uint32 = th_flag2
+    join(lo)
+    check(cast[uint32](before == 0 and th_flag2 == 9), "priority: a less urgent thread waits until the runner blocks")
+    th_order_n = 0
+    y1: uint32 = spawn("yield1", cast[uint64](&w_yielder), 1, 3, 0)
+    y2: uint32 = spawn("yield2", cast[uint64](&w_yielder), 2, 3, 0)
+    join(y1)
+    join(y2)
+    check(cast[uint32](th_order_n == 8 and th_order[0] == 1 and th_order[1] == 2 and th_order[2] == 1 and th_order[3] == 2 and th_order[6] == 1 and th_order[7] == 2), "yield: two equal threads alternate")
+    # fill the thread table, then release everything
+    live0: uint32 = kheap.n_live
+    n: uint32 = 0
+    while n < 32:
+        th_tids[n] = spawn("fill", cast[uint64](&w_nop), 0, 5, 0)
+        if th_tids[n] == 0:
+            break
+        n = n + 1
+    k: uint32 = 0
+    while k < n:
+        join(th_tids[k])
+        k = k + 1
+    printk1("   %d more threads fitted in the table\n", cast[uint64](n))
+    check(cast[uint32](n == 29 and kheap.n_live == live0), "thread table: full at 32 threads (29 + idle, reaper, runner); joins release every stack")
+
+
+# ============================================================ 4. FP context
+# Expected checksums: output of tests/reference_m2.py.
+EXP1: uint64 = 0x62e4dcaf4e253d6c
+EXP2: uint64 = 0x0632d33d64327bd0
+EXP3: uint64 = 0x6b09613201aeb380
+EXP4: uint64 = 0x76db175d7964cced
+EXP5: uint64 = 0x2ed09b786f1da182
+EXP6: uint64 = 0x5ed2b94a73d1b0c7
+
+
+def w_stress(seed: uint64) -> int64:
+    return cast[int64](stress_mix(seed, 12000, 0))
+
+
+def w_fphold(seed: uint64) -> int64:
+    return cast[int64](fp_hold(seed, 20000))
+
+
+# Count a just-joined thread if it was switched in at least three times.
+def busy(n: uint32) -> uint32:
+    if reap_switches >= 3:
+        return n + 1
+    return n
+
+
+def test_fp_switch():
+    printk0("-- 4. context-switch stress: float64 and 64-bit integer maths under preemption\n")
+    sw0: uint64 = sched_switches
+    t0: uint64 = sched_now()
+    k1: uint32 = spawn("mixk1", cast[uint64](&w_stress), 1, 4, 0)
+    k2: uint32 = spawn("mixk2", cast[uint64](&w_stress), 2, 4, 0)
+    k3: uint32 = spawn("mixk3", cast[uint64](&w_stress), 3, 4, 0)
+    k4: uint32 = spawn("mixk4", cast[uint64](&w_stress), 4, 4, 0)
+    u5: uint32 = spawn("mixu5", cast[uint64](&u_stress), 5, 4, TF_USER)
+    u6: uint32 = spawn("mixu6", cast[uint64](&u_stress), 6, 4, TF_USER)
+    hk: uint32 = spawn("fpk", cast[uint64](&w_fphold), 0x1000, 4, 0)
+    hu: uint32 = spawn("fpu", cast[uint64](&u_fphold), 0x2000, 4, TF_USER)
+    hk2: uint32 = spawn("fpk2", cast[uint64](&w_fphold), 0x3000, 4, 0)
+    r1: uint64 = cast[uint64](join(k1))
+    nsw: uint32 = busy(0)
+    r2: uint64 = cast[uint64](join(k2))
+    nsw = busy(nsw)
+    r3: uint64 = cast[uint64](join(k3))
+    nsw = busy(nsw)
+    r4: uint64 = cast[uint64](join(k4))
+    nsw = busy(nsw)
+    r5: uint64 = cast[uint64](join(u5))
+    nsw = busy(nsw)
+    r6: uint64 = cast[uint64](join(u6))
+    nsw = busy(nsw)
+    h1: uint64 = cast[uint64](join(hk))
+    nsw = busy(nsw)
+    h2: uint64 = cast[uint64](join(hu))
+    nsw = busy(nsw)
+    h3: uint64 = cast[uint64](join(hk2))
+    nsw = busy(nsw)
+    printk3("   9 threads, %d ticks, %d context switches; %d of the threads were switched in 3 times or more\n", sched_now() - t0, sched_switches - sw0, cast[uint64](nsw))
+    printk4("   checksums %x %x %x %x\n", r1, r2, r3, r4)
+    check(cast[uint32](nsw >= 7 and sched_switches - sw0 >= 40), "stress: the threads were preempted and resumed many times while computing")
+    check(cast[uint32](r1 == EXP1 and r2 == EXP2), "stress: privileged threads 1-2 match the host reference bit for bit")
+    check(cast[uint32](r3 == EXP3 and r4 == EXP4), "stress: privileged threads 3-4 match the host reference bit for bit")
+    check(cast[uint32](r5 == EXP5 and r6 == EXP6), "stress: unprivileged threads (with system calls in the loop) match")
+    check(cast[uint32](h1 == 0 and h3 == 0), "fp registers: d0-d15 held their patterns in two privileged threads")
+    check(cast[uint32](h2 == 0), "fp registers: d0-d15 held their patterns in an unprivileged thread")
+
+
+# ============================================================ 5. synchronisation
+sy_m: Mutex
+sy_shared: volatile uint64 = 0
+sy_sem: Semaphore
+sy_cv: Cond
+sy_ready: volatile uint32 = 0
+sy_woken: volatile uint32 = 0
+sy_tokens: volatile uint32 = 0
+sy_q: MsgQueue
+sy_sum: uint64 = 0
+sy_seq_ok: uint32 = 0
+sy_prio_seen: uint32 = 0
+sy_got: volatile uint32 = 0
+sy_rc: volatile int32 = 0
+
+
+def spin(n: uint64):
+    k: uint64 = 0
+    while k < n:
+        th_flag2 = th_flag2 + 1
+        k = k + 1
+
+
+def w_counter(arg: uint64) -> int64:
+    i: uint32 = 0
+    while i < 300:
+        mutex_lock(&sy_m)
+        tmp: uint64 = sy_shared
+        spin(2000)
+        sy_shared = tmp + 1
+        mutex_unlock(&sy_m)
+        i = i + 1
+    return 0
+
+
+# priority inversion cast: L (5) holds the mutex, M (4) hogs the CPU, H (3) wants the mutex
+def w_low(arg: uint64) -> int64:
+    mutex_lock(&sy_m)
+    sy_got = 1
+    spin(1200000)
+    sy_prio_seen = thr(sched_current)[0].prio
+    th_log(1)
+    mutex_unlock(&sy_m)
+    return cast[int64](thr(sched_current)[0].prio)
+
+
+def w_mid(arg: uint64) -> int64:
+    spin(3000000)
+    th_log(2)
+    return 0
+
+
+def w_high(arg: uint64) -> int64:
+    mutex_lock(&sy_m)
+    th_log(3)
+    mutex_unlock(&sy_m)
+    return 0
+
+
+def w_holder(arg: uint64) -> int64:
+    mutex_lock(&sy_m)
+    sy_got = 1
+    thread_sleep(40)
+    mutex_unlock(&sy_m)
+    return 0
+
+
+def w_foreign_unlock(arg: uint64) -> int64:
+    return cast[int64](mutex_unlock(&sy_m))
+
+
+def w_producer(arg: uint64) -> int64:
+    i: uint32 = 0
+    while i < 50:
+        sem_post(&sy_sem)
+        if (i & 7) == 0:
+            thread_yield()
+        i = i + 1
+    return 0
+
+
+def w_consumer(arg: uint64) -> int64:
+    n: int64 = 0
+    while n < 50:
+        if sem_wait_timeout(&sy_sem, 500) != SYNC_OK:
+            break
+        n = n + 1
+    return n
+
+
+def w_cv_all(arg: uint64) -> int64:
+    mutex_lock(&sy_m)
+    while sy_ready == 0:
+        cond_wait(&sy_cv, &sy_m)
+    sy_woken = sy_woken + 1
+    mutex_unlock(&sy_m)
+    return 0
+
+
+def w_cv_token(arg: uint64) -> int64:
+    mutex_lock(&sy_m)
+    while sy_tokens == 0:
+        cond_wait(&sy_cv, &sy_m)
+    sy_tokens = sy_tokens - 1
+    sy_woken = sy_woken + 1
+    mutex_unlock(&sy_m)
+    return 0
+
+
+def w_mq_send(arg: uint64) -> int64:
+    msg: Array[2, uint32]
+    i: uint32 = 0
+    while i < 200:
+        msg[0] = i
+        msg[1] = i * 3 + 1
+        if mq_send(&sy_q, cast[uint64](&msg[0]), 1000) != SYNC_OK:
+            return -1
+        i = i + 1
+    return 0
+
+
+def w_mq_recv(arg: uint64) -> int64:
+    msg: Array[2, uint32]
+    i: uint32 = 0
+    ok: uint32 = 1
+    sum: uint64 = 0
+    while i < 200:
+        if mq_recv(&sy_q, cast[uint64](&msg[0]), 1000) != SYNC_OK:
+            return -1
+        if msg[0] != i:
+            ok = 0
+        sum = sum + cast[uint64](msg[1])
+        if (i % 50) == 49:
+            thread_sleep(2)             # let the queue fill: the sender must block
+        i = i + 1
+    sy_sum = sum
+    sy_seq_ok = ok
+    return 0
+
+
+def test_sync():
+    printk0("-- 5. mutex, semaphore, condition variable, message queue\n")
+    mutex_init(&sy_m)
+    sy_shared = 0
+    c0: uint32 = spawn("cnt0", cast[uint64](&w_counter), 0, 4, 0)
+    c1: uint32 = spawn("cnt1", cast[uint64](&w_counter), 1, 4, 0)
+    c2: uint32 = spawn("cnt2", cast[uint64](&w_counter), 2, 4, 0)
+    c3: uint32 = spawn("cnt3", cast[uint64](&w_counter), 3, 4, 0)
+    join(c0)
+    join(c1)
+    join(c2)
+    join(c3)
+    printk2("   shared counter %d, lockers had to wait %d times\n", sy_shared, cast[uint64](sy_m.contended))
+    check(cast[uint32](sy_shared == 1200), "mutex: 4 threads x 300 read-modify-write steps lose no update")
+    check(cast[uint32](sy_m.contended > 0), "mutex: the lock was contended (threads were preempted inside it)")
+    check(cast[uint32](mutex_lock(&sy_m) == SYNC_OK and mutex_lock(&sy_m) == SYNC_EDEADLK), "mutex: locking it twice is refused, not a deadlock")
+    fu: int64 = join(spawn("foreign", cast[uint64](&w_foreign_unlock), 0, 1, 0))
+    check(cast[uint32](fu == cast[int64](SYNC_EPERM) and mutex_unlock(&sy_m) == SYNC_OK), "mutex: only the owner can unlock")
+    sy_got = 0
+    h: uint32 = spawn("holder", cast[uint64](&w_holder), 0, 3, 0)
+    thread_sleep(5)
+    t0: uint64 = sched_now()
+    r_try: int32 = mutex_trylock(&sy_m)
+    r_to: int32 = mutex_lock_timeout(&sy_m, 10)
+    dt: uint64 = sched_now() - t0
+    r_lock: int32 = mutex_lock(&sy_m)
+    dt2: uint64 = sched_now() - t0
+    mutex_unlock(&sy_m)
+    join(h)
+    printk2("   timed lock gave up after %d ticks, plain lock got it after %d\n", dt, dt2)
+    check(cast[uint32](sy_got == 1 and r_try == SYNC_TIMEOUT and r_to == SYNC_TIMEOUT and dt == 10), "mutex: trylock and a 10-tick timed lock fail while it is held")
+    check(cast[uint32](r_lock == SYNC_OK and dt2 == 35), "mutex: a blocked locker gets it when the holder releases")
+    # priority inheritance
+    th_order_n = 0
+    sy_got = 0
+    lo: uint32 = spawn("low", cast[uint64](&w_low), 0, 5, 0)
+    while sy_got == 0:
+        thread_sleep(1)
+    hi: uint32 = spawn("high", cast[uint64](&w_high), 0, 3, 0)
+    mid: uint32 = spawn("mid", cast[uint64](&w_mid), 0, 4, 0)
+    lowp: int64 = join(lo)
+    join(hi)
+    join(mid)
+    printk4("   order of completion: %d %d %d (1 = low releases, 3 = high gets the mutex, 2 = middle finishes); low ran at priority %d\n", cast[uint64](th_order[0]), cast[uint64](th_order[1]), cast[uint64](th_order[2]), cast[uint64](sy_prio_seen))
+    check(cast[uint32](th_order[0] == 1 and th_order[1] == 3 and th_order[2] == 2), "priority inheritance: the middle thread cannot starve the mutex holder")
+    check(cast[uint32](sy_prio_seen == 3 and lowp == 5), "priority inheritance: holder boosted to 3 while holding, back to 5 after")
+    # semaphore
+    sem_init(&sy_sem, 0)
+    cons: uint32 = spawn("consumer", cast[uint64](&w_consumer), 0, 3, 0)
+    prod: uint32 = spawn("producer", cast[uint64](&w_producer), 0, 4, 0)
+    join(prod)
+    check(cast[uint32](join(cons) == 50 and sy_sem.count == 0), "semaphore: 50 posts, 50 waits, count back to zero")
+    t0 = sched_now()
+    r_sem: int32 = sem_wait_timeout(&sy_sem, 20)
+    check(cast[uint32](r_sem == SYNC_TIMEOUT and sched_now() - t0 == 20), "semaphore: a timed wait on an empty semaphore gives up after 20 ticks")
+    # condition variable
+    cond_init(&sy_cv)
+    sy_ready = 0
+    sy_woken = 0
+    w1: uint32 = spawn("cv1", cast[uint64](&w_cv_all), 0, 3, 0)
+    w2: uint32 = spawn("cv2", cast[uint64](&w_cv_all), 0, 3, 0)
+    w3: uint32 = spawn("cv3", cast[uint64](&w_cv_all), 0, 3, 0)
+    thread_sleep(10)
+    early: uint32 = sy_woken
+    mutex_lock(&sy_m)
+    sy_ready = 1
+    mutex_unlock(&sy_m)
+    cond_broadcast(&sy_cv)
+    join(w1)
+    join(w2)
+    join(w3)
+    check(cast[uint32](early == 0 and sy_woken == 3), "condition: broadcast wakes all three waiters, none before")
+    sy_tokens = 0
+    sy_woken = 0
+    w1 = spawn("tok1", cast[uint64](&w_cv_token), 0, 3, 0)
+    w2 = spawn("tok2", cast[uint64](&w_cv_token), 0, 3, 0)
+    thread_sleep(5)
+    mutex_lock(&sy_m)
+    sy_tokens = 1
+    mutex_unlock(&sy_m)
+    cond_signal(&sy_cv)
+    thread_sleep(10)
+    one: uint32 = sy_woken
+    mutex_lock(&sy_m)
+    sy_tokens = 1
+    mutex_unlock(&sy_m)
+    cond_signal(&sy_cv)
+    join(w1)
+    join(w2)
+    check(cast[uint32](one == 1 and sy_woken == 2), "condition: signal wakes exactly one waiter at a time")
+    mutex_lock(&sy_m)
+    t0 = sched_now()
+    r_cv: int32 = cond_wait_timeout(&sy_cv, &sy_m, 15)
+    check(cast[uint32](r_cv == SYNC_TIMEOUT and sched_now() - t0 == 15 and mutex_unlock(&sy_m) == SYNC_OK), "condition: a timed wait gives up after 15 ticks holding the mutex again")
+    # message queue
+    mq_init(&sy_q, 8, 4)
+    rx: uint32 = spawn("mqrecv", cast[uint64](&w_mq_recv), 0, 4, 0)
+    tx: uint32 = spawn("mqsend", cast[uint64](&w_mq_send), 0, 4, 0)
+    rtx: int64 = join(tx)
+    rrx: int64 = join(rx)
+    check(cast[uint32](rtx == 0 and rrx == 0 and sy_seq_ok == 1 and sy_sum == 59900), "message queue: 200 messages through 4 slots, in order, none lost")
+    msg: Array[2, uint32]
+    t0 = sched_now()
+    r_mq: int32 = mq_recv(&sy_q, cast[uint64](&msg[0]), 12)
+    check(cast[uint32](r_mq == SYNC_TIMEOUT and sched_now() - t0 == 12), "message queue: receive on an empty queue times out after 12 ticks")
+    mq_destroy(&sy_q)
+
+
+# ============================================================ 6. system calls
+sc_canary: volatile uint32 = 0x0BADCAFE
+
+
+def test_syscalls():
+    printk0("-- 6. system calls from an unprivileged thread\n")
+    ulive0: uint32 = uheap.n_live
+    ures: uint64 = umalloc_aligned(64 * 8, 16)
+    r: Ptr[int64] = cast[Ptr[int64]](ures)
+    i: uint32 = 0
+    while i < 64:
+        r[i] = -7777
+        i = i + 1
+    r[63] = cast[int64](cast[uint64](&sc_canary))     # a kernel address
+    sc0: uint64 = sys_count
+    bp0: uint64 = sys_bad_ptr
+    open0: uint32 = vfs_open_count()
+    t: Ptr[Thread] = thread_create("usys", cast[uint64](&u_syscalls), ures, 3, 8192, TF_USER)
+    tid: uint32 = t[0].tid
+    code: int64 = join(tid)
+    printk3("   the thread made %d system calls; %d were refused for a bad pointer; kernel stack high-water %d bytes\n", sys_count - sc0, sys_bad_ptr - bp0, reap_stack_used)
+    check(cast[uint32](code == 77), "syscall: the unprivileged thread ran to its end (exit code through SVC)")
+    check(cast[uint32](r[0] == cast[int64](tid) and r[58] == cast[int64](tid)), "syscall: getpid and gettid return the thread id")
+    check(cast[uint32](r[1] == 1), "syscall: the thread really is unprivileged (CONTROL.nPRIV = 1)")
+    check(cast[uint32](r[2] == 0 and r[3] == 3 and r[4] == 12 and r[5] == 0), "syscall: mkdir, open_write (first free fd is 3), write, close")
+    check(cast[uint32](r[6] == 12 and r[7] == 1), "syscall: open + read return what was written")
+    check(cast[uint32](r[8] == 6 and r[9] == 1 and r[10] == 12 and r[11] == 0), "syscall: lseek SET and END, read at the offset, 0 at end of file")
+    check(cast[uint32](r[12] == 72 and r[13] == 12 and r[14] == 0 and r[15] == 6), "syscall: stat returns a 9P record (length 12, plain file, name a.txt)")
+    check(cast[uint32](r[16] == 0x80), "syscall: stat marks a directory (qid.type = QTDIR)")
+    check(cast[uint32](r[17] == 6 and r[18] == 1), "syscall: reading a directory lists its names, one per line")
+    check(cast[uint32](r[19] == -16 and r[20] == 0), "syscall: unlink of an open file is refused (EBUSY), close succeeds")
+    check(cast[uint32](r[21] == 0 and r[22] == -2 and r[23] == 1), "syscall: rename; the old name is gone (ENOENT, errstr says why)")
+    check(cast[uint32](r[24] == -39 and r[25] == 0 and r[26] == 0 and r[27] == -2), "syscall: remove refuses a non-empty directory, then removes file and directory")
+    check(cast[uint32](r[28] == -14 and r[29] == -14 and r[30] == -14), "syscall: kernel addresses as buffer or path are refused (EFAULT)")
+    check(cast[uint32](r[31] == -14 and sc_canary == 0x0BADCAFE), "syscall: a read into constant data is refused; kernel memory untouched")
+    check(cast[uint32](r[32] == 8 and r[34] == 9 and r[35] == 0), "syscall: /dev/zero reads zeros, /dev/null swallows writes and reads empty")
+    check(cast[uint32](r[33] == -38 and r[36] == -9 and r[56] == -9), "syscall: unknown number is ENOSYS, bad descriptors are EBADF")
+    printk1("   sleep_ms(50) measured %d jiffies (100 Hz)\n", cast[uint64](r[37]))
+    check(cast[uint32](r[37] == 5 or r[37] == 6), "syscall: sleep_ms(50) takes 5 jiffies by get_jiffies")
+    check(cast[uint32](r[38] >= 0x60C00000 and r[39] == 0 and r[40] == 0x12345678 and r[41] == 0 and r[42] == -22), "syscall: mmap gives zeroed user memory, munmap frees it once")
+    check(cast[uint32](r[43] > 0 and r[44] == 0 and r[45] == 43), "syscall: thread_spawn + thread_join from user mode, exit code 43")
+    check(cast[uint32](r[46] == 0 and r[47] == 100 and r[48] == 104 and r[52] == 104), "syscall: create (dir and file), fstat, dup shares the file offset")
+    check(cast[uint32](r[49] == 0 and r[50] == 9 and r[51] == 1 and r[53] >= 0), "syscall: chdir, getcwd, relative and dot-dot paths")
+    check(cast[uint32](r[54] == 0 and r[55] == -2), "syscall: remove of the emptied directory; chdir to nowhere fails")
+    check(cast[uint32](r[57] == 0 and r[59] == 9 and r[60] == 0), "syscall: writes to /dev/console and through dup2")
+    check(cast[uint32](vfs_open_count() == open0), "syscall: no open file left behind by the thread")
+    ufree(ures)
+    check(cast[uint32](uheap.n_live == ulive0), "syscall: user arena back to its starting block count (stacks freed)")
+
+
+# ============================================================ 7. memory protection
+mp_secret: volatile uint32 = 0x5EC2E7
+mp_beat: volatile uint64 = 0
+mp_stop: volatile uint32 = 0
+
+
+def w_heartbeat(arg: uint64) -> int64:
+    while mp_stop == 0:
+        mp_beat = mp_beat + 1
+        thread_sleep(1)
+    return 0
+
+
+def test_mpu():
+    printk0("-- 7. memory protection: each fault must end only the thread that caused it\n")
+    klive0: uint32 = kheap.n_live
+    ulive0: uint32 = uheap.n_live
+    hb: uint32 = spawn("heartbeat", cast[uint64](&w_heartbeat), 0, 1, 0)
+    beat0: uint64 = mp_beat
+    tc0: uint32 = trap_count
+    # (a) unprivileged stack overflow
+    t: uint32 = spawn("deep-user", cast[uint64](&fault_stack_overflow), 1, 3, TF_USER)
+    code: int64 = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_kind == FAULT_STACK_OVERFLOW), "mpu: unprivileged stack overflow hits the guard, thread ended (139)")
+    check(cast[uint32](trap_last_addr >= 0x60C00000 and (trap_last_addr & 0x3FF) < 0x400 and trap_count == tc0 + 1), "mpu: the faulting address is inside the thread's user-stack guard")
+    # (b) privileged stack overflow
+    t = spawn("deep-kern", cast[uint64](&fault_stack_overflow), 1, 3, 0)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_kind == FAULT_STACK_OVERFLOW and trap_last_addr < 0x60C00000 and trap_last_addr >= 0x60000000), "mpu: a kernel thread overflowing its stack is caught the same way")
+    # (c) unprivileged read and write of kernel data
+    t = spawn("peek", cast[uint64](&fault_read), cast[uint64](&mp_secret), 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_kind == FAULT_ACCESS and trap_last_addr == cast[uint32](cast[uint64](&mp_secret))), "mpu: unprivileged read of a kernel variable faults at its address")
+    t = spawn("poke", cast[uint64](&fault_write), cast[uint64](&mp_secret), 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_kind == FAULT_ACCESS and mp_secret == 0x5EC2E7), "mpu: unprivileged write to a kernel variable faults, value unchanged")
+    t = spawn("heap-peek", cast[uint64](&fault_read), cast[uint64](kheap.base) + 64, 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_addr == kheap.base + 64), "mpu: unprivileged read of the kernel heap faults")
+    t = spawn("uart-poke", cast[uint64](&fault_write), 0x40004000, 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_addr == 0x40004000), "mpu: unprivileged write to a peripheral register faults")
+    # (d) the same functions run to completion when allowed
+    t = spawn("kpeek", cast[uint64](&fault_read), cast[uint64](&mp_secret), 3, 0)
+    check(cast[uint32](join(t) == 0x5EC2E7 + 1000), "mpu: control -- a privileged thread reads the same variable normally")
+    um: uint64 = umalloc_aligned(64, 16)
+    cast[Ptr[uint32]](um)[0] = 41
+    t = spawn("upeek", cast[uint64](&fault_read), um, 3, TF_USER)
+    check(cast[uint32](join(t) == 1041), "mpu: control -- an unprivileged thread reads user-arena memory normally")
+    # (e) null pointers
+    t = spawn("null-user", cast[uint64](&fault_read), 0, 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_addr == 0), "mpu: unprivileged null pointer read faults at address 0")
+    t = spawn("null-kern", cast[uint64](&fault_write), 8, 3, 0)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t and trap_last_addr == 8), "mpu: privileged null pointer write (offset 8) faults too")
+    t = spawn("jump-null", cast[uint64](&fault_jump), 0, 3, 0)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t), "mpu: calling a null function pointer faults")
+    # (f) code and constants are read-only, data is not executable
+    lit: Ptr[uint8] = "constant text"
+    t = spawn("rom-write", cast[uint64](&fault_write), cast[uint64](lit), 3, 0)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_addr == cast[uint32](cast[uint64](lit)) and lit[0] == 99), "mpu: even privileged code cannot write to constants")
+    cast[Ptr[uint16]](um)[0] = 0x4770                # `bx lr`
+    t = spawn("exec-data", cast[uint64](&fault_jump), um + 1, 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 139 and trap_last_tid == t), "mpu: data is not executable (jump into the user arena faults)")
+    ufree(um)
+    # (g) an undefined instruction is a usage fault, also survivable
+    t = spawn("undefined", cast[uint64](&fault_udf), 0, 3, TF_USER)
+    code = join(t)
+    check(cast[uint32](code == 132 and trap_last_kind == FAULT_USAGE), "fault: undefined instruction ends the thread with 132")
+    mp_stop = 1
+    join(hb)
+    printk2("   %d faults handled; the heartbeat thread counted %d beats meanwhile\n", cast[uint64](trap_count - tc0), mp_beat - beat0)
+    check(cast[uint32](trap_count == tc0 + 12 and mp_beat > beat0), "fault: twelve faults, the other threads kept running")
+    check(cast[uint32](kheap.n_live == klive0 and uheap.n_live == ulive0 and heap_check(&kheap) == 0 and heap_check(&uheap) == 0), "fault: the stacks of all ended threads were released, heaps intact")
+
+
+# ============================================================ 8. file system
+fs_buf: Array[4096, uint8]
+
+
+def fs_pattern(i: uint64) -> uint8:
+    return cast[uint8]((i * 31 + (i >> 8) * 7 + 5) & 255)
+
+
+def test_fs():
+    printk0("-- 8. file system (Hamnix tmpfs through the HackOS file layer)\n")
+    open0: uint32 = vfs_open_count()
+    # a file larger than three 64 KiB tmpfs chunks, written in odd-sized pieces
+    fd: int32 = vfs_open("/tmp/big.bin", OWRITE | OTRUNC | OCREATE)
+    total: uint64 = 0
+    okw: uint32 = 1
+    while total < 200000:
+        n: uint64 = 3001
+        if total + n > 200000:
+            n = 200000 - total
+        k: uint64 = 0
+        while k < n:
+            fs_buf[k] = fs_pattern(total + k)
+            k = k + 1
+        if vfs_write(fd, &fs_buf[0], n) != cast[int64](n):
+            okw = 0
+            break
+        total = total + n
+    vfs_close(fd)
+    fd = vfs_open("/tmp/big.bin", OREAD)
+    size: int64 = vfs_lseek(fd, 0, 2)
+    vfs_lseek(fd, 0, 0)
+    bad: uint64 = 0
+    pos: uint64 = 0
+    got: int64 = vfs_read(fd, &fs_buf[0], 4096, 0)
+    while got > 0:
+        k2: uint64 = 0
+        while k2 < cast[uint64](got):
+            if fs_buf[k2] != fs_pattern(pos + k2):
+                bad = bad + 1
+            k2 = k2 + 1
+        pos = pos + cast[uint64](got)
+        got = vfs_read(fd, &fs_buf[0], 4096, 0)
+    # random access across a chunk boundary
+    vfs_lseek(fd, 65530, 0)
+    vfs_read(fd, &fs_buf[0], 12, 0)
+    edge: uint32 = 1
+    k3: uint64 = 0
+    while k3 < 12:
+        if fs_buf[k3] != fs_pattern(65530 + k3):
+            edge = 0
+        k3 = k3 + 1
+    vfs_close(fd)
+    check(cast[uint32](okw == 1 and size == 200000 and pos == 200000 and bad == 0), "fs: 200000-byte file written in pieces reads back identical")
+    check(cast[uint32](edge == 1), "fs: seek + read across a 64 KiB chunk boundary")
+    # append and truncate
+    fd = vfs_open("/tmp/log.txt", OWRITE | OCREATE)
+    vfs_write(fd, "one\n", 4)
+    vfs_close(fd)
+    fd = vfs_open("/tmp/log.txt", OWRITE | OAPPEND)
+    vfs_write(fd, "two\n", 4)
+    vfs_close(fd)
+    fd = vfs_open("/tmp/log.txt", OREAD)
+    n2: int64 = vfs_read(fd, &fs_buf[0], 64, 0)
+    vfs_close(fd)
+    app: uint32 = cast[uint32](n2 == 8 and fs_buf[0] == 111 and fs_buf[4] == 116 and fs_buf[7] == 10)
+    fd = vfs_open("/tmp/log.txt", OWRITE | OTRUNC)
+    vfs_close(fd)
+    fd = vfs_open("/tmp/log.txt", OREAD)
+    n3: int64 = vfs_read(fd, &fs_buf[0], 64, 0)
+    vfs_close(fd)
+    check(cast[uint32](app == 1 and n3 == 0), "fs: append adds at the end, truncate empties the file")
+    # many small files in a directory
+    vfs_mkdir("/tmp/many")
+    name: Array[32, uint8]
+    made: uint32 = 0
+    i: uint32 = 0
+    while i < 40:
+        name[0] = 47
+        name[1] = 116
+        name[2] = 109
+        name[3] = 112
+        name[4] = 47
+        name[5] = 109
+        name[6] = 97
+        name[7] = 110
+        name[8] = 121
+        name[9] = 47
+        name[10] = 102
+        name[11] = cast[uint8](48 + i / 10)
+        name[12] = cast[uint8](48 + i % 10)
+        name[13] = 0
+        fd = vfs_open(&name[0], OWRITE | OCREATE)
+        if fd >= 0:
+            vfs_write(fd, &name[0], 13)
+            vfs_close(fd)
+            made = made + 1
+        i = i + 1
+    fd = vfs_open("/tmp/many", OREAD)
+    listed: int64 = vfs_read(fd, &fs_buf[0], 4096, 0)
+    vfs_close(fd)
+    check(cast[uint32](made == 40 and listed == 160 and fs_buf[0] == 102 and fs_buf[3] == 10), "fs: 40 files created, the directory lists 40 names")
+    check(cast[uint32](vfs_unlink("/tmp/many") == -39), "fs: a directory with files in it cannot be removed")
+    removed: uint32 = 0
+    i = 0
+    while i < 40:
+        name[11] = cast[uint8](48 + i / 10)
+        name[12] = cast[uint8](48 + i % 10)
+        if vfs_unlink(&name[0]) == 0:
+            removed = removed + 1
+        i = i + 1
+    check(cast[uint32](removed == 40 and vfs_unlink("/tmp/many") == 0 and vfs_open("/tmp/many", OREAD) == -2), "fs: all 40 removed, then the directory")
+    check(cast[uint32](vfs_rename("/tmp/big.bin", "/etc/moved.bin") == 0 and vfs_open("/tmp/big.bin", OREAD) == -2), "fs: rename across directories")
+    fd = vfs_open("/etc/moved.bin", OREAD)
+    sz2: int64 = vfs_lseek(fd, 0, 2)
+    vfs_close(fd)
+    check(cast[uint32](sz2 == 200000 and vfs_unlink("/etc/moved.bin") == 0 and vfs_unlink("/tmp/log.txt") == 0), "fs: the renamed file kept its contents; clean-up")
+    check(cast[uint32](vfs_open("/dev/nothing", OREAD) == -2 and vfs_mkdir("/dev/x") == -30 and vfs_unlink("/") == -16), "fs: /dev is fixed, the root cannot be removed")
+    check(cast[uint32](vfs_open_count() == open0), "fs: no descriptor leaked")
+    printk2("   kernel heap after the file tests: %d bytes in %d live blocks\n", cast[uint64](kheap.used_bytes), cast[uint64](kheap.n_live))
+
+
+# ============================================================ 9. console input
+def line_is(buf: Ptr[uint8], n: int64, want: Ptr[uint8]) -> uint32:
+    i: int64 = 0
+    while want[i] != 0:
+        if i >= n or buf[i] != want[i]:
+            return 0
+        i = i + 1
+    if i == n:
+        return 1
+    return 0
+
+
+def test_console():
+    printk0("-- 9. console: lines typed into QEMU's serial port (injected by the harness)\n")
+    buf: Array[128, uint8]
+    console_rx_enable()
+    n: int64 = vfs_read(0, &buf[0], 127, 0)
+    check(line_is(&buf[0], n, "status report\n"), "console: a line arrives through the UART receive interrupt")
+    n = vfs_read(0, &buf[0], 127, 0)
+    check(line_is(&buf[0], n, "backspace works\n"), "console: backspace and DEL erase characters")
+    n = vfs_read(0, &buf[0], 127, 0)
+    check(line_is(&buf[0], n, "second try\n"), "console: Ctrl-U erases the line")
+    n = vfs_read(0, &buf[0], 4, 0)
+    n2: int64 = vfs_read(0, &buf[4], 100, 0)
+    check(cast[uint32](n == 4 and n2 == 6 and line_is(&buf[0], 10, "long line\n") == 1), "console: a short read takes part of a line, the next read the rest")
+    n = vfs_read(0, &buf[0], 127, 0)
+    check(cast[uint32](n == 0), "console: Ctrl-D on an empty line reads as end of file")
+    n = console_read(&buf[0], 16, 1)
+    check(cast[uint32](n == 0 and con_rx_irqs > 0 and con_rx_dropped == 0), "console: non-blocking read returns 0 when nothing is waiting")
+    printk2("   %d bytes received in %d receive interrupts\n", con_rx_bytes, con_rx_irqs)
+    # raw mode: bytes fed by the test itself, not by the UART
+    console_set_mode(CON_RAW)
+    irq: uint32 = cpu_irq_save()
+    console_input(27)
+    console_input(91)
+    console_input(65)
+    console_input(13)
+    cpu_irq_restore(irq)
+    n = console_read(&buf[0], 16, 1)
+    console_set_mode(CON_COOKED)
+    check(cast[uint32](n == 4 and buf[0] == 27 and buf[2] == 65 and buf[3] == 13), "console: raw mode passes bytes through unedited (fed by the test, not the UART)")
+
+
+# ============================================================ benchmark
+bn_n: volatile uint64 = 0
+
+
+def w_ping(arg: uint64) -> int64:
+    i: uint64 = 0
+    while i < arg:
+        thread_yield()
+        i = i + 1
+    return 0
+
+
+def cycles_now() -> uint64:
+    irq: uint32 = cpu_irq_save()
+    t: uint64 = sched_now()
+    cv: uint32 = mmio_read32(0xE000E018)
+    t2: uint64 = sched_now()
+    cpu_irq_restore(irq)
+    return t * 25000 + cast[uint64](24999 - cv)
+
+
+def bench_switch():
+    # Two threads that only yield to each other: 2 x N switches.  The figure is
+    # CPU-clock cycles of the emulated 25 MHz timer; under `-icount shift=0`
+    # QEMU advances that clock 1 ns per instruction, i.e. 40 instructions per
+    # cycle (see `make measure-switch`).  Without -icount it is only wall time.
+    c0: uint64 = cycles_now()
+    sw0: uint64 = sched_switches
+    a: uint32 = spawn("ping", cast[uint64](&w_ping), 2000, 4, 0)
+    b: uint32 = spawn("pong", cast[uint64](&w_ping), 2000, 4, 0)
+    join(a)
+    join(b)
+    c1: uint64 = cycles_now()
+    printk3("BENCH yield ping-pong: %d context switches in %d timer cycles (x40 = instructions under -icount shift=0)\n", sched_switches - sw0, c1 - c0, 0)
+
+
+def runner(arg: uint64) -> int64:
+    vfs_open_stdio()
+    test_boot()
+    test_heap()
+    test_threads()
+    test_fp_switch()
+    test_sync()
+    test_syscalls()
+    test_mpu()
+    test_fs()
+    bench_switch()
+    test_console()
+    if failures == 0:
+        printk0("RESULT: PASS (all checks passed)\n")
+    else:
+        printk1("RESULT: FAIL (%d checks failed)\n", cast[uint64](failures))
+    hackos_exit(failures)
+    return 0
+
+
+def main() -> int32:
+    kputs("\nHackOS 0.2 kernel test (milestone 2) -- QEMU mps2-an500\n")
+    kernel_init()
+    thread_create("runner", cast[uint64](&runner), 0, 2, 16384, 0)
+    sched_start()
+    return 0

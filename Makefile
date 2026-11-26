@@ -58,9 +58,9 @@ $(B)/%.ll: $(SRC_AD) $(HOST_AC) | $(B)
 ROOT_hackos := init/main.ad
 ROOT_selftest := demo/main.ad
 KOBJS_hackos := $(B)/switch.o
+ROOT_ktest := tests/ktest_main.ad
+KOBJS_ktest := $(B)/switch.o $(B)/fptest.o
 ROOT_faulttest := tests/fault_main.ad
-ROOT_t1 := tests/scratch/t1.ad
-KOBJS_t1 := $(B)/switch.o
 
 $(B)/%.o: $(B)/%.ll
 	$(CLANG) $(LLFLAGS) -c $< -o $@
@@ -68,7 +68,10 @@ $(B)/%.o: $(B)/%.ll
 $(B)/%.o: arch/armv7m/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o boards/mps2_an500/link.ld
+$(B)/%.o: tests/arch/%.S | $(B)
+	$(CLANG) $(ASFLAGS) -c $< -o $@
+
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o boards/mps2_an500/link.ld
 	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/cpu.o $(KOBJS_$*) $<
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 
@@ -78,7 +81,7 @@ run: $(B)/hackos.elf
 size: $(B)/hackos.elf
 	$(SIZE) $<
 
-test: $(B)/hackos.elf $(B)/faulttest.elf
+test: $(B)/hackos.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf
 	ADDER=$(ADDER) bash tests/run_all.sh
 
 measure: $(HOST_AC)

@@ -37,6 +37,7 @@ con_eof: uint32 = 0                # pending end-of-file marks
 con_mode: uint32 = 1
 con_rx_bytes: uint64 = 0           # statistics
 con_rx_dropped: uint64 = 0
+con_rx_irqs: uint64 = 0            # receive interrupts taken
 con_ready: uint32 = 0
 
 
@@ -153,6 +154,7 @@ def console_input(ch: uint32):
 # IRQ 0: UART0 receive.
 def uart0_rx_handler():
     irq: uint32 = cpu_irq_save()
+    con_rx_irqs = con_rx_irqs + 1
     # Acknowledge first, then drain: a byte that arrives after the drain
     # raises the interrupt again instead of being acknowledged unseen.
     board_console_rx_irq_ack()

@@ -106,6 +106,10 @@ sched_running: uint32 = 0
 sched_ticks: volatile uint64 = 0
 sched_switches: uint64 = 0
 sched_next_tid: uint32 = 1
+# Figures of the thread released last (it is gone once joined).
+reap_switches: uint64 = 0
+reap_cpu_ticks: uint64 = 0
+reap_stack_used: uint64 = 0
 rq_head: Array[8, uint64]
 rq_tail: Array[8, uint64]
 timer_head: uint64 = 0
@@ -576,6 +580,9 @@ def thread_kill_current_from_fault(code: int64, kind: uint32, addr: uint32):
 # Release a zombie.  Thread context only: a thread that was ended by a fault
 # could not release its own resources, so the exit hook runs here for it.
 def _reap(t: Ptr[Thread]):
+    reap_switches = t[0].switches
+    reap_cpu_ticks = t[0].cpu_ticks
+    reap_stack_used = thread_kstack_used(t)
     if t[0].fault_kind != 0 and sched_exit_hook_set != 0:
         sched_exit_hook(cast[uint64](t))
     _free_stacks(cast[uint64](t))
