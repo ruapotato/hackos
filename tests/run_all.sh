@@ -3,7 +3,8 @@
 # Copyright (C) 2026 David Hamner
 # HackOS test runner (called by `make test` after the images are built).
 #   1. compiler-side checks from the Adder tree (IR / disassembly, no emulator)
-#   2. the Hamnix copies are unmodified
+#   2. the Hamnix copies and the third-party C code are unmodified; C and
+#      Adder only meet through extern "C" (tests/check_c_link.sh)
 #   3. static checks on the linked images
 #   4. run-time self-test (milestone 1: arithmetic, FPU, start-up) under QEMU
 #   5. kernel tests under QEMU, with console input injected into the UART
@@ -80,6 +81,30 @@ while read -r sum path; do
 done < fs/HAMNIX_ORIGIN
 [ "$ncopies" = 4 ] && ok "4 copied files listed" || bad "$ncopies copied files listed, expected 4"
 
+echo "[test] === 2b. third-party C code is unmodified, and C and Adder only meet through extern \"C\""
+nthird=0
+while read -r sum name; do
+    [ ${#sum} = 64 ] || continue
+    nthird=$((nthird+1))
+    have="$(sha256sum < "third_party/sensirion-sht4x/$name" | cut -d' ' -f1)"
+    [ "$have" = "$sum" ] || bad "third_party/sensirion-sht4x/$name differs from the recorded upstream file"
+done < third_party/sensirion-sht4x/UPSTREAM
+[ "$nthird" = 9 ] && ok "9 Sensirion files match the hashes in UPSTREAM" || bad "$nthird Sensirion files listed in UPSTREAM, expected 9"
+KO="$B/startup.o $B/cpu.o $B/switch.o $B/fptest.o"
+if bash tests/check_c_link.sh $B/ktest.ll $B/ktest.o $KO -- $B/c/*.o > $B/clink.log 2>&1; then
+    ok "link rule: $(sed 's/^ok: //' $B/clink.log)"
+else
+    bad "link rule violated"; cat $B/clink.log
+fi
+# the rule must catch a C object that uses bare libc names or kernel functions
+"${CLANG:-clang}" --target=thumbv7em-none-eabihf -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -ffreestanding -fno-builtin -O1 \
+    -c tests/c/bad_libc.c -o $B/c_bad.o 2>$B/c_bad.err || bad "cannot compile tests/c/bad_libc.c"
+bash tests/check_c_link.sh $B/ktest.ll $B/ktest.o $KO -- $B/c/*.o $B/c_bad.o > $B/clink_bad.log 2>&1; rc=$?
+[ $rc -ne 0 ] && ok "link rule rejects a bad C object" || bad "link rule accepted tests/c/bad_libc.c"
+expect "  ... C calling the Adder-convention memcpy" $B/clink_bad.log "^R1: C code calls 'memcpy'"
+expect "  ... C calling an Adder kernel function" $B/clink_bad.log "^R1: C code calls 'kmalloc'"
+expect "  ... C defining a bare C library name" $B/clink_bad.log "^R3: .*'strlen'"
+
 echo "[test] === 3. static checks on the images"
 for img in hackos ktest selftest; do
     undef="$("$NM" -u $B/$img.elf | wc -l)"
@@ -123,7 +148,7 @@ nfail="$(grep -c '^FAIL ' $B/selftest.out)"; npass="$(grep -c '^PASS ' $B/selfte
 [ "$npass" = "$EXPECTED_SELF" ] && ok "$npass PASS lines (all $EXPECTED_SELF checks ran)" || bad "$npass PASS lines, expected $EXPECTED_SELF"
 expect "RESULT: PASS" $B/selftest.out '^RESULT: PASS'
 
-echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, console)"
+echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, console)"
 EXPECTED_K="$(grep -cE '^ +check\(' tests/ktest_main.ad)"
 qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT"
 if wait_for "-- 9. console"; then

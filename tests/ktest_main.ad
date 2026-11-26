@@ -27,6 +27,9 @@ from drivers.tty.console import console_rx_enable, console_input, console_set_mo
 from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf
 from tests.kt_user import stress_mix, u_stress, u_fphold, u_syscalls, u_child, f64_bits
 
+from tests.kt_cinterop import ci_scalars, ci_callback, ci_structs, ci_sht_serial, ci_sht_measure, ci_sht_negative, ci_sht_errors, ci_dt, ci_t, ci_rh, fk_writes, fk_reads
+from drivers.i2c.sensirion_hal import hal_calls
+
 extern def fp_hold(seed: uint64, loops: uint64) -> uint64
 
 failures: uint32 = 0
@@ -889,6 +892,20 @@ def test_console():
     check(cast[uint32](n == 4 and buf[0] == 27 and buf[2] == 65 and buf[3] == 13), "console: raw mode passes bytes through unedited (fed by the test, not the UART)")
 
 
+# ============================================================ 10. C code
+def test_c():
+    printk0("-- 10. C code linked into the image: direct calls both ways, a vendor driver\n")
+    check(ci_scalars(), "C: integers of every width, float and double arguments, signed results")
+    check(ci_callback(), "C: a C function calls an Adder function through a pointer, 10 times")
+    check(ci_structs(), "C: structures by pointer in both directions; C library shim (memset, strlen, ...)")
+    check(ci_sht_serial(), "SHT4x driver (Sensirion, C): serial number read from the emulated sensor")
+    check(ci_sht_measure(), "SHT4x driver: 25.0 C / 56.5 %RH measured; its 10 ms wait slept in the scheduler")
+    printk3("   driver reported %d milli-C, %d milli-%%RH; the measurement took %d ticks\n", cast[uint64](ci_t[0]), cast[uint64](ci_rh[0]), ci_dt)
+    check(ci_sht_negative(), "SHT4x driver: negative temperature and raw ticks through pointers")
+    check(ci_sht_errors(), "SHT4x driver: CRC error detected, soft reset, missing device reported as -1")
+    printk3("   the C driver made %d calls into Adder (bus and sleep); the emulated sensor saw %d writes and %d reads\n", hal_calls, cast[uint64](fk_writes), cast[uint64](fk_reads))
+
+
 # ============================================================ benchmark
 bn_n: volatile uint64 = 0
 
@@ -935,6 +952,7 @@ def runner(arg: uint64) -> int64:
     test_syscalls()
     test_mpu()
     test_fs()
+    test_c()
     bench_switch()
     test_console()
     if failures == 0:

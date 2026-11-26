@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- Sensirion SHT4x humidity and temperature sensor: Adder
+# declarations for the vendor's C driver (third_party/sensirion-sht4x,
+# sht4x_i2c.h).  Calling one of these is a direct call into C.
+#
+# Results come back through pointers to C integers: pass the address of an
+# Array[1, int32] (or of any 4-byte cell), not of a 64-bit Adder local.
+
+from drivers.i2c.sensirion_hal import sensirion_i2c_hal_read, sensirion_i2c_hal_write, sensirion_i2c_hal_sleep_usec, sensirion_i2c_hal_init, sensirion_i2c_hal_free, sensirion_i2c_hal_select_bus
+
+SHT4X_ADDR_A: uint32 = 0x44
+SHT4X_NO_ERROR: int32 = 0
+SHT4X_CRC_ERROR: int32 = 1
+
+extern "C" def sht4x_init(i2c_address: uint8)
+# temperature in milli degrees Celsius, humidity in milli percent RH
+extern "C" def sht4x_measure_high_precision(temperature: Ptr[int32], humidity: Ptr[int32]) -> int16
+extern "C" def sht4x_measure_lowest_precision_ticks(temperature_ticks: Ptr[uint16], humidity_ticks: Ptr[uint16]) -> int16
+extern "C" def sht4x_serial_number(serial_number: Ptr[uint32]) -> int16
+extern "C" def sht4x_soft_reset() -> int16

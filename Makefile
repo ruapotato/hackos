@@ -31,6 +31,15 @@ ASFLAGS := $(CPUFLAGS) -ffreestanding
 LDFLAGS := -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static
 
 B := build
+
+# C code (third-party drivers and their tests): natural C ABI, no C library
+# except lib/cshim, whose functions carry hackos_c_ names (the forced include
+# renames the usual ones; see lib/cshim/include/hackos_libc_rename.h).
+CFLAGS  := $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fno-pic -ffunction-sections -fdata-sections \
+           -Wall -Wextra -isystem lib/cshim/include -include lib/cshim/include/hackos_libc_rename.h
+C_SHT4X := third_party/sensirion-sht4x
+COBJS_ktest := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common.o $(B)/c/interop.o $(B)/c/libc.o
+
 SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/mps2_an500/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
 
 .SECONDARY:
@@ -68,11 +77,23 @@ $(B)/%.o: $(B)/%.ll
 $(B)/%.o: arch/armv7m/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
+$(B)/c/%.o: $(C_SHT4X)/%.c | $(B)
+	@mkdir -p $(B)/c
+	$(CLANG) $(CFLAGS) -I$(C_SHT4X) -c $< -o $@
+
+$(B)/c/%.o: tests/c/%.c | $(B)
+	@mkdir -p $(B)/c
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(B)/c/%.o: lib/cshim/%.c | $(B)
+	@mkdir -p $(B)/c
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
 $(B)/%.o: tests/arch/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o boards/mps2_an500/link.ld
-	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/cpu.o $(KOBJS_$*) $<
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(COBJS_ktest) boards/mps2_an500/link.ld
+	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $<
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 
 run: $(B)/hackos.elf

@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- I2C bus, software side.
+#
+# A device is an address plus a write and a read function.  There is no I2C
+# controller driver yet (the emulated board's is not modelled usefully and the
+# target's LPI2C needs the real chip), so the only devices are ones attached
+# in software: tests attach an emulated sensor.  A controller driver will
+# provide the same two entry points for real devices.
+
+I2C_MAX_DEV: uint32 = 8
+I2C_OK: int32 = 0
+I2C_NACK: int32 = -1
+
+
+class I2cDev:
+    addr: uint32
+    used: uint32
+    wr: uint64                      # Fn[int32, Ptr[uint8], uint32]
+    rd: uint64                      # Fn[int32, Ptr[uint8], uint32]
+
+
+i2c_devs: Array[8, I2cDev]
+i2c_transfers: uint64 = 0
+
+
+def i2c_attach(addr: uint32, wr: uint64, rd: uint64) -> int32:
+    i: uint32 = 0
+    while i < I2C_MAX_DEV:
+        if i2c_devs[i].used == 0:
+            i2c_devs[i].addr = addr
+            i2c_devs[i].wr = wr
+            i2c_devs[i].rd = rd
+            i2c_devs[i].used = 1
+            return 0
+        i = i + 1
+    return -1
+
+
+def i2c_detach(addr: uint32):
+    i: uint32 = 0
+    while i < I2C_MAX_DEV:
+        if i2c_devs[i].used != 0 and i2c_devs[i].addr == addr:
+            i2c_devs[i].used = 0
+        i = i + 1
+
+
+def _i2c_find(addr: uint32) -> int32:
+    i: uint32 = 0
+    while i < I2C_MAX_DEV:
+        if i2c_devs[i].used != 0 and i2c_devs[i].addr == addr:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# Write n bytes to the device at `addr`.  I2C_OK, or I2C_NACK when nothing
+# answers at that address.
+def i2c_write(addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
+    d: int32 = _i2c_find(addr)
+    if d < 0:
+        return I2C_NACK
+    i2c_transfers = i2c_transfers + 1
+    f: Fn[int32, Ptr[uint8], uint32] = cast[Fn[int32, Ptr[uint8], uint32]](i2c_devs[d].wr)
+    return f(data, n)
+
+
+def i2c_read(addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
+    d: int32 = _i2c_find(addr)
+    if d < 0:
+        return I2C_NACK
+    i2c_transfers = i2c_transfers + 1
+    f: Fn[int32, Ptr[uint8], uint32] = cast[Fn[int32, Ptr[uint8], uint32]](i2c_devs[d].rd)
+    return f(data, n)

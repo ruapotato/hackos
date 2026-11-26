@@ -1,0 +1,228 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS kernel test: Adder <-> C.
+#
+#   * tests/c/interop.c: every argument class, results by signedness, a C
+#     function calling back through a function pointer, structures by pointer,
+#     the C library shim.
+#   * the unmodified Sensirion SHT4x driver (third_party/sensirion-sht4x)
+#     talking to an emulated sensor on the software I2C bus; its platform layer
+#     is Adder code that the C driver calls.
+
+from kernel.sched.core import sched_now
+from drivers.i2c.bus import i2c_attach, i2c_detach, i2c_transfers
+from drivers.i2c.sensirion_hal import hal_sleep_usec_total, hal_calls
+from drivers.i2c.sht4x import sht4x_init, sht4x_measure_high_precision, sht4x_measure_lowest_precision_ticks, sht4x_serial_number, sht4x_soft_reset
+
+
+class CRec:                         # struct hk_rec in tests/c/interop.c
+    tag: uint8
+    len: uint16
+    crc: uint32
+    big: uint64
+    ratio: float64
+    name: Array[12, uint8]
+
+
+extern "C" def hk_c_mix(a: uint64, b: int32, d: float64, f: float32, u8: uint8, s16: int16) -> float64
+extern "C" def hk_c_wide(a: int8, b: int16, c: uint16) -> int64
+extern "C" def hk_c_neg8(v: int32) -> int8
+extern "C" def hk_c_u16(v: uint32) -> uint16
+extern "C" def hk_c_apply(fn: Fn[uint32, uint32, Ptr[uint32]], ctx: Ptr[uint32], n: uint32) -> uint32
+extern "C" def hk_c_fill(r: Ptr[CRec], name: Ptr[uint8]) -> uint32
+extern "C" def hk_c_check(r: Ptr[CRec]) -> uint32
+
+ci_rec: CRec
+ci_calls: Array[1, uint32]
+
+
+# Called BY C through a function pointer.
+extern "C" def ci_square(i: uint32, ctx: Ptr[uint32]) -> uint32:
+    ctx[0] = ctx[0] + 1
+    return i * i
+
+
+# ---- an emulated SHT4x on the software I2C bus ------------------------------
+# Protocol (Sensirion SHT4x data sheet): the host writes one command byte,
+# waits, then reads 6 bytes: T ticks (big endian) + CRC, RH ticks + CRC, or for
+# the serial-number command two 16-bit words each followed by its CRC.  CRC-8,
+# polynomial 0x31, initial value 0xFF.
+fk_cmd: uint32 = 0
+fk_t: uint32 = 0
+fk_rh: uint32 = 0
+fk_serial: uint32 = 0x0F3A9B2C
+fk_bad_crc: uint32 = 0
+fk_resets: uint32 = 0
+fk_writes: uint32 = 0
+fk_reads: uint32 = 0
+
+
+def fk_crc(hi: uint32, lo: uint32) -> uint32:
+    crc: uint32 = 0xFF
+    k: uint32 = 0
+    while k < 2:
+        if k == 0:
+            crc = crc ^ hi
+        else:
+            crc = crc ^ lo
+        b: uint32 = 0
+        while b < 8:
+            if (crc & 0x80) != 0:
+                crc = ((crc << 1) ^ 0x31) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+            b = b + 1
+        k = k + 1
+    return crc
+
+
+def fk_write(data: Ptr[uint8], n: uint32) -> int32:
+    fk_writes = fk_writes + 1
+    if n != 1:
+        return -1
+    fk_cmd = cast[uint32](data[0])
+    if fk_cmd == 0x94:
+        fk_resets = fk_resets + 1
+    return 0
+
+
+def fk_put_word(out: Ptr[uint8], off: uint32, w: uint32):
+    out[off] = cast[uint8]((w >> 8) & 0xFF)
+    out[off + 1] = cast[uint8](w & 0xFF)
+    c: uint32 = fk_crc((w >> 8) & 0xFF, w & 0xFF)
+    if fk_bad_crc != 0:
+        c = c ^ 0x5A
+    out[off + 2] = cast[uint8](c)
+
+
+def fk_read(data: Ptr[uint8], n: uint32) -> int32:
+    fk_reads = fk_reads + 1
+    if n != 6:
+        return -1
+    if fk_cmd == 0x89:
+        fk_put_word(data, 0, fk_serial >> 16)
+        fk_put_word(data, 3, fk_serial & 0xFFFF)
+        return 0
+    if fk_cmd == 0xFD or fk_cmd == 0xF6 or fk_cmd == 0xE0:
+        fk_put_word(data, 0, fk_t)
+        fk_put_word(data, 3, fk_rh)
+        return 0
+    return -1
+
+
+# What the data sheet says the ticks mean, in floating point (milli units).
+def ref_milli_c(ticks: uint32) -> float64:
+    return -45000.0 + 175000.0 * cast[float64](ticks) / 65535.0
+
+
+def ref_milli_rh(ticks: uint32) -> float64:
+    return -6000.0 + 125000.0 * cast[float64](ticks) / 65535.0
+
+
+def near(got: int32, want: float64) -> uint32:
+    d: float64 = cast[float64](got) - want
+    if d < 0.0:
+        d = 0.0 - d
+    if d <= 2.0:
+        return 1
+    return 0
+
+
+# Each returns 1 when everything it looked at was right.
+def ci_scalars() -> uint32:
+    # 0x0000000700000000 >> 32 = 7;  7 + (-3) + 1.5 * 2.5 + 200 + (-100) = 107.75
+    m: float64 = hk_c_mix(0x0000000700000000, -3, 1.5, 2.5, 200, -100)
+    w: int64 = hk_c_wide(-2, -3, 65535)
+    n8: int32 = cast[int32](hk_c_neg8(100))
+    u16: uint32 = cast[uint32](hk_c_u16(65535))
+    if m == 107.75 and w == -2000000000000 - 196608 + 65535 and n8 == -100 and u16 == 0:
+        return 1
+    return 0
+
+
+def ci_callback() -> uint32:
+    ci_calls[0] = 0
+    s: uint32 = hk_c_apply(ci_square, &ci_calls[0], 10)
+    if s == 285 and ci_calls[0] == 10:
+        return 1
+    return 0
+
+
+def ci_structs() -> uint32:
+    sz: uint32 = hk_c_fill(&ci_rec, "hackos")
+    ok: uint32 = 0
+    if sz == sizeof(CRec) and sz == 40 and ci_rec.tag == 0xA7 and ci_rec.len == 6 and ci_rec.crc == 0xC0FFEE06 and ci_rec.big == 0x0123456789ABCDEF and ci_rec.ratio == 0.375 and ci_rec.name[0] == 104 and ci_rec.name[5] == 115 and ci_rec.name[6] == 0:
+        ok = 1
+    ci_rec.tag = 0x5A
+    ci_rec.len = 4660
+    ci_rec.crc = 0xDEADBEEF
+    ci_rec.big = 0xFEDCBA9876543210
+    ci_rec.ratio = -2.5
+    src: Ptr[uint8] = "from-adder"
+    i: uint32 = 0
+    while i < 11:
+        ci_rec.name[i] = src[i]
+        i = i + 1
+    if hk_c_check(&ci_rec) != 127:
+        ok = 0
+    return ok
+
+
+ci_t: Array[1, int32]
+ci_rh: Array[1, int32]
+ci_sn: Array[1, uint32]
+ci_tt: Array[1, uint16]
+ci_ht: Array[1, uint16]
+ci_dt: uint64 = 0
+
+
+def ci_sht_serial() -> uint32:
+    i2c_attach(0x44, cast[uint64](&fk_write), cast[uint64](&fk_read))
+    sht4x_init(0x44)
+    ci_sn[0] = 0
+    rc: int32 = cast[int32](sht4x_serial_number(&ci_sn[0]))
+    if rc == 0 and ci_sn[0] == 0x0F3A9B2C and fk_cmd == 0x89:
+        return 1
+    return 0
+
+
+def ci_sht_measure() -> uint32:
+    fk_t = 0x6666                   # 25.0 C by the data sheet
+    fk_rh = 0x8000                  # 56.5 %RH
+    us0: uint64 = hal_sleep_usec_total
+    t0: uint64 = sched_now()
+    rc: int32 = cast[int32](sht4x_measure_high_precision(&ci_t[0], &ci_rh[0]))
+    ci_dt = sched_now() - t0
+    if rc == 0 and near(ci_t[0], ref_milli_c(0x6666)) != 0 and near(ci_rh[0], ref_milli_rh(0x8000)) != 0 and ci_t[0] == 24998 and ci_rh[0] == 56500 and ci_dt == 10 and hal_sleep_usec_total - us0 == 10000:
+        return 1
+    return 0
+
+
+def ci_sht_negative() -> uint32:
+    fk_t = 0x1000                   # about -34.06 C: a negative int32 through a pointer
+    fk_rh = 0x0400                  # about -4.05 %RH (below the sensor's range)
+    rc: int32 = cast[int32](sht4x_measure_high_precision(&ci_t[0], &ci_rh[0]))
+    rc2: int32 = cast[int32](sht4x_measure_lowest_precision_ticks(&ci_tt[0], &ci_ht[0]))
+    if rc == 0 and ci_t[0] < 0 and near(ci_t[0], ref_milli_c(0x1000)) != 0 and near(ci_rh[0], ref_milli_rh(0x0400)) != 0 and rc2 == 0 and ci_tt[0] == 0x1000 and ci_ht[0] == 0x0400 and fk_cmd == 0xE0:
+        return 1
+    return 0
+
+
+def ci_sht_errors() -> uint32:
+    ok: uint32 = 1
+    ci_t[0] = 111
+    fk_bad_crc = 1
+    if cast[int32](sht4x_measure_high_precision(&ci_t[0], &ci_rh[0])) != 1 or ci_t[0] != 111:
+        ok = 0                      # CRC_ERROR, outputs untouched
+    fk_bad_crc = 0
+    r0: uint32 = fk_resets
+    if cast[int32](sht4x_soft_reset()) != 0 or fk_resets != r0 + 1:
+        ok = 0
+    # nobody at 0x45: the bus returns -1, which must arrive in Adder as -1
+    # after int32 -> int8 (Adder) -> int16 (C) -> Adder
+    sht4x_init(0x45)
+    if cast[int32](sht4x_serial_number(&ci_sn[0])) != -1:
+        ok = 0
+    sht4x_init(0x44)
+    i2c_detach(0x44)
+    return ok

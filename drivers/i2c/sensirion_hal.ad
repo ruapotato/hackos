@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the platform layer Sensirion's embedded I2C drivers ask for
+# (third_party/sensirion-sht4x/sensirion_i2c_hal.h), written in Adder.
+#
+# These are `extern "C"` definitions: the vendor's C code calls them with the
+# C calling convention (uint8_t in r0, a pointer in r1, ...) and the compiler
+# converts to Adder's 64-bit values at the function boundary.  The sleep goes
+# to the scheduler, so a C driver waiting for a conversion lets other threads
+# run.
+
+from drivers.i2c.bus import i2c_read, i2c_write
+from kernel.sched.core import thread_sleep, sched_running
+
+hal_sleep_usec_total: uint64 = 0    # statistics, read by the tests
+hal_calls: uint64 = 0
+
+
+extern "C" def sensirion_i2c_hal_select_bus(bus_idx: uint8) -> int16:
+    if bus_idx != 0:
+        return -1
+    return 0
+
+
+extern "C" def sensirion_i2c_hal_init():
+    hal_calls = hal_calls + 1
+
+
+extern "C" def sensirion_i2c_hal_free():
+    hal_calls = hal_calls + 1
+
+
+extern "C" def sensirion_i2c_hal_read(address: uint8, data: Ptr[uint8], count: uint8) -> int8:
+    hal_calls = hal_calls + 1
+    return cast[int8](i2c_read(cast[uint32](address), data, cast[uint32](count)))
+
+
+extern "C" def sensirion_i2c_hal_write(address: uint8, data: Ptr[uint8], count: uint8) -> int8:
+    hal_calls = hal_calls + 1
+    return cast[int8](i2c_write(cast[uint32](address), data, cast[uint32](count)))
+
+
+extern "C" def sensirion_i2c_hal_sleep_usec(useconds: uint32):
+    hal_calls = hal_calls + 1
+    hal_sleep_usec_total = hal_sleep_usec_total + cast[uint64](useconds)
+    if sched_running != 0:
+        thread_sleep((cast[uint64](useconds) + 999) / 1000)
