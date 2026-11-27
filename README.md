@@ -93,7 +93,7 @@ everything here from source, and runs:
 3. static checks on the linked images (vector tables, the empty null-guard
    area, constants in read-only memory, no undefined symbols);
 4. the run-time self-test from milestone 1 (arithmetic, FPU, start-up);
-5. the kernel tests: one image, 160 counted checks, including processes
+5. the kernel tests: one image, 163 counted checks, including processes
    (isolation, faults, spawn, rfork, exec, wait), pipes and FAT, with console
    input typed into the emulated UART by the harness;
 6. a scripted session with the kernel monitor (`build/monitor.elf`);
