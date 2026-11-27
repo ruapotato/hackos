@@ -80,6 +80,26 @@ register models, and the Teensy's programs in QEMU in the Teensy's memory
 map. How to flash it, what the first power-up should show, and the order in
 which to check the untested parts: [`docs/boards/teensy41.md`](docs/boards/teensy41.md).
 
+## A third board: the Adafruit Feather nRF52840 Express (UNTESTED ON HARDWARE)
+
+`make BOARD=feather-nrf52840` builds it for Adafruit's Feather nRF52840
+Express (Nordic nRF52840: Cortex-M4F at 64 MHz, single-precision FPU,
+8-region MPU, 1 MB flash, 256 KB RAM): `build/feather-nrf52840/hackos.uf2`
+for the board's UF2 bootloader (double-tap reset, copy the file to the
+FTHR840BOOT drive). It has the console on the TX/RX header pins (UARTE0,
+115200), the red LED as a sign of life, and the scheduler tick from RTC1.
+Two things are new for this chip. float64 is software (compiler-rt), as the M4F
+has no double-precision FPU. Programs are built ROPI/RWPI, so their code
+runs in place from flash and only their data and stacks take RAM: the
+shell, and a pipeline of five programs beside it, fit in 256 KB. **None of
+it has run on a Feather.** `make test-nrf52` boots the unchanged image in
+Renode's nRF52840 machine and runs a shell session there. It also checks every
+register constant against Nordic's headers, the image and the UF2 file
+against Adafruit's bootloader, and the pins against Adafruit's tables.
+Wiring (a USB-to-serial adapter or a Raspberry Pi), first power-up,
+bring-up order and memory: [`docs/boards/feather-nrf52840.md`](docs/boards/feather-nrf52840.md).
+What another board or chip needs: [`docs/porting.md`](docs/porting.md).
+
 Known shortcomings are listed at the end.
 
 ## Build and test
@@ -126,7 +146,9 @@ sessions run in real time.
 
 Other targets: `make size`, `make measure` (code size of small functions
 against the same functions in C; sizes of the image and of every program),
-`make BOARD=teensy41` and `make test-teensy` (above).
+`make BOARD=teensy41` and `make test-teensy`, `make BOARD=feather-nrf52840`
+and `make test-nrf52` (above; the latter needs Renode, see
+`tests/nrf52/renode_session.sh`, and is skipped without it).
 
 `BOARD` selects `boards/<dir>/board.mk`; Adder code imports the board as
 `board.board`, and every Adder unit is compiled inside `build/root` (or
@@ -144,6 +166,11 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `arch/armv7m/cpu.S`, `aeabi.S` | special-register access; shims from the EABI helper names to their Adder implementations (also linked into every program) |
 | `boards/mps2_an500/` | the QEMU machine: board functions, vector table, linker script, `board.mk` |
 | `boards/teensy41/` | the Teensy 4.1: boot header and vector table, linker script, board functions, size patches (`patches/`) |
+| `boards/feather_nrf52840/` | the Feather nRF52840 Express: vector table, linker script, board functions, size patches |
+| `soc/nrf52/`, `soc/nrf52840/` | nRF52 UARTE, GPIO, RTC tick, delays; nRF52840 addresses, interrupts, clocks |
+| `user/rt/prog_rwpi.ld` | the layout of an RWPI program (code in place in flash, data at r9) |
+| `scripts/mkuf2.py` | Intel HEX to UF2 |
+| `tests/nrf52/` | the Feather checks: register checker, image/UF2 checker, Adafruit facts, the Renode platform and shell session |
 | `soc/imxrt/` | i.MX RT drivers for IP blocks the RT1060 and RT1170 share: LPUART, GPIO, IOMUXC, LPI2C, LPSPI, uSDHC; register access and delays |
 | `soc/imxrt1062/` | RT1062 addresses, interrupts, clock gates and roots, clock report, watchdogs, caches |
 | `drivers/sd/` | SD card protocol over the uSDHC |
@@ -178,6 +205,8 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `tests/imxrt/` | the Teensy checks: boot header, register and pin checkers, register models, the driver test image, the uSDHC test on QEMU's i.MX6UL, the Teensy memory test |
 | `docs/syscalls.md` | the system-call table and how it differs from Hamnix |
 | `docs/boards/teensy41.md` | flashing, wiring, first power-up, bring-up checklist, memory |
+| `docs/boards/feather-nrf52840.md` | the same for the Feather nRF52840 |
+| `docs/porting.md` | what a new board, chip family or architecture needs |
 
 Assembly is five files (about 740 lines): what the processor requires at
 exception entry and exit, register access, the calling-convention shims, and
@@ -246,8 +275,12 @@ AGPL-3.0-or-later. See `LICENSE`.
 
 Files copied from Hamnix (`fs/HAMNIX_ORIGIN`: the file systems, the shell, the
 programs and their libraries) are GPL-3.0-or-later by the same author. `third_party/` holds code under its own licences (currently
-BSD-3-Clause: Sensirion's driver, NXP's RT1062 device files), each with its
-licence file and an `UPSTREAM` record. Nothing of PJRC's Teensy core is
+BSD-3-Clause: Sensirion's driver, NXP's RT1062 device files, Nordic's
+nRF52840 device headers; Apache-2.0 WITH LLVM-exception: LLVM compiler-rt's
+software double precision), each with its licence file and an `UPSTREAM`
+record. Of Adafruit's bootloader (MIT) and Arduino core (LGPL-2.1) nothing
+is copied: `tests/nrf52/feather_facts.txt` records extracted numbers (pins,
+addresses, keys), with the sources' commits and hashes. Nothing of PJRC's Teensy core is
 copied (its licence adds a condition to MIT's); its pin table and boot block
 were compared with, and the extracted pin table
 (`tests/imxrt/teensy41_pins.txt`) records only facts, with the source's

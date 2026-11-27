@@ -10,3 +10,8 @@ C code never calls Adder-convention functions and Adder never calls C except
 through `extern "C"` declarations; tests/check_c_link.sh enforces that at every
 `make test`.  C library functions for this code come from lib/cshim, under
 prefixed names (see lib/cshim/include/hackos_libc_rename.h for why).
+
+nordic-mdk-nrf52840/ is read as data only (tests/nrf52/check_regs.py), as
+nxp-mcux-rt1062/ is.  llvm-compiler-rt-builtins/ is compiled for boards
+with SOFT_DOUBLE=1 only (BOARD=feather-nrf52840): it defines the run-time
+ABI's __aeabi_d* helpers and calls nothing outside itself.

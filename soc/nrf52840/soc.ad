@@ -66,6 +66,15 @@ FICR_INFO_FLASH: uint64 = 0x110          # hdr: NRF_FICR_Type.INFO.FLASH
 FICR_DEVICEID0: uint64 = 0x060           # hdr: NRF_FICR_Type.DEVICEID[0]
 FICR_DEVICEID1: uint64 = 0x064           # hdr: NRF_FICR_Type.DEVICEID[1]
 
+# ---- access-port protection (SWD) ----------------------------------------------
+APPROTECT_BASE: uint64 = 0x40000000  # hdr: NRF_APPROTECT_BASE
+APPROTECT_DISABLE: uint64 = 0x558    # hdr: NRF_APPROTECT_Type.DISABLE
+UICR_APPROTECT: uint64 = 0x208       # hdr: NRF_UICR_Type.APPROTECT
+FICR_CFG_VAR1: uint64 = 0x130        # unchecked: nrf52_erratas.h nrf52_configuration_249(), not a named FICR register
+FICR_CFG_VAR2: uint64 = 0x134        # unchecked: same
+CFG249_PART: uint32 = 8              # unchecked: nrf52_erratas.h: var1 == 0x08 is the nRF52840
+CFG249_FIRST: uint32 = 5             # unchecked: nrf52_erratas.h: var2 >= 5 (build codes Fxx on) have the software branch
+
 # ---- ARMv7-M system registers -------------------------------------------------------
 NVIC_ISER0: uint64 = 0xE000E100      # unchecked: ARMv7-M architecture
 NVIC_ICER0: uint64 = 0xE000E180      # unchecked: ARMv7-M architecture
@@ -101,6 +110,21 @@ def nrf52840_system_init():
     mmio_write32(NVIC_ICPR0 + 4, 0xFFFFFFFF)
     mmio_write32(CLOCK_BASE + CLOCK_INTENCLR, 0xFFFFFFFF)
     mmio_write32(NVMC_BASE + NVMC_ICACHECNF, mmio_read32(NVMC_BASE + NVMC_ICACHECNF) | NVMC_ICACHECNF_CACHEEN_MSK)
+    nrf52840_handle_approtect()
+
+
+# Newer nRF52840s (build code F on: "configuration 249" in Nordic's
+# nrf52_erratas.h) close the debug port at every reset unless the running
+# firmware opens its software branch.  Nordic's SystemInit (without
+# ENABLE_APPROTECT) copies UICR.APPROTECT into APPROTECT.DISABLE, so a chip
+# whose UICR says "hardware disabled" (0x5A) stays debuggable; this does the
+# same.  It opens nothing else: with UICR.APPROTECT erased (0xFFFFFFFF) such
+# a chip keeps its debug port closed (Adafruit's bootloader source does not
+# touch APPROTECT; what a given Feather's UICR holds is not known here, see
+# docs/boards/feather-nrf52840.md, SWD).
+def nrf52840_handle_approtect():
+    if ficr(FICR_CFG_VAR1) == CFG249_PART and ficr(FICR_CFG_VAR2) >= CFG249_FIRST:
+        mmio_write32(APPROTECT_BASE + APPROTECT_DISABLE, mmio_read32(UICR_BASE + UICR_APPROTECT))
 
 
 # HFCLK from the 32 MHz crystal (HFXO; the UART's baud rate is then
