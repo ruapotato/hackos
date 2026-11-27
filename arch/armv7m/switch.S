@@ -12,6 +12,8 @@
         .equ    T_KSTACK_TOP, 20
         .equ    T_SVC_CTRL,   24        /* caller's CONTROL.nPRIV          */
         .equ    T_SVC_REGS,   32        /* caller's r4-r11 at system-call entry */
+        .equ    T_STATE,      68        /* scheduler state                 */
+        .equ    T_ZOMBIE,      4
         .equ    KERNEL_BASEPRI, 0x40
         .equ    FPCCR,        0xE000EF34
 
@@ -141,6 +143,16 @@
         ldr     r2, [r3]                /* r2 = current thread             */
         cmp     r2, #0
         beq     svc_bad
+        /* An `svc` executed with a stack pointer the thread may not use:
+         * pushing the exception frame faulted, the fault handler has ended
+         * the thread, and the SVCall that was pending all along arrives
+         * here afterwards.  There is no frame to read and nobody to serve.
+         * Return: the context switch the fault handler asked for is still
+         * pending and runs before anything is unstacked.                  */
+        ldr     r1, [r2, #T_STATE]
+        cmp     r1, #T_ZOMBIE
+        it      eq
+        bxeq    lr
         ldr     r1, [r0, #24]           /* stacked pc                      */
         ldrb    r1, [r1, #-2]           /* immediate of the svc instruction */
         cmp     r1, #1

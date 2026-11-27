@@ -441,8 +441,8 @@ def t_redir(path: Ptr[uint8]) -> int32:
     sys_close(fd2)
     if n == 46 and iobuf[0] == 104 and iobuf[45] == 10:
         r = r | 4                       # both lines of /bin/hello are in the file
-    if sys_fdbind(1, 1, 1, 0) < 0:
-        r = r | 8                       # not our child: refused
+    if sys_fdbind(1, 1, 1, 0) < 0 and sys_fdbind(0, 9, 7, 0x40020400) < 0 and sys_fdbind(0, 9, 7, 0x40010009) < 0 and sys_waitpid(1) == -10:
+        r = r | 8                       # not our child; made-up channels; a kernel thread: refused
     return r
 
 
@@ -465,6 +465,14 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         return t_spawn(arg)
     if seq(cmd, "nop") != 0:
         return 0
+    if seq(cmd, "badsp") != 0:
+        # a system call with the stack pointer aimed at kernel memory
+        asm_volatile("movw r0, #0x1000\n movt r0, #0x2000\n mov sp, r0\n movs r0, #4\n svc #0")
+        return 9
+    if seq(cmd, "bkpt") != 0:
+        # the instruction a debugger would use; nobody is listening
+        asm_volatile("bkpt 0xAB")
+        return 9
     if seq(cmd, "loop") != 0:
         # never ends by itself and never enters the kernel
         spin: uint64 = 0

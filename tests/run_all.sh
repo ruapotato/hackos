@@ -233,6 +233,7 @@ else
 fi
 expect "tmpfs per-file cost reported" $B/ktest.txt '^BENCH tmpfs: an empty file takes 0 bytes of kernel heap, its first byte [0-9]+ more'
 expect "a faulting process is reported as a process, by name" $B/ktest.txt "process [0-9]+ 'ptest' ended: stack overflow at 0x60"
+expect "a breakpoint instruction in a process is reported, the system carries on" $B/ktest.txt "process [0-9]+ 'ptest' ended: breakpoint instruction or escalated fault"
 expect "the loaded C program printed through its relocated pointers" $B/ktest.txt '^crel: relocated pointers ok$'
 
 echo "[test] === 6. monitor session over the UART (real-time clock, commands typed by the harness)"

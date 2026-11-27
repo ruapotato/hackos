@@ -245,6 +245,9 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
     if nr == SYS_THREAD_SPAWN:
         return _sys_thread_spawn(a0, a1, a2, a3)
     if nr == SYS_THREAD_JOIN:
+        if (current_thread()[0].flags & TF_PROC) != 0:
+            set_current_errstr("thread_join: a process has one thread; use waitpid")
+            return cast[int64](ENOSYS)
         if a1 != 0 and uok(a1, 8, 1) == 0:
             return _bad()
         return cast[int64](thread_join(cast[uint32](a0), cast[Ptr[int64]](a1)))

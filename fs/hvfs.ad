@@ -744,7 +744,15 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
         if arg < 0 or arg >= cast[int32](TMPFS_MAX_FILES) or tmpfs_table[arg].used == 0 or tmpfs_is_dir(arg) != 0:
             return _err(EBADF, "fdbind: not an open file channel")
     elif kind == DEVFD_CHAN:
-        if (arg & CHAN_INLINE_TAG) == 0:
+        # exactly the values vfs_openchan hands out, nothing a caller made up
+        cok: uint32 = 0
+        if (arg & (CHAN_INLINE_TAG | CHAN_DEV | CHAN_ROM | 0xFFFF)) == arg and (arg & CHAN_INLINE_TAG) != 0:
+            idx: int32 = arg & 0xFFFF
+            if (arg & CHAN_DEV) != 0 and (arg & CHAN_ROM) == 0 and idx >= DEV_CONSOLE and idx <= DEV_ZERO:
+                cok = 1
+            if (arg & CHAN_ROM) != 0 and (arg & CHAN_DEV) == 0 and cast[uint32](idx) < rom_count():
+                cok = 1
+        if cok == 0:
             return _err(EBADF, "fdbind: not a device channel")
     elif kind != DEVFD_CONS and kind != DEVFD_NONE:
         return _err(EINVAL, "fdbind: unknown kind")

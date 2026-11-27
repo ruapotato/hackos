@@ -630,11 +630,25 @@ def proc_rfork(flags: uint32) -> int32:
 
 
 # ---------------------------------------------------------------- wait
+# Only processes can be waited for with these calls: not the kernel's own
+# threads, whose ids come from the same counter.
+def _is_proc(pid: int32) -> uint32:
+    if pid <= 0:
+        return 0
+    t: Ptr[Thread] = thread_by_tid(cast[uint32](pid))
+    if t == cast[Ptr[Thread]](0) or (t[0].flags & TF_PROC) == 0:
+        return 0
+    return 1
+
+
 # waitpid(pid, flags): the exit code of process `pid` once it has ended, and
 # the process is gone.  flags bit 0 (WNOHANG): -EAGAIN instead of waiting.
 # -ECHILD when there is no such process (or it is detached, or the caller).
 def proc_waitpid(pid: int32, flags: uint32) -> int64:
     code: int64 = 0
+    if _is_proc(pid) == 0:
+        set_current_errstr("wait: no such child")
+        return cast[int64](ECHILD)
     rc: int32 = thread_wait(cast[uint32](pid), flags & 1, &code)
     if rc == -11:
         return cast[int64](EAGAIN)
@@ -651,6 +665,9 @@ def proc_waitpid(pid: int32, flags: uint32) -> int64:
 # -ECHILD for an unknown pid.  Stopped and continued states do not exist.
 def proc_waitpid_jc(pid: int32, status: Ptr[int64]) -> int64:
     code: int64 = 0
+    if _is_proc(pid) == 0:
+        set_current_errstr("waitjc: no such child")
+        return cast[int64](ECHILD)
     rc: int32 = thread_wait(cast[uint32](pid), 1, &code)
     if rc == -11:
         return 0

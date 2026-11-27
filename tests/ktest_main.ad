@@ -1075,6 +1075,12 @@ def test_proc():
     check(cast[uint32](code == 139), "isolation: nor is the arena of the in-image unprivileged threads")
     code = run_prog("/bin/ptest", "poke", "40004000", nul)
     check(cast[uint32](code == 139 and trap_last_addr == 0x40004000), "isolation: a process writing to a peripheral register faults")
+    tc0 = trap_count
+    code = run_prog("/bin/ptest", "bkpt", nul, nul)
+    check(cast[uint32](code == 132 and trap_count == tc0 + 1), "isolation: a breakpoint instruction in a process ends the process, not the system")
+    tc0 = trap_count
+    code = run_prog("/bin/ptest", "badsp", nul, nul)
+    check(cast[uint32](code == 139 and trap_count == tc0 + 1), "isolation: a system call made with the stack pointer aimed at kernel memory ends the process, not the system")
     sb0: uint64 = sys_bad_ptr
     code = run_prog("/bin/ptest", "sysptr", hexstr(cast[uint32](cast[uint64](&failures)), &hx[0]), nul)
     check(cast[uint32](code == 14 and sys_bad_ptr == sb0 + 1), "isolation: the kernel refuses a system-call buffer outside the caller's block (EFAULT)")
@@ -1088,7 +1094,7 @@ def test_proc():
     code = run_prog("/bin/ptest", "huge", nul, nul)
     check(cast[uint32](code == 139 and trap_last_kind == FAULT_STACK_OVERFLOW), "proc: a 6 KB frame cannot step over anything: still a stack overflow")
     thread_sleep(5)
-    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0), "proc: after 8 faulted processes: no block, stack, slot or open file left behind")
+    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0), "proc: after 10 faulted processes: no block, stack, slot or open file left behind")
 
     # spawn, rfork + exec, wait -- from inside a process
     code = run_prog("/bin/ptest", "spawn", "/bin/hello", nul)

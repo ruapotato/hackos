@@ -27,8 +27,8 @@
 #     opens exactly that block to it (kernel/proc.ad has the loader, exec,
 #     rfork and wait).  One thread per process.
 #
-# The first sixteen words of Thread are read and written by switch.S at fixed
-# offsets; do not move them.
+# The first eighteen words of Thread (up to and including `state`) are read
+# and written by switch.S at fixed offsets; do not move them.
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq_disable, mmio_read32, mmio_write32
 from kernel.rt import rt_memset
@@ -89,8 +89,8 @@ class Thread:
     pad0: uint32                    # 28
     svc_regs: Array[8, uint32]      # 32 caller's r4-r11 at system-call entry
     # ---- scheduler ----
-    tid: uint32
-    state: volatile uint32          # written by interrupt handlers
+    tid: uint32                     # 64
+    state: volatile uint32          # 68 written by interrupt handlers; read by switch.S
     prio: uint32                    # effective priority
     base_prio: uint32
     slice: uint32
