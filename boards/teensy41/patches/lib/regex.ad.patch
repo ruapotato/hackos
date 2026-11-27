@@ -2,7 +2,7 @@ HackOS teensy41 size patch to lib/regex.ad (applied in build/teensy41/root only)
 
 Reason: rx_ends, the end positions a repetition can take at each of 4
 nesting levels, is 512 KiB of grep's 699 KiB of static data; the Teensy
-4.1's program arena is 736 KiB.  32768 positions per level -> 2048 (a
+4.1's program arena is 704 KiB.  32768 positions per level -> 2048 (a
 repetition can then match at most 2047 times in one line; the matcher's
 existing bound `ne < RX_REP_ENDS - 1` stops there).  Constant and array
 length only.

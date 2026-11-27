@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the program arena: one block per process, each aligned to the
+# power-of-two MPU region that covers it (kernel/proc.ad, kernel/mpu.ad).
+#
+# The bookkeeping is a table in kernel memory, not headers in the arena.
+# With in-band headers (mm/heap.ad) the first block could never begin at the
+# arena's start: its header would have to sit just below it.  On a board
+# whose arena holds only one aligned slot of the size a shell needs (the
+# Teensy 4.1: 704 KB from 0x20200000, a 448 KB shell block that must start
+# on a 512 KB boundary) that is the difference between a shell and none.
+#
+# First fit by address over aligned candidates; at most PARENA_MAX blocks
+# (one per thread slot is the most there can be).  Interrupts are masked for
+# the table walk, as in the heap.
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+
+PARENA_MAX: uint32 = 32
+
+pa_base: Array[32, uint32]          # sorted by address
+pa_size: Array[32, uint32]
+pa_n: uint32 = 0
+pa_start: uint32 = 0
+pa_end: uint32 = 0
+pa_used: uint64 = 0
+pa_peak: uint64 = 0
+pa_n_alloc: uint64 = 0
+pa_n_fail: uint64 = 0
+
+
+def parena_init(start: uint64, end: uint64):
+    pa_start = cast[uint32](start)
+    pa_end = cast[uint32](end)
+    pa_n = 0
+    pa_used = 0
+    pa_peak = 0
+    pa_n_alloc = 0
+    pa_n_fail = 0
+
+
+def _pa_up(v: uint64, al: uint64) -> uint64:
+    return (v + al - 1) & (0xFFFFFFFFFFFFFFFF ^ (al - 1))
+
+
+# `size` bytes at a multiple of `align` (a power of two, at least 16).
+# Returns the address, or 0 when no gap holds it.
+def parena_alloc(size: uint64, align: uint64) -> uint64:
+    al: uint64 = align
+    if al < 16:
+        al = 16
+    sz: uint64 = (size + 15) & 0xFFFFFFF0
+    if sz == 0:
+        sz = 16
+    irq: uint32 = cpu_irq_save()
+    if pa_n >= PARENA_MAX:
+        pa_n_fail = pa_n_fail + 1
+        cpu_irq_restore(irq)
+        return 0
+    cand: uint64 = _pa_up(cast[uint64](pa_start), al)
+    i: uint32 = 0
+    while i < pa_n:
+        b: uint64 = cast[uint64](pa_base[i])
+        e: uint64 = b + cast[uint64](pa_size[i])
+        if cand + sz <= b:
+            break                           # fits in the gap before block i
+        if e > cand:
+            cand = _pa_up(e, al)
+        i = i + 1
+    if cand + sz > cast[uint64](pa_end):
+        pa_n_fail = pa_n_fail + 1
+        cpu_irq_restore(irq)
+        return 0
+    # insert at i, keeping the table sorted
+    j: uint32 = pa_n
+    while j > i:
+        pa_base[j] = pa_base[j - 1]
+        pa_size[j] = pa_size[j - 1]
+        j = j - 1
+    pa_base[i] = cast[uint32](cand)
+    pa_size[i] = cast[uint32](sz)
+    pa_n = pa_n + 1
+    pa_used = pa_used + sz
+    if pa_used > pa_peak:
+        pa_peak = pa_used
+    pa_n_alloc = pa_n_alloc + 1
+    cpu_irq_restore(irq)
+    return cand
+
+
+# Free the block that starts at `addr`.  0, or -1 if there is none.
+def parena_free(addr: uint64) -> int32:
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < pa_n and cast[uint64](pa_base[i]) != addr:
+        i = i + 1
+    if i == pa_n:
+        cpu_irq_restore(irq)
+        return -1
+    pa_used = pa_used - cast[uint64](pa_size[i])
+    while i + 1 < pa_n:
+        pa_base[i] = pa_base[i + 1]
+        pa_size[i] = pa_size[i + 1]
+        i = i + 1
+    pa_n = pa_n - 1
+    cpu_irq_restore(irq)
+    return 0
+
+
+def parena_live() -> uint32:
+    return pa_n
+
+
+# 0 if the table is sorted, without overlaps and inside the arena.
+def parena_check() -> int32:
+    i: uint32 = 0
+    while i < pa_n:
+        if pa_base[i] < pa_start or pa_base[i] + pa_size[i] > pa_end:
+            return -1
+        if i > 0 and pa_base[i - 1] + pa_size[i - 1] > pa_base[i]:
+            return -1
+        i = i + 1
+    return 0

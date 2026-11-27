@@ -3,11 +3,16 @@
 # HackOS -- page-granular allocations under the names Hamnix code expects.
 #
 # Hamnix's mm/page_alloc.ad is a buddy allocator over physical pages; its
-# callers in the files HackOS carries (fs/tmpfs.ad) only need "2^order pages,
-# page aligned" and the matching free.  Without an MMU a page is just a 4 KiB
-# alignment unit, so both map onto the kernel heap's aligned allocation.
+# callers in the files HackOS carries (fs/tmpfs.ad) need "2^order pages" and
+# the matching free.  The pages are NOT page aligned here: Hamnix aligns
+# tmpfs data chunks so that a shared mmap can map them into a process
+# (tmpfs_page_phys), and HackOS has no MMU and no such mmap (nothing calls
+# tmpfs_page_phys).  An aligned 4 KiB allocation could leave up to 4 KiB of
+# unusable gap in front of every chunk; measured on the Teensy 4.1's 172 KiB
+# kernel heap, a 40 KB file left the largest free block at 4064 bytes and no
+# program could start (tests/imxrt/t41mem.sh).
 
-from mm.slab import kmalloc_aligned, kfree
+from mm.slab import kmalloc, kfree
 
 PA_SITE_NONE: uint64 = 0
 PA_SITE_TMPFS: uint64 = 18
@@ -22,7 +27,7 @@ def pa_set_site(site: uint64):
 
 def alloc_pages(order: int32) -> uint64:
     n: uint64 = PAGE_SIZE << cast[uint64](order)
-    p: uint64 = kmalloc_aligned(n, PAGE_SIZE)
+    p: uint64 = kmalloc(n)
     if p != 0:
         pa_pages_live = pa_pages_live + (cast[uint64](1) << cast[uint64](order))
     return p

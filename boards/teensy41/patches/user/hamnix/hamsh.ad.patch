@@ -2,7 +2,7 @@ HackOS teensy41 size patch to user/hamnix/hamsh.ad (on top of
 user/hamnix/hamsh.ad.patch, which the committed file already carries).
 Applied by scripts/mkroot.sh in build/teensy41/root only.
 
-Reason: a process is one block of the Teensy 4.1's program arena (768 KiB of
+Reason: a process is one block of the Teensy 4.1's program arena (704 KiB of
 on-chip RAM, boards/teensy41/link.ld), and the shell's static arrays are
 real memory from its first instruction.  After milestone 3 they were
 1,525,832 bytes.  This patch divides by 16 the four arenas the milestone-3

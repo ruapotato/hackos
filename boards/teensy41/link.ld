@@ -11,12 +11,12 @@
  *   ITCM  0x00000000  FlexRAM bank 0 (32 KB).  Nothing is linked there: its
  *                     first 4 KB are the MPU's null-pointer guard, the rest
  *                     is free for later.
- *   DTCM  0x20000000  FlexRAM banks 1-8 (256 KB), zero wait states, not
+ *   DTCM  0x20000000  FlexRAM banks 1-9 (288 KB), zero wait states, not
  *                     executable (the M7 does not fetch from DTCM), not
  *                     cached: kernel data, stacks, kernel heap.
  *   OCRAM 0x20200000  512 KB of on-chip RAM (OCRAM2 in the manual) and, right
- *                     after it at 0x20280000, FlexRAM banks 9-15 configured
- *                     as OCRAM (224 KB): 736 KB, contiguous, on the AXI bus,
+ *                     after it at 0x20280000, FlexRAM banks 10-15 configured
+ *                     as OCRAM (192 KB): 704 KB, contiguous, on the AXI bus,
  *                     executable: the program arena.  Programs run from here,
  *                     so it is the only place a process can live.  (NXP's
  *                     own MIMXRT1062xxxxx_flexspi_nor.ld treats 0x20200000 +
@@ -38,11 +38,16 @@ MEMORY
 {
     FLASH (rx) : ORIGIN = 0x60000000, LENGTH = 7936K
     ITCM (rwx) : ORIGIN = 0x00000000, LENGTH = 32K
-    DTCM (rw)  : ORIGIN = 0x20000000, LENGTH = 256K
-    OCRAM (rwx): ORIGIN = 0x20200000, LENGTH = 736K
+    DTCM (rw)  : ORIGIN = 0x20000000, LENGTH = 288K
+    OCRAM (rwx): ORIGIN = 0x20200000, LENGTH = 704K
 }
 
-__flexram_bank_config = 0x5556AAAB;  /* bank 0 ITCM (11), 1-8 DTCM (10), 9-15 OCRAM (01) */
+__flexram_bank_config = 0x555AAAAB;  /* bank 0 ITCM (11), 1-9 DTCM (10), 10-15 OCRAM (01) */
+/* Why this split: the shell is a 448 KB block that must start on a 512 KB
+ * boundary (0x20200000); grep, the largest other program, a 192 KB block on
+ * a 256 KB boundary (0x20280000); 704 KB holds both.  Every further bank of
+ * DTCM is kernel heap, which also holds the data of files in / (tmpfs).
+ * tests/imxrt/t41mem.sh runs the shell session in exactly this map. */
 __stack_size = 0x4000;               /* handler-mode (MSP) stack */
 __user_size  = 0x4000;               /* shared arena of in-image unprivileged
                                         threads: 16 KB, none in this image */

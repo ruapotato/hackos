@@ -25,7 +25,7 @@
  *
  * The ROM jumps to the entry with the core clock it chose and its own stack
  * in OCRAM.  board_reset_early then configures FlexRAM -- 1 bank of 32 KB
- * ITCM, 8 banks (256 KB) DTCM, 7 banks (224 KB) OCRAM after OCRAM2, see
+ * ITCM, 9 banks (288 KB) DTCM, 6 banks (192 KB) OCRAM after OCRAM2, see
  * link.ld -- before Reset_Handler points the stack into DTCM, and
  * lights the LED (pin 13) as the first sign of life.                     */
 

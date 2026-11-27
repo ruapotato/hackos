@@ -11,6 +11,7 @@
 # The second arena, the user arena, is what unprivileged threads may touch
 # (kernel/mpu.ad): user stacks and sys_mmap memory come from it.
 
+from mm.parena import parena_init, parena_alloc, parena_free
 from mm.heap import Heap, heap_init, heap_alloc, heap_alloc_aligned, heap_free, heap_block_req
 from kernel.rt import rt_memset
 
@@ -31,7 +32,6 @@ KM_SITE_PIPE: uint64 = 12
 
 kheap: Heap
 uheap: Heap
-pheap: Heap                         # program arena: one block per process
 km_site: uint64 = 0
 km_ready: uint32 = 0
 
@@ -39,7 +39,7 @@ km_ready: uint32 = 0
 def mm_init():
     heap_init(&kheap, cast[uint64](&__heap_start), cast[uint64](&__heap_end))
     heap_init(&uheap, cast[uint64](&__user_start), cast[uint64](&__user_end))
-    heap_init(&pheap, cast[uint64](&__prog_start), cast[uint64](&__prog_end))
+    parena_init(cast[uint64](&__prog_start), cast[uint64](&__prog_end))
     km_ready = 1
 
 
@@ -83,12 +83,13 @@ def user_arena_end() -> uint64:
     return cast[uint64](&__user_end)
 
 
-# Program arena.  A block is aligned to `align` so that one MPU region can
-# cover exactly it; the allocator's own headers sit outside every block, out
-# of reach of the process that owns the block.
+# Program arena (mm/parena.ad).  A block is aligned to `align` so that one
+# MPU region can cover exactly it; the allocator keeps its table in kernel
+# memory, so nothing of it is inside any block, and a block may begin right
+# at the arena's start.
 def palloc_aligned(size: uint64, align: uint64) -> uint64:
-    return heap_alloc_aligned(&pheap, size, align)
+    return parena_alloc(size, align)
 
 
 def pfree(addr: uint64) -> int32:
-    return heap_free(&pheap, addr)
+    return parena_free(addr)

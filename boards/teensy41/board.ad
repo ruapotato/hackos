@@ -147,7 +147,7 @@ def board_mpu_xram_base() -> uint32:
 
 
 def board_mpu_xram_size() -> uint32:
-    return 0x100000             # 0x20200000 + 1 MB: covers the 736 KB arena
+    return 0x100000             # 0x20200000 + 1 MB: covers the 704 KB arena
 
 
 # Regions 8 and 9: the FlexSPI2 window (PSRAM pads, 0x70000000) and the SEMC

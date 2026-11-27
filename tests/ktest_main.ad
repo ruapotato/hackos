@@ -30,7 +30,7 @@ from tests.kt_user import stress_mix, u_stress, u_fphold, u_syscalls, u_child, f
 from tests.kt_cinterop import ci_scalars, ci_callback, ci_structs, ci_sht_serial, ci_sht_measure, ci_sht_negative, ci_sht_errors, ci_dt, ci_t, ci_rh, fk_writes, fk_reads
 from drivers.i2c.sensirion_hal import hal_calls
 from kernel.proc import proc_spawn, proc_waitpid, proc_waitpid_jc, proc_spawned, proc_execs, proc_last_block, proc_last_image, proc_last_stack, proc_last_relocs
-from mm.slab import pheap
+from mm.parena import parena_live, parena_check
 from kernel.pipe import pipe_alloc_chan, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_live
 from fs.tmpfs import TmpfsEntry
 from fs.hvfs import fat_mounted
@@ -1021,13 +1021,13 @@ def test_proc():
     printk0("-- 11. processes: programs loaded from /bin into their own memory\n")
     hx: Array[12, uint8]
     nul: Ptr[uint8] = cast[Ptr[uint8]](0)
-    plive0: uint32 = pheap.n_live
+    plive0: uint32 = parena_live()
     klive0: uint32 = kheap.n_live
     thr0: uint32 = threads_in_use()
     open0: uint32 = vfs_open_count()
     code: int64 = run_prog("/bin/hello", "one", "two", nul)
     check(cast[uint32](code == 3), "proc: /bin/hello loaded, ran unprivileged, exit code = argc")
-    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0), "proc: block, kernel stack and table slot were returned")
+    check(cast[uint32](parena_live() == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0), "proc: block, kernel stack and table slot were returned")
     printk3("   /bin/hello: block %d bytes (stack %d, image %d)", cast[uint64](proc_last_block), cast[uint64](proc_last_stack), cast[uint64](proc_last_image))
     printk1(", %d relocations\n", cast[uint64](proc_last_relocs))
     code = run_prog("/bin/ptest", "image", nul, nul)
@@ -1042,7 +1042,7 @@ def test_proc():
     fd: int32 = vfs_open("/tmp/junk", OWRITE | OTRUNC | OCREATE)
     vfs_write(fd, "this is not an ELF file, not even close ........................", 64)
     vfs_close(fd)
-    check(cast[uint32](run_prog("/tmp/junk", nul, nul, nul) == -8 and pheap.n_live == plive0), "proc: a file that is not a program is ENOEXEC, nothing left allocated")
+    check(cast[uint32](run_prog("/tmp/junk", nul, nul, nul) == -8 and parena_live() == plive0), "proc: a file that is not a program is ENOEXEC, nothing left allocated")
     vfs_unlink("/tmp/junk")
 
     # two instances of one program at once: different blocks, own data
@@ -1094,7 +1094,7 @@ def test_proc():
     code = run_prog("/bin/ptest", "huge", nul, nul)
     check(cast[uint32](code == 139 and trap_last_kind == FAULT_STACK_OVERFLOW), "proc: a 6 KB frame cannot step over anything: still a stack overflow")
     thread_sleep(5)
-    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0), "proc: after 10 faulted processes: no block, stack, slot or open file left behind")
+    check(cast[uint32](parena_live() == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0), "proc: after 10 faulted processes: no block, stack, slot or open file left behind")
 
     # spawn, rfork + exec, wait -- from inside a process
     code = run_prog("/bin/ptest", "spawn", "/bin/hello", nul)
@@ -1114,7 +1114,7 @@ def test_proc():
     code = run_prog("/bin/ptest", "orphan", nul, nul)
     live_mid: uint32 = threads_in_use()
     thread_sleep(120)
-    check(cast[uint32](code == 60 and live_mid == thr0 + 1 and threads_in_use() == thr0 and pheap.n_live == plive0), "proc: a child that outlives its parent is collected by the reaper")
+    check(cast[uint32](code == 60 and live_mid == thr0 + 1 and threads_in_use() == thr0 and parena_live() == plive0), "proc: a child that outlives its parent is collected by the reaper")
     check(cast[uint32](proc_waitpid(9999, 0) == -10 and proc_waitpid_jc(9999, cast[Ptr[int64]](0)) == -10), "proc: waiting for a process that does not exist is ECHILD")
 
     # ending a process group from outside (what Ctrl-C at the console does)
@@ -1140,9 +1140,9 @@ def test_proc():
     vfs_close(fd)
     check(cast[uint32](code == 139 and mutex_dead_released == md0 + 1 and fd >= 0 and vfs_unlink("/tmp/afterlock") == 0), "fault: a thread that dies holding the file-system lock does not block the file system")
     vfs_unlink("/tmp/notelf")           # left by `ptest forkfail`
-    check(cast[uint32](pheap.n_live == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0 and heap_check(&pheap) == 0 and heap_check(&kheap) == 0), "proc: everything released at the end of the group, heaps consistent")
+    check(cast[uint32](parena_live() == plive0 and kheap.n_live == klive0 and threads_in_use() == thr0 and vfs_open_count() == open0 and parena_check() == 0 and heap_check(&kheap) == 0), "proc: everything released at the end of the group, heaps consistent")
     printk2("   %d processes created so far, %d of them through exec\n", proc_spawned, proc_execs)
-    printk4("   program arena blocks %d (was %d), kernel heap blocks %d (was %d)", cast[uint64](pheap.n_live), cast[uint64](plive0), cast[uint64](kheap.n_live), cast[uint64](klive0))
+    printk4("   program arena blocks %d (was %d), kernel heap blocks %d (was %d)", cast[uint64](parena_live()), cast[uint64](plive0), cast[uint64](kheap.n_live), cast[uint64](klive0))
     printk4(", threads %d (was %d), open files %d (was %d)\n", cast[uint64](threads_in_use()), cast[uint64](thr0), cast[uint64](vfs_open_count()), cast[uint64](open0))
 
 

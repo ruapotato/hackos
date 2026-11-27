@@ -59,9 +59,26 @@ Works, and is checked by `make test`:
 - Runs end with a status line and a system reset; nothing depends on a
   debugger channel (semihosting is gone).
 
-Does not exist yet: any real device driver, any i.MX RT support, signals
-other than Ctrl-C ending the foreground program, threads inside a process,
-shared libraries, a way to compile on the device.
+Does not exist yet: signals other than Ctrl-C ending the foreground
+program, threads inside a process, shared libraries, a way to compile on
+the device, USB, PSRAM.
+
+## A second board: the Teensy 4.1 (UNTESTED ON HARDWARE)
+
+`make BOARD=teensy41` builds the same system for a PJRC Teensy 4.1 (NXP
+i.MX RT1062): `build/teensy41/hackos.hex` for the Teensy loader, with the
+FlexSPI boot header, the console on `Serial1` (pins 0/1, 115200), the LED on
+pin 13 as a sign of life, and `/sd` on the built-in microSD socket. The
+i.MX RT drivers (LPUART, GPIO, IOMUXC, clock gates and roots, LPI2C, LPSPI,
+uSDHC and the SD card protocol) are in `soc/imxrt/` (shared with the
+RT1170 family) and `soc/imxrt1062/`. **None of it has run on a Teensy.**
+What can be checked without one is checked by `make test-teensy`: the boot
+header against NXP's structures, every register constant and pin-mux
+setting against NXP's device files and PJRC's pin table, the SD driver
+against QEMU's own uSDHC and SD card models, the other drivers against
+register models, and the Teensy's programs in QEMU in the Teensy's memory
+map. How to flash it, what the first power-up should show, and the order in
+which to check the untested parts: [`docs/boards/teensy41.md`](docs/boards/teensy41.md).
 
 Known shortcomings are listed at the end.
 
@@ -108,16 +125,29 @@ tick-exact timing checks independent of the host's load; the two typed
 sessions run in real time.
 
 Other targets: `make size`, `make measure` (code size of small functions
-against the same functions in C; sizes of the image and of every program).
+against the same functions in C; sizes of the image and of every program),
+`make BOARD=teensy41` and `make test-teensy` (above).
+
+`BOARD` selects `boards/<dir>/board.mk`; Adder code imports the board as
+`board.board`, and every Adder unit is compiled inside `build/root` (or
+`build/<BOARD>/root`), a tree of links to the sources in which `board` is the
+selected board directory and in which a board's size patches of copied
+Hamnix code are applied (`scripts/mkroot.sh`). The default is
+`BOARD=qemu-mps2`; everything above is that board.
 
 ## Layout
 
 | Path | What |
 |--|--|
-| `arch/armv7m/startup.S` | vector tables, reset stub, fault entry |
+| `arch/armv7m/startup.S` | reset stub, fault entry; includes the board's vector table |
 | `arch/armv7m/switch.S` | PendSV context switch, SVC entry and exit, first-thread start |
 | `arch/armv7m/cpu.S`, `aeabi.S` | special-register access; shims from the EABI helper names to their Adder implementations (also linked into every program) |
-| `boards/mps2_an500/` | linker script and board constants for the QEMU machine |
+| `boards/mps2_an500/` | the QEMU machine: board functions, vector table, linker script, `board.mk` |
+| `boards/teensy41/` | the Teensy 4.1: boot header and vector table, linker script, board functions, size patches (`patches/`) |
+| `soc/imxrt/` | i.MX RT drivers for IP blocks the RT1060 and RT1170 share: LPUART, GPIO, IOMUXC, LPI2C, LPSPI, uSDHC; register access and delays |
+| `soc/imxrt1062/` | RT1062 addresses, interrupts, clock gates and roots, clock report, watchdogs, caches |
+| `drivers/sd/` | SD card protocol over the uSDHC |
+| `mm/parena.ad` | the program arena: one MPU-aligned block per process, bookkeeping outside the arena |
 | `kernel/sched/core.ad` | threads, scheduler, wait queues, timer queue, the reaper |
 | `kernel/proc.ad` | processes: program loader, spawn, exec, rfork, wait |
 | `kernel/pipe.ad` | pipes |
@@ -141,11 +171,13 @@ against the same functions in C; sizes of the image and of every program).
 | `drivers/i2c/` | software I2C bus, Sensirion platform layer and driver declarations |
 | `init/main.ad`, `init/monitor*.ad` | the system image (init + shell); the kernel monitor image |
 | `scripts/mkromfs.sh` | generates the table of ROM files |
-| `third_party/` | vendor C code with licences and upstream records |
+| `third_party/` | vendor code with licences and upstream records: Sensirion's C driver; NXP's RT1062 device files, read as data by the checks |
 | `lib/cshim/` | the few C library functions C code may use |
 | `demo/main.ad` | the milestone-1 run-time self-test |
 | `tests/` | kernel test image, harness, link-rule check, measurement fixtures, the FAT image's contents |
+| `tests/imxrt/` | the Teensy checks: boot header, register and pin checkers, register models, the driver test image, the uSDHC test on QEMU's i.MX6UL, the Teensy memory test |
 | `docs/syscalls.md` | the system-call table and how it differs from Hamnix |
+| `docs/boards/teensy41.md` | flashing, wiring, first power-up, bring-up checklist, memory |
 
 Assembly is five files (about 740 lines): what the processor requires at
 exception entry and exit, register access, the calling-convention shims, and
@@ -173,8 +205,9 @@ linked. A C file works the same way (`user/progs/crel.c`).
 
 ## Known shortcomings
 
-- Emulator only; the memory map, UART and clock are those of `mps2-an500`.
-  Tables are sized for its 16 MB (the target has 64 MB).
+- Nothing has run on hardware. The QEMU board's tables are sized for its
+  16 MB; the Teensy 4.1's (1 MB) are smaller by per-board patches, with the
+  limits listed in docs/boards/teensy41.md.
 - **No signals, one exception.** Ctrl-C ends the process group the shell
   has named as the foreground one (`tcsetpgrp`), with status 130. Hamnix's
   shell names a group for a single foreground command, not for a pipeline:
@@ -206,7 +239,6 @@ linked. A C file works the same way (`user/progs/crel.c`).
   should. Console output is polled.
 - Removing an open file is refused; directory reads are a snapshot.
 - 64-bit division is a bit-at-a-time loop: correct, slow.
-- Board support is selected by import path, not by a build option.
 
 ## Licence
 
@@ -214,4 +246,9 @@ AGPL-3.0-or-later. See `LICENSE`.
 
 Files copied from Hamnix (`fs/HAMNIX_ORIGIN`: the file systems, the shell, the
 programs and their libraries) are GPL-3.0-or-later by the same author. `third_party/` holds code under its own licences (currently
-BSD-3-Clause), each with its licence file and an `UPSTREAM` record.
+BSD-3-Clause: Sensirion's driver, NXP's RT1062 device files), each with its
+licence file and an `UPSTREAM` record. Nothing of PJRC's Teensy core is
+copied (its licence adds a condition to MIT's); its pin table and boot block
+were compared with, and the extracted pin table
+(`tests/imxrt/teensy41_pins.txt`) records only facts, with the source's
+commit and hash.

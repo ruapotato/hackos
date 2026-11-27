@@ -9,10 +9,11 @@
 #
 #   OUT/<dir>/...   a symbolic link to every file of the firmware tree
 #   OUT/board       a link to boards/BOARD_DIR (kernel code imports board.board)
-#   OUT/<path>      for each PATCH = boards/BOARD_DIR/patches/<path>.patch: a
+#   OUT/<path>      for each PATCH = boards/*/patches/<path>.patch: a
 #                   real file, <path> with that patch applied (a per-board size
 #                   configuration of copied code; the committed file is left
-#                   as it is)
+#                   as it is; tests/imxrt/t41mem.sh applies the teensy41
+#                   patches in a tree for the QEMU board)
 #   OUT/<PATH>      for each PATH=REPLACEMENT: a link to REPLACEMENT instead
 #                   (the driver tests swap soc/imxrt/reg.ad and delay.ad for
 #                   register models this way; never used for an image that
@@ -36,8 +37,8 @@ for p in "$@"; do
         rm -f "$out/$rel"; ln -s "$top/$src" "$out/$rel"
         continue;;
     esac
-    rel="${p#boards/$board/patches/}"; rel="${rel%.patch}"
-    [ "$rel" != "$p" ] && [ -f "$rel" ] || { echo "mkroot: $p does not name a file under boards/$board/patches/" >&2; exit 1; }
+    rel="${p#boards/*/patches/}"; rel="${rel%.patch}"
+    [ "$rel" != "$p" ] && [ -f "$rel" ] || { echo "mkroot: $p does not name a file under boards/*/patches/" >&2; exit 1; }
     rm -f "$out/$rel"
     patch -s -o "$out/$rel" "$rel" "$p" || { echo "mkroot: $p does not apply to $rel" >&2; exit 1; }
 done
