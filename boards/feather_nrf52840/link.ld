@@ -51,6 +51,18 @@ __stack_size = 0x2000;               /* handler-mode (MSP) stack */
 __user_size  = 0x100;                /* shared arena of in-image unprivileged
                                         threads: none in this image */
 
+/* Explicit program headers, without FILEHDR/PHDRS: otherwise lld puts the
+ * ELF and program headers in a load segment below the first section (at
+ * 0x20000, inside the SoftDevice), which a debugger that programs an ELF by
+ * its segments would write.  tests/nrf52/check_image.py checks the segments. */
+PHDRS
+{
+    text  PT_LOAD;
+    romfs PT_LOAD;
+    data  PT_LOAD;
+    ram   PT_LOAD;
+}
+
 SECTIONS
 {
     .text :
@@ -61,7 +73,7 @@ SECTIONS
         *(EXCLUDE_FILE(*romfs.o) .rodata EXCLUDE_FILE(*romfs.o) .rodata.*)
         . = ALIGN(8);
         __text_end = .;
-    } > FLASH
+    } > FLASH :text
 
     .romfs __romfs_window :
     {
@@ -69,7 +81,7 @@ SECTIONS
         KEEP(*romfs.o(.rodata .rodata.*))
         . = ALIGN(8);
         __romfs_end = .;
-    } > FLASH
+    } > FLASH :romfs
 
     /DISCARD/ : { *(.ARM.exidx* .ARM.extab* .ARM.attributes .comment .note*) }
 
@@ -80,7 +92,7 @@ SECTIONS
         *(.data .data.*)
         . = ALIGN(8);
         __data_end = .;
-    } > RAM AT > FLASH
+    } > RAM AT > FLASH :data
 
     /* .xbss directly precedes .bss; board_init_early clears it (only QEMU
      * hands over zeroed RAM). */
@@ -90,7 +102,7 @@ SECTIONS
         *(.bss.tmpfs_table)
         . = ALIGN(8);
         __xbss_end = .;
-    } > RAM
+    } > RAM :ram
 
     .bss (NOLOAD) : ALIGN(8)
     {
@@ -99,20 +111,20 @@ SECTIONS
         *(COMMON)
         . = ALIGN(8);
         __bss_end = .;
-    } > RAM
+    } > RAM :ram
 
     .stack (NOLOAD) : ALIGN(8)
     {
         __stack_bottom = .;
         . = . + __stack_size;
         __stack_top = .;
-    } > RAM
+    } > RAM :ram
 
     .fault_stack (NOLOAD) : ALIGN(8)
     {
         . = . + 0x800;
         __fault_stack_top = .;
-    } > RAM
+    } > RAM :ram
 
     __flash_end = LOADADDR(.data) + SIZEOF(.data);
     __ram_end = ORIGIN(RAM) + LENGTH(RAM);

@@ -185,7 +185,9 @@ bootloader.
    then **Ctrl-C** on `ptest loop`, then **a fault** (`ptest peek 20000000`
    must end with status 139: the MPU, on the real M4).
 6. **Timing.** `sleep`-like waits use the RTC1 tick, 1000 Hz on average, from
-   the RC oscillator: within about 2 % of real time, uncalibrated.
+   the RC oscillator, which HackOS does not calibrate: expect an error of
+   up to a few per cent against a wall clock (the product specification's
+   LFRC tolerance).
 
 ## 6. What was checked without the board, and what was not
 

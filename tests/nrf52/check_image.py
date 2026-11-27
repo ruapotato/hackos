@@ -50,6 +50,12 @@ check(re.search(r'^NRF_APP_START \?= 0x0*26000$', mk, re.M) is not None and app 
       f"NRF_APP_START 0x26000 = S140 6.1.1's own size word (SD_SIZE_GET); 7.3.0 would be 0x{num('SD_S140_7_3_0_APP_START'):x}")
 check(syms['hackos_vectors'] == app and syms['__vectors_start'] == app, f"vector table at the application start 0x{app:x}")
 
+ph = subprocess.run(['llvm-readelf', '-l', f'{B}/hackos.elf'], capture_output=True, text=True).stdout
+loads = [l.split() for l in ph.split('\n') if l.strip().startswith('LOAD')]
+bad = [l for l in loads if int(l[4], 16) and not (app <= int(l[3], 16) < user_end)]
+check(loads and not bad, f"every ELF load segment with file contents has its load address inside 0x{app:x}..0x{user_end:x} "
+      f"({len(loads)} segments; programming the ELF over SWD writes nothing else)")
+
 # the image's bytes, from the HEX
 mem = {}
 base = 0

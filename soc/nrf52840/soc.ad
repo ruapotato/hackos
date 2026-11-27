@@ -129,7 +129,8 @@ def nrf52840_handle_approtect():
 
 # HFCLK from the 32 MHz crystal (HFXO; the UART's baud rate is then
 # crystal-accurate instead of HFINT's +-1.5 %), LFCLK from the internal RC
-# oscillator (32.768 kHz, +-2 % uncalibrated: it only paces the scheduler
+# oscillator (32.768 kHz, not calibrated here, so off by up to a few per
+# cent (product specification, LFRC tolerance); it only paces the scheduler
 # tick; RC rather than the Feather's 32 kHz crystal so that the same image
 # runs on a board without one, as Adafruit's bootloader does).  Each start
 # is polled with a bound: a dead crystal costs WAIT_SPINS polls and leaves

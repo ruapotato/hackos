@@ -10,6 +10,8 @@
 #                the committed feather_facts.txt re-extracted from them
 #   image        vector table, memory map, HEX and UF2 against the
 #                bootloader's rules; pins against Adafruit's tables
+#   uf2conv      (with UF2CONV=<microsoft/uf2>/utils/uf2conv.py) the UF2
+#                file byte for byte against Microsoft's converter
 #   code         no double-precision FPU instruction anywhere (the M4F has
 #                none), the soft-double helpers linked, every program an
 #                RWPI executable with no load-time relocation
@@ -60,6 +62,12 @@ facts() {
     diff tests/nrf52/feather_facts.txt $L/facts.txt && echo "ok: the facts table is what those checkouts say"
 }
 
+uf2conv() {
+    if [ -z "${UF2CONV:-}" ]; then echo "no UF2CONV= (Microsoft's utils/uf2conv.py) given"; return 77; fi
+    python3 -I "$UF2CONV" -c -f 0xADA52840 -o $L/uf2conv.uf2 $B/hackos.hex || return 1
+    cmp $L/uf2conv.uf2 $B/hackos.uf2 && echo "ok: scripts/mkuf2.py's file is byte-identical to Microsoft's uf2conv.py output"
+}
+
 code() {
     local bad=0
     for f in $B/hackos.elf $B/user/*.elf; do
@@ -91,6 +99,7 @@ step third_party third_party
 step regs regs
 step facts facts
 step image python3 -I tests/nrf52/check_image.py tests/nrf52/feather_facts.txt $B
+step uf2conv uf2conv
 step code code
 step renode bash tests/nrf52/renode_session.sh
 echo "[nrf52] $failed failed steps"
