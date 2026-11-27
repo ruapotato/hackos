@@ -15,6 +15,7 @@
 
 from kernel.cpu import cpu_irq_disable, mmio_write32
 from kernel.print import kputs, kput_u64
+from board.board import board_halt
 
 
 def hackos_exit(code: uint32):
@@ -22,5 +23,6 @@ def hackos_exit(code: uint32):
     kputs("\n[hackos] exit status ")
     kput_u64(cast[uint64](code))
     kputs("\n")
+    board_halt(code)
     while 1 == 1:
         mmio_write32(0xE000ED0C, 0x05FA0004)        # AIRCR: VECTKEY | SYSRESETREQ

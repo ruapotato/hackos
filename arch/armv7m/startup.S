@@ -3,7 +3,7 @@
 /* HackOS -- ARMv7-M (Cortex-M7) start-up and ABI glue.
  *
  * This file holds ONLY what cannot be written in Adder:
- *   1. the vector table (a data table at a fixed section),
+ *   1. the vector table (a data table at a fixed section; per board, included),
  *   2. the reset stub (the FPU must be on before any compiled code runs,
  *      because LLVM is free to move 64-bit values through d-registers),
  *   3. the fault entry stub (must read LR/MSP/PSP before any prologue),
@@ -31,48 +31,13 @@
 /* ------------------------------------------------------------------ */
 /* 1. Vector tables                                                   */
 /* ------------------------------------------------------------------ */
-/* Address 0 holds only what reset needs: the core reads the initial MSP and
- * the reset vector from there before any code runs.  The rest of the first
- * 4 KB of the image is empty and becomes an MPU no-access region (the null
- * pointer guard, kernel/mpu.ad), so the real vector table lives behind it and
- * hackos_start() points VTOR at it.  Until then interrupts are masked; a fault
- * that early still finds a handler through the copies below.              */
-        .section .boot_vectors, "a", %progbits
-        .global hackos_boot_vectors
-        .type hackos_boot_vectors, %object
-hackos_boot_vectors:
-        .word   __stack_top             /*  0 initial MSP                 */
-        .word   Reset_Handler           /*  1 reset                       */
-        .word   nmi_handler             /*  2 NMI                         */
-        .word   HardFault_Handler       /*  3                             */
-        .word   MemManage_Handler       /*  4                             */
-        .word   BusFault_Handler        /*  5                             */
-        .word   UsageFault_Handler      /*  6                             */
-        .size hackos_boot_vectors, . - hackos_boot_vectors
-
-        .section .vectors, "a", %progbits
-        .balign 128                     /* VTOR bits [6:0] are zero       */
-        .global hackos_vectors
-        .type hackos_vectors, %object
-hackos_vectors:
-        .word   __stack_top             /*  0 initial MSP                 */
-        .word   Reset_Handler           /*  1 reset                       */
-        .word   nmi_handler             /*  2 NMI                         */
-        .word   HardFault_Handler       /*  3                             */
-        .word   MemManage_Handler       /*  4                             */
-        .word   BusFault_Handler        /*  5                             */
-        .word   UsageFault_Handler      /*  6                             */
-        .word   0, 0, 0, 0              /*  7..10 reserved                */
-        .word   svc_handler             /* 11 SVCall     (weak)           */
-        .word   debugmon_handler        /* 12                             */
-        .word   0                       /* 13 reserved                    */
-        .word   pendsv_handler          /* 14 PendSV     (weak)           */
-        .word   systick_handler         /* 15 SysTick    (Adder, weak)    */
-        .word   uart0_rx_handler        /* 16 IRQ 0: UART0 receive (weak) */
-        .rept   31                      /* 17.. external interrupts 1..31 */
-        .word   irq_default_handler
-        .endr
-        .size hackos_vectors, . - hackos_vectors
+/* Board specific: boards/<board>/vectors.S, found through -Iboards/<board>.
+ * It defines hackos_vectors (the table VTOR is pointed at) and whatever the
+ * board's boot path needs before it (mps2-an500: the reset-only table at
+ * address 0; teensy41: the FlexSPI boot header).  A board that must run code
+ * before the stack pointer is usable defines BOARD_RESET_EARLY and a leaf
+ * routine board_reset_early that uses no stack.                          */
+#include "vectors.S"
 
 /* Handlers a kernel may define in Adder.  A plain zero-argument Adder
  * function IS a valid exception handler: the core stacks r0-r3,r12,lr,pc,xPSR
@@ -108,6 +73,9 @@ hackos_vectors:
         .type   Reset_Handler, %function
 Reset_Handler:
         cpsid   i
+#ifdef BOARD_RESET_EARLY
+        bl      board_reset_early       /* e.g. memory banks; no stack yet */
+#endif
         ldr     r0, =__stack_top        /* do not rely on the loader's MSP */
         mov     sp, r0
         /* CPACR (0xE000ED88): full access to CP10+CP11 = enable the FPU.  */

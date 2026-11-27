@@ -1,17 +1,36 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- build and test (milestone 1: QEMU mps2-an500, ARM Cortex-M7).
+# HackOS -- build and test.
 #
-#   make            build build/hackos.elf (the demo / self-test image)
-#   make test       build everything from source and run every test; non-zero
-#                   exit status on any failure
-#   make run        run the demo in QEMU with the UART on the terminal
-#   make size       text/data/bss of the image
-#   make measure    cost of the i64 value model vs. C (tests/measure.sh)
+#   make                    build the default board's image (BOARD=qemu-mps2)
+#   make test               build everything for QEMU from source and run every
+#                           test; non-zero exit status on any failure
+#   make run                run the system in QEMU with the UART on the terminal
+#   make size               text/data/bss of the image
+#   make measure            cost of the i64 value model vs. C (tests/measure.sh)
+#   make BOARD=teensy41     the Teensy 4.1 image: build/teensy41/hackos.hex
+#                           (docs/boards/teensy41.md)
+#   make test-teensy        the checks that can be made without the board:
+#                           boot header, register constants, pin table, the
+#                           drivers against register models (tests/imxrt/)
+#
+# BOARD picks boards/<dir>/board.mk (the linker script, the vector table, which
+# images exist, per-board size patches).  Adder code imports the board as
+# `board.board`; the compiler runs in $(B)/root, a tree of links to these
+# sources in which `board` is the selected board directory
+# (scripts/mkroot.sh).  Output goes to build/ for qemu-mps2 and to
+# build/<BOARD>/ for every other board.
 #
 # ADDER points at a checkout of the Adder compiler that has the
 # thumbv7em-none-eabihf target (branch cortex-m7).  Nothing from that tree is
 # copied here; its host compiler binary is bootstrapped there on first use.
+BOARD   ?= qemu-mps2
+BOARD_DIR_qemu-mps2 := mps2_an500
+BOARD_DIR_teensy41  := teensy41
+BOARD_DIR := $(BOARD_DIR_$(BOARD))
+ifeq ($(BOARD_DIR),)
+$(error unknown BOARD=$(BOARD); known: qemu-mps2 teensy41)
+endif
 ADDER   ?= ../adder
 CLANG   ?= clang
 LLD     ?= ld.lld
@@ -21,16 +40,27 @@ SIZE    ?= llvm-size
 QEMU    ?= qemu-system-arm
 
 HOST_AC := $(ADDER)/build/cutover/host_ac.elf
+HOST_AC_ABS = $(abspath $(HOST_AC))
 TRIPLE  := thumbv7em-none-eabihf
 CPUFLAGS := --target=$(TRIPLE) -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb
 OPT     ?= -O2
 # -ffunction-sections/-fdata-sections + --gc-sections: only what is reachable
 # from the vector table is linked.
 LLFLAGS := $(CPUFLAGS) $(OPT) -ffreestanding -fno-pic -ffunction-sections -fdata-sections -Wno-override-module
-ASFLAGS := $(CPUFLAGS) -ffreestanding
-LDFLAGS := -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static
+ASFLAGS := $(CPUFLAGS) -ffreestanding -Iboards/$(BOARD_DIR)
 
+ifeq ($(BOARD),qemu-mps2)
 B := build
+else
+B := build/$(BOARD)
+endif
+# Defaults a board.mk may change.
+LINK_LD       := boards/$(BOARD_DIR)/link.ld
+IMAGES        := hackos
+BOARD_PATCHES :=
+PROG_AFLAGS   :=
+include boards/$(BOARD_DIR)/board.mk
+LDFLAGS := -T $(LINK_LD) --gc-sections -nostdlib -static
 
 # C code (third-party drivers and their tests): natural C ABI, no C library
 # except lib/cshim, whose functions carry hackos_c_ names (the forced include
@@ -40,7 +70,7 @@ CFLAGS  := $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fno-pic -ffu
 C_SHT4X := third_party/sensirion-sht4x
 COBJS_ktest := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common.o $(B)/c/interop.o $(B)/c/libc.o
 
-SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/mps2_an500/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
+SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/*/*.ad soc/*/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
 
 # ---- user programs -----------------------------------------------------------
 # Each is its own Adder translation unit, compiled position-independent and
@@ -65,8 +95,8 @@ URT     := $(B)/user/crt.o $(B)/user/aeabi.o $(B)/user/rt.o
 STRIP   ?= llvm-strip
 
 .SECONDARY:
-.PHONY: all test run size measure clean compiler
-all: $(B)/hackos.elf
+.PHONY: all test run size measure clean compiler test-teensy
+all: $(IMAGES:%=$(B)/%.elf) $(BOARD_ALL)
 
 # Bootstrap the compiler in ITS tree if its binary is missing or older than
 # its sources (the Python seed compiles the self-hosted compiler; ~7 s).
@@ -78,12 +108,17 @@ $(HOST_AC): $(wildcard $(ADDER)/adder/compiler/*.ad)
 $(B):
 	mkdir -p $(B)
 
+# The tree the compiler runs in (see the top of this file).
+SRCROOT := $(B)/root/.stamp
+$(SRCROOT): $(SRC_AD) $(SRC_USER) $(BOARD_PATCHES) scripts/mkroot.sh boards/$(BOARD_DIR)/board.mk | $(B)
+	bash scripts/mkroot.sh $(B)/root $(BOARD_DIR) $(BOARD_PATCHES)
+
 # One Adder translation unit per image: the root file plus its import closure.
 # The compiler resolves imports relative to the current directory, so it runs
 # from the firmware root.  A function outside the LLVM-lane subset is a hard
 # compile error on this target.
-$(B)/%.ll: $(SRC_AD) $(HOST_AC) | $(B)
-	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $(ROOT_$*) $@
+$(B)/%.ll: $(SRC_AD) $(HOST_AC) $(SRCROOT) | $(B)
+	cd $(B)/root && $(HOST_AC_ABS) --backend=llvm --target=$(TRIPLE) $(ROOT_$*) $(abspath $@)
 	@grep '^; ADDER_STAT' $@
 
 ROOT_hackos := init/main.ad
@@ -101,14 +136,14 @@ $(B)/%.o: $(B)/%.ll
 $(B)/user:
 	mkdir -p $(B)/user
 
-$(B)/user/rt.ll: user/rt/rt.ad kernel/rt.ad $(HOST_AC) | $(B)/user
-	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $< $@
+$(B)/user/rt.ll: user/rt/rt.ad kernel/rt.ad $(HOST_AC) $(SRCROOT) | $(B)/user
+	cd $(B)/root && $(HOST_AC_ABS) --backend=llvm --target=$(TRIPLE) $(PROG_AFLAGS) $< $(abspath $@)
 
-$(B)/user/%.ll: user/progs/%.ad $(SRC_USER) $(HOST_AC) | $(B)/user
-	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $< $@
+$(B)/user/%.ll: user/progs/%.ad $(SRC_USER) $(HOST_AC) $(SRCROOT) | $(B)/user
+	cd $(B)/root && $(HOST_AC_ABS) --backend=llvm --target=$(TRIPLE) $(PROG_AFLAGS) $< $(abspath $@)
 
-$(B)/user/%.ll: user/hamnix/%.ad $(SRC_USER) $(HOST_AC) | $(B)/user
-	$(HOST_AC) --backend=llvm --target=$(TRIPLE) $< $@
+$(B)/user/%.ll: user/hamnix/%.ad $(SRC_USER) $(HOST_AC) $(SRCROOT) | $(B)/user
+	cd $(B)/root && $(HOST_AC_ABS) --backend=llvm --target=$(TRIPLE) $(PROG_AFLAGS) $< $(abspath $@)
 
 $(B)/user/%.o: $(B)/user/%.ll
 	$(CLANG) $(UFLAGS) -c $< -o $@
@@ -139,6 +174,8 @@ $(B)/romfs.o: $(B)/romfs.S
 $(B)/%.o: arch/armv7m/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
+$(B)/startup.o: boards/$(BOARD_DIR)/vectors.S
+
 $(B)/c/%.o: $(C_SHT4X)/%.c | $(B)
 	@mkdir -p $(B)/c
 	$(CLANG) $(CFLAGS) -I$(C_SHT4X) -c $< -o $@
@@ -154,7 +191,7 @@ $(B)/c/%.o: lib/cshim/%.c | $(B)
 $(B)/%.o: tests/arch/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(B)/romfs.o $(COBJS_ktest) boards/mps2_an500/link.ld
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(B)/romfs.o $(COBJS_ktest) $(LINK_LD)
 	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(B)/romfs.o $<
 	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
 

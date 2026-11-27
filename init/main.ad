@@ -11,6 +11,7 @@
 from kernel.init import kernel_init
 from kernel.sched.core import thread_create, sched_start, thread_sleep
 from kernel.print import kputs
+from board.board import board_name, board_late_init
 from kernel.printk.printk import printk1, printk2
 from kernel.proc import proc_spawn, proc_waitpid
 from drivers.tty.console import console_rx_enable, console_set_mode, CON_RAW
@@ -50,8 +51,11 @@ def init_main(arg: uint64) -> int64:
 
 
 def main() -> int32:
-    kputs("\nHackOS 0.3 (milestone 3) -- ARM Cortex-M7, QEMU mps2-an500\n")
+    kputs("\nHackOS 0.3 (milestone 3) -- ARM Cortex-M7, ")
+    kputs(board_name())
+    kputs("\n")
     kernel_init()
+    board_late_init()
     console_rx_enable()
     thread_create("init", cast[uint64](&init_main), 0, 2, 16384, 0)
     sched_start()

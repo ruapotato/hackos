@@ -44,6 +44,7 @@
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.rt import rt_memcpy, rt_memset
+from board.board import board_code_loaded
 from kernel.mpu import mpu_proc_rasr, mpu_proc_rbar
 from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, thread_killed, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, WAIT_FOREVER
 from mm.slab import kmalloc, kfree, palloc_aligned, pfree
@@ -267,6 +268,7 @@ def _load_fd(fd: int32, hdr: Ptr[uint8], ph: Ptr[uint8], img: Ptr[Image]) -> int
     if (entry & 0xFFFFFFFE) >= hi:
         pfree(base)
         return _fail(ENOEXEC, "exec: entry point outside the image")
+    board_code_loaded(base, cast[uint64](bsize))
     img[0].base = base
     img[0].lo = cast[uint32](base)
     img[0].hi = cast[uint32](base) + bsize

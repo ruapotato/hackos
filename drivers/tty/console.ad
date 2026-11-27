@@ -20,7 +20,7 @@
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, mmio_read32, mmio_write32, mmio_write8
 from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, sched_running, sched_in_handler, sched_kill_group, thread_killed, tty_fg_pgid, WAIT_FOREVER
 from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock
-from boards.mps2_an500.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack
+from board.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack
 
 CON_RING: uint32 = 1024
 CON_LINE: uint32 = 256

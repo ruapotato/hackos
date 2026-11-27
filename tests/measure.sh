@@ -10,6 +10,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ADDER="${ADDER:-../adder}"
 CLANG="${CLANG:-clang}"; OBJDUMP="${OBJDUMP:-llvm-objdump}"; SIZE="${SIZE:-llvm-size}"
 B=build/measure; mkdir -p $B
+AC="$(cd "$ADDER" && pwd)/build/cutover/host_ac.elf"; MB="$(pwd)/$B"
+# Kernel and program sources are compiled in the tree `make` builds for the
+# board (build/root: links to the sources, `board` = boards/mps2_an500).
+kc() { (cd build/root && "$AC" --backend=llvm --target=thumbv7em-none-eabihf "$@"); }
 CF="--target=thumbv7em-none-eabihf -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb -ffreestanding -fno-pic -Wno-override-module"
 bytes() { llvm-nm -S "$1" | awk -v fn="$2" '$4==fn{print strtonum("0x" $2)}'; }
 insns() { awk -v fn="<$2>:" '/^[0-9a-f]+ <.*>:$/{infn=($2==fn); next} infn && /^ +[0-9a-f]+:/ && $0 !~ /\.(word|short|byte)/{n++} END{print n+0}' "$1"; }
@@ -38,12 +42,12 @@ done
 echo "sizeof(Item {uint32 key; Item *next; uint8 *data}):"
 echo "  Adder: $(awk '/^define .*@sizeof_item\(/{f=1} f&&/ret i64/{print $3} /^}/{f=0}' <($CLANG $CF -O2 -S -emit-llvm $B/cost_ad.ll -o -)) bytes   C: $(awk '/<sizeof_item>:/{f=1;next} f&&/movs/{print strtonum(substr($4,2)); exit}' $B/cost_c-O2.dis) bytes"
 echo
-if [ -f build/hackos.elf ] && [ -f build/romfs.o ]; then
+if [ -f build/hackos.elf ] && [ -f build/romfs.o ] && [ -d build/root ]; then
     rom="$($SIZE -A build/romfs.o | awk '$1==".rodata.romfs"{print $2}')"
     echo "System image (kernel, init, and the programs under /bin as ROM files), -O2:"; $SIZE build/hackos.elf
     echo "  of that text, $rom bytes are the ROM files; the kernel itself is $(( $($SIZE build/hackos.elf | awk 'NR==2{print $1}') - rom )) bytes"
     # the same kernel with the size attribute (the ROM files unchanged)
-    "$ADDER/build/cutover/host_ac.elf" --backend=llvm --target=thumbv7em-none-eabihf --llvm-optsize init/main.ad $B/hackos_os.ll >/dev/null
+    kc --llvm-optsize init/main.ad $MB/hackos_os.ll >/dev/null
     $CLANG $CF -Os -ffunction-sections -fdata-sections -c $B/hackos_os.ll -o $B/hackos_os.o
     ld.lld -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static -o $B/hackos_os.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/romfs.o $B/hackos_os.o
     echo "The same with the kernel built --llvm-optsize and clang -Os:"; $SIZE $B/hackos_os.elf
@@ -52,11 +56,11 @@ if [ -f build/hackos.elf ] && [ -f build/romfs.o ]; then
     echo "Programs (position-independent, stripped): file size at -O2, and built --llvm-optsize / -Os"
     printf '%-8s | %9s | %9s | %s\n' program "-O2" "-Os" "memory block when running (-O2: stack + image, rounded to eighths of an MPU region)"
     UF="$CF -ffunction-sections -fdata-sections -fPIE"
-    "$ADDER/build/cutover/host_ac.elf" --backend=llvm --target=thumbv7em-none-eabihf --llvm-optsize user/rt/rt.ad $B/u_rt.ll >/dev/null
+    kc --llvm-optsize user/rt/rt.ad $MB/u_rt.ll >/dev/null
     $CLANG $UF -Os -c $B/u_rt.ll -o $B/u_rt.o
     for p in echo cat ls cp rm mkdir wc head grep hamsh hello ptest halt; do
         src=user/hamnix/$p.ad; [ -f $src ] || src=user/progs/$p.ad
-        "$ADDER/build/cutover/host_ac.elf" --backend=llvm --target=thumbv7em-none-eabihf --llvm-optsize $src $B/u_$p.ll >/dev/null
+        kc --llvm-optsize $src $MB/u_$p.ll >/dev/null
         $CLANG $UF -Os -c $B/u_$p.ll -o $B/u_$p.o
         stack=$($OBJDUMP -p build/user/$p.elf | awk '/STACK/{getline; print strtonum("0x" substr($4,3))}')
         ld.lld -pie --no-dynamic-linker --omagic -T user/rt/prog.ld --gc-sections -nostdlib -z norelro -z stack-size=$stack --defsym=__heap_size=0 -o $B/u_$p.elf build/user/crt.o build/user/aeabi.o $B/u_rt.o $B/u_$p.o

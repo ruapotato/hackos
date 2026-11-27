@@ -48,6 +48,7 @@
 # Descriptors and /fd names are per thread, which means per process (a
 # process is one thread); a new thread gets copies of its creator's.
 
+from board.board import board_storage_init
 from kernel.sched.core import Thread, thr, threads, current_thread, thread_by_tid, sched_current, set_current_errstr, sched_exit_hook, sched_exit_hook_set, sched_spawn_hook, sched_spawn_hook_set, T_UNUSED, THREAD_MAX, TF_PROC, PF_VFORK
 from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock, memcpy, memset, spinlock_lock, spinlock_unlock
 from kernel.rt import rt_memcpy, rt_memset
@@ -449,7 +450,7 @@ def _fat_open(rel: Ptr[uint8], mode: uint32, wants_write: uint32) -> int32:
 # Mount the FAT32 volume on block device "ram0" at /sd, if there is one.
 # Returns 1 when mounted.
 def vfs_fat_mount() -> uint32:
-    slot: int32 = blk_init()
+    slot: int32 = board_storage_init()
     if slot < 0:
         return 0
     if fat_init(slot) != 0:

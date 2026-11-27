@@ -2,7 +2,7 @@
 # Copyright (C) 2026 David Hamner
 # HackOS -- console output formatting (no allocation, no varargs).
 
-from boards.mps2_an500.board import board_console_putc
+from board.board import board_console_putc
 
 
 def kputc(c: uint32):

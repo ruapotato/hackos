@@ -8,7 +8,7 @@
 # clear.
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_irq_enable
-from boards.mps2_an500.board import board_console_init
+from board.board import board_console_init, board_init_early
 from kernel.exit import hackos_exit
 # Not called from here, but arch/armv7m/startup.S refers to them by name, so
 # they must be part of every image: the fault report and the run-time helpers
@@ -54,6 +54,7 @@ def hackos_start():
     mmio_write32(0xE000ED24, mmio_read32(0xE000ED24) | 0x70000)
     # CCR (0xE000ED14): trap divide-by-zero (bit 4).
     mmio_write32(0xE000ED14, mmio_read32(0xE000ED14) | 0x10)
+    board_init_early()
     board_console_init()
     cpu_irq_enable()
     rc: int32 = main()

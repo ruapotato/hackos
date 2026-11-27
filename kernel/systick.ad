@@ -6,7 +6,7 @@
 #   0xE000E018 SYST_CVR  current value (any write clears it)
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_ipsr
-from boards.mps2_an500.board import board_cpu_hz
+from board.board import board_systick_csr, board_systick_reload
 
 # Written by the interrupt handler, read by thread code: volatile.
 systick_ticks: volatile uint32 = 0
@@ -17,9 +17,9 @@ systick_seen_ipsr: volatile uint32 = 0
 
 def systick_start(hz: uint32):
     mmio_write32(0xE000E010, 0)
-    mmio_write32(0xE000E014, board_cpu_hz() / hz - 1)
+    mmio_write32(0xE000E014, board_systick_reload(hz))
     mmio_write32(0xE000E018, 0)
-    mmio_write32(0xE000E010, 7)
+    mmio_write32(0xE000E010, board_systick_csr())
 
 
 def systick_stop():

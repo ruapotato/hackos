@@ -34,7 +34,7 @@ from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq
 from kernel.rt import rt_memset
 from mm.slab import kmalloc_aligned, kfree, umalloc_aligned, ufree, pfree
 from kernel.mpu import mpu_switch
-from boards.mps2_an500.board import board_cpu_hz
+from board.board import board_systick_csr, board_systick_reload
 
 THREAD_MAX: uint32 = 32
 SCHED_PRIOS: uint32 = 8
@@ -947,7 +947,7 @@ def sched_start():
     sched_mpu_apply(nxt)
     sched_running = 1
     mmio_write32(0xE000E010, 0)
-    mmio_write32(0xE000E014, board_cpu_hz() / SCHED_HZ - 1)
+    mmio_write32(0xE000E014, board_systick_reload(SCHED_HZ))
     mmio_write32(0xE000E018, 0)
-    mmio_write32(0xE000E010, 7)
+    mmio_write32(0xE000E010, board_systick_csr())
     sched_launch()

@@ -22,6 +22,11 @@
 #                                                                   code, data (off otherwise)
 #   6  1 KB at the bottom of the current thread's user stack    none / none
 #   7  1 KB at the bottom of the current thread's kernel stack  none / none
+#   8+ whatever the board adds (board_mpu_extra), e.g. no-access windows over
+#      address ranges where nothing answers (teensy41)
+#
+# Regions 0, 2 and 3 come from the board (board_mpu_{code,kram,xram}_*); the
+# shared user arena from the linker script.
 #
 # (*) depends on what kind of thread is running, see mpu_switch():
 #     - a thread of a loaded program (a process) gets region 5 and nothing
@@ -56,6 +61,7 @@
 #   * A kernel-stack frame larger than the 1 KB guard can step over it.
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_isb
+from board.board import board_mpu_code_base, board_mpu_code_size, board_mpu_kram_base, board_mpu_kram_size, board_mpu_xram_base, board_mpu_xram_size, board_mpu_extra
 
 extern def __user_start()
 extern def __user_end()
@@ -114,11 +120,12 @@ def mpu_init():
         n = n + 1
     ustart: uint32 = cast[uint32](cast[uint64](&__user_start))
     usize: uint32 = cast[uint32](cast[uint64](&__user_end)) - ustart
-    mpu_region(0, 0x00000000, 0x400000, MPU_AP_RO, 0)
+    mpu_region(0, board_mpu_code_base(), board_mpu_code_size(), MPU_AP_RO, 0)
     mpu_region(1, 0x00000000, 0x1000, MPU_AP_NONE, MPU_XN)
-    mpu_region(2, 0x20000000, 0x400000, MPU_AP_PRIV_RW, MPU_XN)
-    mpu_region(3, 0x60000000, 0x1000000, MPU_AP_PRIV_RW, MPU_XN)
+    mpu_region(2, board_mpu_kram_base(), board_mpu_kram_size(), MPU_AP_PRIV_RW, MPU_XN)
+    mpu_region(3, board_mpu_xram_base(), board_mpu_xram_size(), MPU_AP_PRIV_RW, MPU_XN)
     mpu_region(4, ustart, usize, MPU_AP_FULL, MPU_XN)
+    board_mpu_extra()
     mpu_user_base = ustart
     mpu_user_size = usize
     mpu_mode = MPU_MODE_SHARED
@@ -164,12 +171,12 @@ def mpu_switch(ustack_base: uint64, kstack_base: uint64, kind: uint32, rbar: uin
         if mpu_mode != MPU_MODE_PROC:
             mmio_write32(MPU_RNR, 4)
             mmio_write32(MPU_RASR, 0)
-            mpu_region(0, 0x00000000, 0x400000, MPU_AP_PRIV_RO, 0)
+            mpu_region(0, board_mpu_code_base(), board_mpu_code_size(), MPU_AP_PRIV_RO, 0)
             mpu_mode = MPU_MODE_PROC
     elif kind == 1:
         if mpu_mode != MPU_MODE_SHARED:
             mmio_write32(MPU_RNR, 5)
             mmio_write32(MPU_RASR, 0)
-            mpu_region(0, 0x00000000, 0x400000, MPU_AP_RO, 0)
+            mpu_region(0, board_mpu_code_base(), board_mpu_code_size(), MPU_AP_RO, 0)
             mpu_region(4, mpu_user_base, mpu_user_size, MPU_AP_FULL, MPU_XN)
             mpu_mode = MPU_MODE_SHARED

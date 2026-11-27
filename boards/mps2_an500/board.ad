@@ -13,11 +13,94 @@
 #     +0x10 BAUDDIV   must be >= 16; baud = pclk / BAUDDIV
 #   A byte written to DATA is only transmitted while CTRL.TX_EN is set.
 
+# The functions every board provides (the kernel imports them as board.board;
+# Makefile: BOARD, scripts/mkroot.sh):
+#   board_name, board_cpu_hz, board_init_early, board_late_init
+#   board_console_{init,putc,rx_irq_enable,rx_ready,getc,rx_irq_ack}
+#   board_systick_csr, board_systick_reload      scheduler tick source
+#   board_mpu_{code,kram,xram}_{base,size}, board_mpu_extra   MPU plan
+#   board_storage_init     registers the block device FAT is mounted from
+#   board_code_loaded      after a program image was written to RAM
+#   board_halt             last call before the system reset of hackos_exit
+
 from kernel.cpu import mmio_read32, mmio_write32
+from kernel.block.blk import blk_init
+
+
+def board_name() -> Ptr[uint8]:
+    return "QEMU mps2-an500"
 
 
 def board_cpu_hz() -> uint32:
     return 25000000
+
+
+# Before the console exists (after .data/.bss are set up).  Nothing to do in
+# the emulator.
+def board_init_early():
+    return
+
+
+# After kernel_init, before the scheduler starts.
+def board_late_init():
+    return
+
+
+# SysTick: CLKSOURCE=1 (the 25 MHz CPU clock), TICKINT, ENABLE.
+def board_systick_csr() -> uint32:
+    return 7
+
+
+def board_systick_reload(hz: uint32) -> uint32:
+    return board_cpu_hz() / hz - 1
+
+
+# Regions 0, 2 and 3 of the MPU plan (kernel/mpu.ad): the code region, the
+# kernel RAM and the large RAM; each a power of two aligned to its size.
+def board_mpu_code_base() -> uint32:
+    return 0x00000000
+
+
+def board_mpu_code_size() -> uint32:
+    return 0x400000
+
+
+def board_mpu_kram_base() -> uint32:
+    return 0x20000000
+
+
+def board_mpu_kram_size() -> uint32:
+    return 0x400000
+
+
+def board_mpu_xram_base() -> uint32:
+    return 0x60000000
+
+
+def board_mpu_xram_size() -> uint32:
+    return 0x1000000
+
+
+# Regions 8.. if the board needs any (MPU still off when this runs).
+def board_mpu_extra():
+    return
+
+
+# The FAT volume at /sd: the RAM disk the harness preloads (kernel/block/blk.ad).
+def board_storage_init() -> int32:
+    return blk_init()
+
+
+# A program image has just been written to [base, base+size).  QEMU has no
+# caches.
+def board_code_loaded(base: uint64, size: uint64):
+    return
+
+
+# hackos_exit(code) calls this, then requests a system reset (which ends
+# QEMU under -no-reboot).
+def board_halt(code: uint32):
+    return
 
 
 def board_console_init():
