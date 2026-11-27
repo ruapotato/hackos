@@ -268,7 +268,7 @@ def board_late_init():
     kputs(" GPR14 ")
     kput_hex32(reg_rd(IOMUXC_GPR_BASE + IOMUXC_GPR_GPR14))
     kputs("\n")
-    thread_create("led", cast[uint64](&_led_main), 0, 6, 1024, 0)
+    thread_create("led", cast[uint64](&_led_main), 0, 6, 2048, 0)
 
 
 # hackos_exit(code): code 0 resets (the `halt` program ends a session that
