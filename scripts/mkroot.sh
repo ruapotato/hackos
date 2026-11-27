@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# mkroot.sh OUT BOARD_DIR [PATCH...]
+# mkroot.sh OUT BOARD_DIR [PATCH | PATH=REPLACEMENT ...]
 #
 # Builds the source tree one board is compiled from.  The Adder compiler
 # resolves `from a.b import x` as a/b.ad relative to its working directory and
@@ -13,6 +13,10 @@
 #                   real file, <path> with that patch applied (a per-board size
 #                   configuration of copied code; the committed file is left
 #                   as it is)
+#   OUT/<PATH>      for each PATH=REPLACEMENT: a link to REPLACEMENT instead
+#                   (the driver tests swap soc/imxrt/reg.ad and delay.ad for
+#                   register models this way; never used for an image that
+#                   runs on a board)
 #
 # Run from the firmware root.  OUT is removed and made again.
 set -euo pipefail
@@ -25,6 +29,13 @@ for d in arch boards demo drivers fs init kernel lib mm soc tests user; do
 done
 ln -s "$top/boards/$board" "$out/board"
 for p in "$@"; do
+    case "$p" in
+    *=*)
+        rel="${p%%=*}"; src="${p#*=}"
+        [ -f "$rel" ] && [ -f "$src" ] || { echo "mkroot: $p: both must be files" >&2; exit 1; }
+        rm -f "$out/$rel"; ln -s "$top/$src" "$out/$rel"
+        continue;;
+    esac
     rel="${p#boards/$board/patches/}"; rel="${rel%.patch}"
     [ "$rel" != "$p" ] && [ -f "$rel" ] || { echo "mkroot: $p does not name a file under boards/$board/patches/" >&2; exit 1; }
     rm -f "$out/$rel"

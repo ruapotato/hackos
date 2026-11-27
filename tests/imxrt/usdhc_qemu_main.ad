@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# uSDHC + SD card driver test on QEMU `-M mcimx6ul-evk` (tests/imxrt/usdhc_qemu.sh).
+#
+# soc/imxrt/usdhc.ad and drivers/sd/sd.ad are compiled unchanged (Thumb-2 for
+# the Cortex-M7) and run against QEMU's i.MX uSDHC model and SD card model:
+# models of the same IP written by the QEMU developers, i.e. an oracle that
+# is not my own reading of the manual.  The card image is filled by the
+# harness with pattern(lba, offset) in blocks [0, 4096) and the last 64;
+# the harness checks the image file afterwards for the blocks written here.
+#
+# Output: one "PASS name" / "FAIL name" line per check, facts as "INFO",
+# then "[usdhc-test] done F" with F the number of failures.
+
+from tests.imxrt.qemu_a7.uart import a7_uart_init, a7_puts, a7_put_u64, a7_put_hex
+from drivers.sd.sd import sd_init, sd_read, sd_write, sd_capacity, sd_v2, sd_hc, sd_rca, sd_ocr, sd_last_cmd, sd_last_error, sd_last_status
+from soc.imxrt.usdhc import usdhc_sdclk_hz, usdhc_clock_fields
+from kernel.rt import rt_memcpy
+
+USDHC1_A7: uint64 = 0x02190000       # i.MX6UL uSDHC1 (QEMU hw/arm/fsl-imx6ul.c)
+
+buf: Array[33280, uint8]
+fails: uint32 = 0
+
+
+def check(ok: uint32, name: Ptr[uint8]):
+    if ok != 0:
+        a7_puts("PASS ")
+    else:
+        a7_puts("FAIL ")
+        fails = fails + 1
+    a7_puts(name)
+    a7_puts("\n")
+
+
+def pat(lba: uint64, off: uint64) -> uint8:
+    return cast[uint8]((lba * 31 + off * 7 + 1) & 255)
+
+
+# 1 if `n` blocks at p hold pattern (xor x) for lba..lba+n-1.
+def holds(p: Ptr[uint8], lba: uint64, n: uint64, x: uint32) -> uint32:
+    b: uint64 = 0
+    while b < n:
+        o: uint64 = 0
+        while o < 512:
+            if cast[uint32](p[b * 512 + o]) != (cast[uint32](pat(lba + b, o)) ^ x):
+                a7_puts("INFO mismatch at lba ")
+                a7_put_u64(lba + b)
+                a7_puts(" offset ")
+                a7_put_u64(o)
+                a7_puts("\n")
+                return 0
+            o = o + 1
+        b = b + 1
+    return 1
+
+
+def fill(p: Ptr[uint8], lba: uint64, n: uint64, x: uint32):
+    b: uint64 = 0
+    while b < n:
+        o: uint64 = 0
+        while o < 512:
+            p[b * 512 + o] = cast[uint8](cast[uint32](pat(lba + b, o)) ^ x)
+            o = o + 1
+        b = b + 1
+
+
+def rd(lba: uint64, n: uint64, p: Ptr[uint8]) -> uint32:
+    return cast[uint32](sd_read(lba, n, cast[uint64](p)) == 0)
+
+
+def a7_main():
+    a7_uart_init()
+    a7_puts("[usdhc-test] start\n")
+    # clock divider arithmetic (pure): 198 MHz root
+    f: uint32 = usdhc_clock_fields(198000000, 400000)
+    check(cast[uint32](usdhc_sdclk_hz <= 400000 and usdhc_sdclk_hz > 300000), "clock: identification clock 300..400 kHz from a 198 MHz root")
+    f = usdhc_clock_fields(198000000, 25000000)
+    check(cast[uint32](usdhc_sdclk_hz <= 25000000 and usdhc_sdclk_hz > 20000000), "clock: data clock 20..25 MHz from a 198 MHz root")
+    rc: int32 = sd_init(USDHC1_A7, 198000000)
+    if rc != 0:
+        a7_puts("INFO sd_init rc=")
+        a7_put_u64(cast[uint64](cast[int64](0) - cast[int64](rc)))
+        a7_puts(" (negated) at CMD")
+        a7_put_u64(cast[uint64](sd_last_cmd))
+        a7_puts("\n")
+        check(cast[uint32](sd_read(0, 1, cast[uint64](&buf[0])) == -1), "no card: reads are refused")
+        a7_puts("[usdhc-test] done ")
+        a7_put_u64(cast[uint64](fails))
+        a7_puts("\n")
+        return
+    cap: uint64 = sd_capacity()
+    a7_puts("INFO card v2=")
+    a7_put_u64(cast[uint64](sd_v2))
+    a7_puts(" hc=")
+    a7_put_u64(cast[uint64](sd_hc))
+    a7_puts(" rca=")
+    a7_put_hex(sd_rca)
+    a7_puts(" ocr=")
+    a7_put_hex(sd_ocr)
+    a7_puts(" sectors=")
+    a7_put_u64(cap)
+    a7_puts(" sdclk=")
+    a7_put_u64(cast[uint64](usdhc_sdclk_hz))
+    a7_puts("\n")
+    check(cast[uint32](cap >= 4096), "card: capacity read from the CSD (at least the 4096 blocks the harness filled)")
+    p: Ptr[uint8] = &buf[0]
+    check(rd(0, 1, p) & holds(p, 0, 1, 0), "read: block 0, single-block command")
+    check(rd(1, 1, p) & holds(p, 1, 1, 0), "read: block 1")
+    check(rd(1000, 1, p) & holds(p, 1000, 1, 0), "read: block 1000")
+    check(rd(cap - 1, 1, p) & holds(p, cap - 1, 1, 0), "read: the last block")
+    check(rd(0, 64, p) & holds(p, 0, 64, 0), "read: blocks 0..63, one multi-block command")
+    check(rd(cap - 64, 64, p) & holds(p, cap - 64, 64, 0), "read: the last 64 blocks, multi-block")
+    check(rd(4093, 3, p) & holds(p, 4093, 3, 0), "read: 3 blocks at 4093")
+    check(rd(5, 1, &buf[1]) & holds(&buf[1], 5, 1, 0), "read: into a buffer that is not word aligned")
+    check(cast[uint32](sd_read(cap - 1, 2, cast[uint64](p)) == -1), "read: past the end is refused")
+    check(cast[uint32](sd_read(0, 0, cast[uint64](p)) == -1), "read: zero blocks is refused")
+    fill(p, 2000, 1, 0xA5)
+    check(cast[uint32](sd_write(2000, 1, cast[uint64](p)) == 0), "write: block 2000, single-block command")
+    fill(p, 3000, 8, 0xA5)
+    check(cast[uint32](sd_write(3000, 8, cast[uint64](p)) == 0), "write: blocks 3000..3007, multi-block")
+    fill(&buf[3], 3500, 2, 0x5A)
+    check(cast[uint32](sd_write(3500, 2, cast[uint64](&buf[3])) == 0), "write: 2 blocks from an unaligned buffer")
+    check(rd(2000, 1, p) & holds(p, 2000, 1, 0xA5), "write: block 2000 reads back")
+    check(rd(3000, 8, p) & holds(p, 3000, 8, 0xA5), "write: blocks 3000..3007 read back")
+    check(rd(3500, 2, p) & holds(p, 3500, 2, 0x5A), "write: blocks 3500..3501 read back")
+    check(rd(1999, 1, p) & holds(p, 1999, 1, 0) & rd(2001, 1, p) & holds(p, 2001, 1, 0), "write: neighbours of block 2000 unchanged")
+    check(rd(2999, 1, p) & holds(p, 2999, 1, 0) & rd(3008, 1, p) & holds(p, 3008, 1, 0), "write: neighbours of 3000..3007 unchanged")
+    a7_puts("INFO last card status ")
+    a7_put_hex(sd_last_status)
+    a7_puts("\n[usdhc-test] done ")
+    a7_put_u64(cast[uint64](fails))
+    a7_puts("\n")

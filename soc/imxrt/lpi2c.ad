@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- LPI2C master (i.MX RT1060 and RT1170 families).
+#
+# UNTESTED ON HARDWARE.  Registers and masks are checked against the device
+# header (tests/imxrt/check_regs.py); the command sequences are tested
+# against a model of the LPI2C master written from the reference manual
+# (tests/imxrt/models/lpi2c_model.ad), which is my reading of the manual and
+# not an independent oracle.  Not covered without a board: bus timing on the
+# wire, pull-ups, clock stretching, arbitration with another master.
+#
+# The master is driven through its command FIFO (MTDR): START+address,
+# transmit bytes, receive N bytes, STOP.  Every wait is bounded; on any error
+# the FIFOs are flushed and a STOP is issued so the bus is left idle.
+#
+# Same results as the software bus (drivers/i2c/bus.ad): 0, I2C_NACK (-1),
+# and further codes below.
+
+from soc.imxrt.reg import reg_rd, reg_wr
+from soc.imxrt.delay import delay_us
+
+LPI2C_PARAM: uint64 = 0x04
+LPI2C_MCR: uint64 = 0x10
+LPI2C_MSR: uint64 = 0x14
+LPI2C_MIER: uint64 = 0x18
+LPI2C_MCFGR0: uint64 = 0x20
+LPI2C_MCFGR1: uint64 = 0x24
+LPI2C_MCFGR2: uint64 = 0x28
+LPI2C_MCFGR3: uint64 = 0x2C
+LPI2C_MCCR0: uint64 = 0x48
+LPI2C_MFCR: uint64 = 0x58
+LPI2C_MFSR: uint64 = 0x5C
+LPI2C_MTDR: uint64 = 0x60
+LPI2C_MRDR: uint64 = 0x70
+
+LPI2C_MCR_MEN: uint32 = 0x1
+LPI2C_MCR_RST: uint32 = 0x2
+LPI2C_MCR_RTF: uint32 = 0x100
+LPI2C_MCR_RRF: uint32 = 0x200
+LPI2C_MSR_TDF: uint32 = 0x1
+LPI2C_MSR_RDF: uint32 = 0x2
+LPI2C_MSR_EPF: uint32 = 0x100
+LPI2C_MSR_SDF: uint32 = 0x200
+LPI2C_MSR_NDF: uint32 = 0x400
+LPI2C_MSR_ALF: uint32 = 0x800
+LPI2C_MSR_FEF: uint32 = 0x1000
+LPI2C_MSR_PLTF: uint32 = 0x2000
+LPI2C_MSR_DMF: uint32 = 0x4000
+LPI2C_MSR_MBF: uint32 = 0x1000000
+LPI2C_MSR_BBF: uint32 = 0x2000000
+LPI2C_MCFGR1_PRESCALE: uint32 = 0x7
+LPI2C_MCFGR2_FILTSCL_SHIFT: uint32 = 16
+LPI2C_MCFGR2_FILTSDA_SHIFT: uint32 = 24
+LPI2C_MCCR0_CLKHI_SHIFT: uint32 = 8
+LPI2C_MCCR0_SETHOLD_SHIFT: uint32 = 16
+LPI2C_MCCR0_DATAVD_SHIFT: uint32 = 24
+LPI2C_MFSR_TXCOUNT: uint32 = 0x7
+LPI2C_MFSR_RXCOUNT: uint32 = 0x70000
+LPI2C_MRDR_RXEMPTY: uint32 = 0x4000
+LPI2C_PARAM_MTXFIFO: uint32 = 0xF
+LPI2C_MTDR_CMD_SHIFT: uint32 = 8
+
+# MTDR commands (reference manual, "Master Transmit Data Register").
+LPI2C_CMD_TX: uint32 = 0x000         # unchecked: RM command code 000b, transmit DATA
+LPI2C_CMD_RX: uint32 = 0x100         # unchecked: RM command code 001b, receive DATA+1 bytes
+LPI2C_CMD_STOP: uint32 = 0x200       # unchecked: RM command code 010b, generate STOP
+LPI2C_CMD_START: uint32 = 0x400      # unchecked: RM command code 100b, (repeated) START + address
+
+LPI2C_FILT: uint32 = 2               # unchecked: driver policy, glitch filter in module clocks
+LPI2C_TIMEOUT_US: uint32 = 20000     # unchecked: driver policy (one byte at 100 kHz is 90 us)
+
+I2C_OK: int32 = 0                    # unchecked: result code shared with drivers/i2c/bus.ad
+I2C_NACK: int32 = -1                 # unchecked: result code shared with drivers/i2c/bus.ad
+I2C_ARB_LOST: int32 = -2             # unchecked: result code
+I2C_TIMEOUT: int32 = -3              # unchecked: result code
+I2C_FIFO_ERR: int32 = -4             # unchecked: result code
+I2C_BAD_ARG: int32 = -5              # unchecked: result code
+
+lpi2c_fifo_words: uint32 = 4
+
+
+# MCCR0 and the prescaler for `hz` from a module clock of `clk_hz`.  The
+# reference manual's period is (CLKLO + CLKHI + 2 + SCL_LATENCY) * 2^PRESCALE
+# clocks with SCL_LATENCY = floor((2 + FILTSCL) / 2^PRESCALE); the smallest
+# prescaler whose CLKLO and CLKHI fit 6 bits is used, with SCL low for 55 %
+# of the period (I2C needs low >= high in fast mode).  Returns
+# (prescale << 32) | MCCR0, or 0 if `hz` cannot be reached.
+def lpi2c_timing(clk_hz: uint32, hz: uint32) -> uint64:
+    if hz == 0 or clk_hz == 0:
+        return 0
+    p: uint32 = 0
+    while p < 8:
+        cycles: uint64 = cast[uint64](clk_hz) / (cast[uint64](hz) << p)
+        lat: uint64 = cast[uint64]((2 + LPI2C_FILT) >> p)
+        if cycles > 2 + lat:
+            total: uint64 = cycles - 2 - lat
+            lo: uint64 = total * 11 / 20
+            hi: uint64 = total - lo
+            if lo >= 1 and lo <= 63 and hi >= 1 and hi <= 63:
+                sethold: uint64 = hi
+                datavd: uint64 = hi / 2
+                if datavd < 1:
+                    datavd = 1
+                mccr0: uint64 = lo | (hi << LPI2C_MCCR0_CLKHI_SHIFT) | (sethold << LPI2C_MCCR0_SETHOLD_SHIFT) | (datavd << LPI2C_MCCR0_DATAVD_SHIFT)
+                return (cast[uint64](p) << 32) | mccr0
+        p = p + 1
+    return 0
+
+
+# Reset and enable the master at `hz`.  Returns 0, or I2C_BAD_ARG.
+def lpi2c_init(base: uint64, clk_hz: uint32, hz: uint32) -> int32:
+    t: uint64 = lpi2c_timing(clk_hz, hz)
+    if t == 0:
+        return I2C_BAD_ARG
+    reg_wr(base + LPI2C_MCR, LPI2C_MCR_RST)
+    reg_wr(base + LPI2C_MCR, 0)
+    lpi2c_fifo_words = cast[uint32](1) << (reg_rd(base + LPI2C_PARAM) & LPI2C_PARAM_MTXFIFO)
+    reg_wr(base + LPI2C_MIER, 0)
+    reg_wr(base + LPI2C_MCFGR0, 0)
+    reg_wr(base + LPI2C_MCFGR1, cast[uint32](t >> 32) & LPI2C_MCFGR1_PRESCALE)
+    reg_wr(base + LPI2C_MCFGR2, (LPI2C_FILT << LPI2C_MCFGR2_FILTSCL_SHIFT) | (LPI2C_FILT << LPI2C_MCFGR2_FILTSDA_SHIFT))
+    reg_wr(base + LPI2C_MCFGR3, 0)
+    reg_wr(base + LPI2C_MCCR0, cast[uint32](t & 0xFFFFFFFF))
+    reg_wr(base + LPI2C_MFCR, 0)
+    reg_wr(base + LPI2C_MCR, LPI2C_MCR_MEN)
+    return I2C_OK
+
+
+def _lpi2c_clear(base: uint64):
+    reg_wr(base + LPI2C_MSR, LPI2C_MSR_EPF | LPI2C_MSR_SDF | LPI2C_MSR_NDF | LPI2C_MSR_ALF | LPI2C_MSR_FEF | LPI2C_MSR_PLTF | LPI2C_MSR_DMF)
+
+
+# An error was seen: drop what is queued, end the transfer, clear the flags.
+def _lpi2c_abort(base: uint64, code: int32) -> int32:
+    reg_wr(base + LPI2C_MCR, LPI2C_MCR_MEN | LPI2C_MCR_RTF | LPI2C_MCR_RRF)
+    if (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_MBF) != 0:
+        reg_wr(base + LPI2C_MTDR, LPI2C_CMD_STOP)
+        waited: uint32 = 0
+        while (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_SDF) == 0 and waited < LPI2C_TIMEOUT_US:
+            delay_us(1)
+            waited = waited + 1
+    _lpi2c_clear(base)
+    return code
+
+
+# 0 while no error flag is set, else the error code.
+def _lpi2c_err(base: uint64) -> int32:
+    st: uint32 = reg_rd(base + LPI2C_MSR)
+    if (st & LPI2C_MSR_NDF) != 0:
+        return I2C_NACK
+    if (st & LPI2C_MSR_ALF) != 0:
+        return I2C_ARB_LOST
+    if (st & (LPI2C_MSR_FEF | LPI2C_MSR_PLTF)) != 0:
+        return I2C_FIFO_ERR
+    return 0
+
+
+# Queue one command word, waiting (bounded) for room in the FIFO.
+def _lpi2c_push(base: uint64, word: uint32) -> int32:
+    waited: uint32 = 0
+    while (reg_rd(base + LPI2C_MFSR) & LPI2C_MFSR_TXCOUNT) >= lpi2c_fifo_words:
+        e: int32 = _lpi2c_err(base)
+        if e != 0:
+            return e
+        if waited >= LPI2C_TIMEOUT_US:
+            return I2C_TIMEOUT
+        delay_us(1)
+        waited = waited + 1
+    reg_wr(base + LPI2C_MTDR, word)
+    return 0
+
+
+# Wait for the STOP that ends the transfer.
+def _lpi2c_wait_stop(base: uint64) -> int32:
+    waited: uint32 = 0
+    while (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_SDF) == 0:
+        e: int32 = _lpi2c_err(base)
+        if e != 0:
+            return e
+        if waited >= LPI2C_TIMEOUT_US:
+            return I2C_TIMEOUT
+        delay_us(1)
+        waited = waited + 1
+    e2: int32 = _lpi2c_err(base)
+    if e2 != 0:
+        return e2
+    return 0
+
+
+def _lpi2c_begin(base: uint64) -> int32:
+    waited: uint32 = 0
+    while (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_MBF) != 0:
+        if waited >= LPI2C_TIMEOUT_US:
+            return I2C_TIMEOUT
+        delay_us(1)
+        waited = waited + 1
+    reg_wr(base + LPI2C_MCR, LPI2C_MCR_MEN | LPI2C_MCR_RTF | LPI2C_MCR_RRF)
+    _lpi2c_clear(base)
+    return 0
+
+
+# START, address (write), n bytes, STOP.
+def lpi2c_write(base: uint64, addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
+    if addr > 0x7F:
+        return I2C_BAD_ARG
+    e: int32 = _lpi2c_begin(base)
+    if e != 0:
+        return _lpi2c_abort(base, e)
+    e = _lpi2c_push(base, LPI2C_CMD_START | (addr << 1))
+    i: uint32 = 0
+    while e == 0 and i < n:
+        e = _lpi2c_push(base, LPI2C_CMD_TX | cast[uint32](data[i]))
+        i = i + 1
+    if e == 0:
+        e = _lpi2c_push(base, LPI2C_CMD_STOP)
+    if e == 0:
+        e = _lpi2c_wait_stop(base)
+    if e != 0:
+        return _lpi2c_abort(base, e)
+    _lpi2c_clear(base)
+    return I2C_OK
+
+
+# START, address (read), n bytes (1..256), STOP.
+def lpi2c_read(base: uint64, addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
+    if addr > 0x7F or n == 0 or n > 256:
+        return I2C_BAD_ARG
+    e: int32 = _lpi2c_begin(base)
+    if e != 0:
+        return _lpi2c_abort(base, e)
+    e = _lpi2c_push(base, LPI2C_CMD_START | (addr << 1) | 1)
+    if e == 0:
+        e = _lpi2c_push(base, LPI2C_CMD_RX | (n - 1))
+    if e == 0:
+        e = _lpi2c_push(base, LPI2C_CMD_STOP)
+    got: uint32 = 0
+    waited: uint32 = 0
+    while e == 0 and got < n:
+        d: uint32 = reg_rd(base + LPI2C_MRDR)
+        if (d & LPI2C_MRDR_RXEMPTY) == 0:
+            data[got] = cast[uint8](d & 0xFF)
+            got = got + 1
+            waited = 0
+        else:
+            e = _lpi2c_err(base)
+            if e == 0:
+                if waited >= LPI2C_TIMEOUT_US:
+                    e = I2C_TIMEOUT
+                else:
+                    delay_us(1)
+                    waited = waited + 1
+    if e == 0:
+        e = _lpi2c_wait_stop(base)
+    if e != 0:
+        return _lpi2c_abort(base, e)
+    _lpi2c_clear(base)
+    return I2C_OK

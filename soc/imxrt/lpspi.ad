@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- LPSPI master (i.MX RT1060 and RT1170 families).
+#
+# UNTESTED ON HARDWARE.  Registers and masks are checked against the device
+# header; transfers are tested against a model written from the reference
+# manual (tests/imxrt/models/lpspi_model.ad) -- my reading of the manual,
+# not an independent oracle.  Not covered without a board: SCK timing and
+# phase on the wire, chip-select timing, the real FIFO depth's effect on
+# throughput.
+#
+# Byte frames, polled.  A transfer holds its chip select for all n bytes
+# (TCR.CONT) and releases it with a final command word that clears CONT.
+# Full duplex: every byte sent clocks one in; `tx` may be null (0xFF is
+# sent), `rx` may be null (what comes in is dropped).
+
+from soc.imxrt.reg import reg_rd, reg_wr
+from soc.imxrt.delay import delay_us
+
+LPSPI_PARAM: uint64 = 0x04
+LPSPI_CR: uint64 = 0x10
+LPSPI_SR: uint64 = 0x14
+LPSPI_IER: uint64 = 0x18
+LPSPI_DER: uint64 = 0x1C
+LPSPI_CFGR0: uint64 = 0x20
+LPSPI_CFGR1: uint64 = 0x24
+LPSPI_CCR: uint64 = 0x40
+LPSPI_FCR: uint64 = 0x58
+LPSPI_FSR: uint64 = 0x5C
+LPSPI_TCR: uint64 = 0x60
+LPSPI_TDR: uint64 = 0x64
+LPSPI_RSR: uint64 = 0x70
+LPSPI_RDR: uint64 = 0x74
+
+LPSPI_CR_MEN: uint32 = 0x1
+LPSPI_CR_RST: uint32 = 0x2
+LPSPI_CR_RTF: uint32 = 0x100
+LPSPI_CR_RRF: uint32 = 0x200
+LPSPI_SR_TDF: uint32 = 0x1
+LPSPI_SR_RDF: uint32 = 0x2
+LPSPI_SR_WCF: uint32 = 0x100
+LPSPI_SR_FCF: uint32 = 0x200
+LPSPI_SR_TCF: uint32 = 0x400
+LPSPI_SR_TEF: uint32 = 0x800
+LPSPI_SR_REF: uint32 = 0x1000
+LPSPI_SR_DMF: uint32 = 0x2000
+LPSPI_SR_MBF: uint32 = 0x1000000
+LPSPI_CFGR1_MASTER: uint32 = 0x1
+LPSPI_CFGR1_NOSTALL: uint32 = 0x8
+LPSPI_CCR_DBT_SHIFT: uint32 = 8
+LPSPI_CCR_PCSSCK_SHIFT: uint32 = 16
+LPSPI_CCR_SCKPCS_SHIFT: uint32 = 24
+LPSPI_FSR_TXCOUNT: uint32 = 0x1F
+LPSPI_FSR_RXCOUNT: uint32 = 0x1F0000
+LPSPI_TCR_FRAMESZ: uint32 = 0xFFF
+LPSPI_TCR_CONTC: uint32 = 0x100000
+LPSPI_TCR_CONT: uint32 = 0x200000
+LPSPI_TCR_PCS_SHIFT: uint32 = 24
+LPSPI_TCR_PRESCALE_SHIFT: uint32 = 27
+LPSPI_TCR_CPHA: uint32 = 0x40000000
+LPSPI_TCR_CPOL: uint32 = 0x80000000
+LPSPI_RSR_RXEMPTY: uint32 = 0x2
+LPSPI_PARAM_TXFIFO: uint32 = 0xFF
+
+LPSPI_TIMEOUT_US: uint32 = 20000     # unchecked: driver policy
+
+lpspi_fifo_words: uint32 = 16
+lpspi_tcr_base: uint32 = 0           # PRESCALE, CPOL/CPHA of the last lpspi_init
+
+
+# (prescale << 8) | SCKDIV for an SCK of at most `hz` from `clk_hz`:
+# SCK = clk / (2^PRESCALE * (SCKDIV + 2)).  Returns 0xFFFFFFFF if `hz` is
+# below what the divider reaches.
+def lpspi_divider(clk_hz: uint32, hz: uint32) -> uint32:
+    if hz == 0:
+        return 0xFFFFFFFF
+    p: uint32 = 0
+    while p < 8:
+        div: uint64 = (cast[uint64](clk_hz) + (cast[uint64](hz) << p) - 1) / (cast[uint64](hz) << p)
+        if div < 2:
+            div = 2
+        if div <= 257:
+            return (p << 8) | cast[uint32](div - 2)
+        p = p + 1
+    return 0xFFFFFFFF
+
+
+# Reset and configure as master; mode 0..3 (CPOL = mode >> 1, CPHA = mode & 1).
+# Returns 0 or -1.
+def lpspi_init(base: uint64, clk_hz: uint32, hz: uint32, mode: uint32) -> int32:
+    d: uint32 = lpspi_divider(clk_hz, hz)
+    if d == 0xFFFFFFFF:
+        return -1
+    sckdiv: uint32 = d & 0xFF
+    reg_wr(base + LPSPI_CR, LPSPI_CR_RST)
+    reg_wr(base + LPSPI_CR, 0)
+    lpspi_fifo_words = cast[uint32](1) << (reg_rd(base + LPSPI_PARAM) & LPSPI_PARAM_TXFIFO)
+    reg_wr(base + LPSPI_IER, 0)
+    reg_wr(base + LPSPI_DER, 0)
+    reg_wr(base + LPSPI_CFGR0, 0)
+    reg_wr(base + LPSPI_CFGR1, LPSPI_CFGR1_MASTER | LPSPI_CFGR1_NOSTALL)
+    # delays (PCS to SCK, SCK to PCS, between transfers) of half an SCK period
+    half: uint32 = sckdiv / 2
+    reg_wr(base + LPSPI_CCR, sckdiv | (sckdiv << LPSPI_CCR_DBT_SHIFT) | (half << LPSPI_CCR_PCSSCK_SHIFT) | (half << LPSPI_CCR_SCKPCS_SHIFT))
+    reg_wr(base + LPSPI_FCR, 0)
+    lpspi_tcr_base = ((d >> 8) << LPSPI_TCR_PRESCALE_SHIFT)
+    if (mode & 2) != 0:
+        lpspi_tcr_base = lpspi_tcr_base | LPSPI_TCR_CPOL
+    if (mode & 1) != 0:
+        lpspi_tcr_base = lpspi_tcr_base | LPSPI_TCR_CPHA
+    reg_wr(base + LPSPI_CR, LPSPI_CR_MEN)
+    return 0
+
+
+def _lpspi_wait_tx_room(base: uint64) -> int32:
+    waited: uint32 = 0
+    while (reg_rd(base + LPSPI_FSR) & LPSPI_FSR_TXCOUNT) >= lpspi_fifo_words:
+        if waited >= LPSPI_TIMEOUT_US:
+            return -1
+        delay_us(1)
+        waited = waited + 1
+    return 0
+
+
+# n bytes, full duplex, chip select `pcs` (0..3) held throughout.
+# Returns 0, or -1 on a timeout (the FIFOs are then flushed).
+def lpspi_transfer(base: uint64, pcs: uint32, tx: Ptr[uint8], rx: Ptr[uint8], n: uint32) -> int32:
+    tcr: uint32 = lpspi_tcr_base | ((pcs & 3) << LPSPI_TCR_PCS_SHIFT) | 7      # FRAMESZ = 8 bits
+    reg_wr(base + LPSPI_CR, LPSPI_CR_MEN | LPSPI_CR_RTF | LPSPI_CR_RRF)
+    reg_wr(base + LPSPI_SR, LPSPI_SR_WCF | LPSPI_SR_FCF | LPSPI_SR_TCF | LPSPI_SR_TEF | LPSPI_SR_REF | LPSPI_SR_DMF)
+    if _lpspi_wait_tx_room(base) != 0:
+        return -1
+    reg_wr(base + LPSPI_TCR, tcr | LPSPI_TCR_CONT)
+    sent: uint32 = 0
+    got: uint32 = 0
+    waited: uint32 = 0
+    while got < n:
+        progress: uint32 = 0
+        # keep at most fifo-1 bytes in flight so the receive FIFO cannot overflow
+        if sent < n and sent - got < lpspi_fifo_words - 1 and (reg_rd(base + LPSPI_FSR) & LPSPI_FSR_TXCOUNT) < lpspi_fifo_words:
+            b: uint32 = 0xFF
+            if cast[uint64](tx) != 0:
+                b = cast[uint32](tx[sent])
+            reg_wr(base + LPSPI_TDR, b)
+            sent = sent + 1
+            progress = 1
+        if (reg_rd(base + LPSPI_RSR) & LPSPI_RSR_RXEMPTY) == 0:
+            v: uint32 = reg_rd(base + LPSPI_RDR)
+            if cast[uint64](rx) != 0:
+                rx[got] = cast[uint8](v & 0xFF)
+            got = got + 1
+            progress = 1
+        if progress == 0:
+            if waited >= LPSPI_TIMEOUT_US:
+                reg_wr(base + LPSPI_CR, LPSPI_CR_MEN | LPSPI_CR_RTF | LPSPI_CR_RRF)
+                return -1
+            delay_us(1)
+            waited = waited + 1
+        else:
+            waited = 0
+    # end the continuous transfer: chip select is released
+    if _lpspi_wait_tx_room(base) != 0:
+        return -1
+    reg_wr(base + LPSPI_TCR, tcr)
+    return 0

@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- GPIO (i.MX RT1060 and RT1170 families).  UNTESTED ON HARDWARE.
+#
+# Output through the set/clear/toggle registers (one write, no
+# read-modify-write of DR, so an interrupt between two pin changes cannot
+# undo one of them).  The pad must also be muxed to its GPIO function
+# (soc/imxrt/iomuxc.ad) and the instance's clock gate on.
+
+from soc.imxrt.reg import reg_rd, reg_wr
+
+GPIO_DR: uint64 = 0x00
+GPIO_GDIR: uint64 = 0x04
+GPIO_PSR: uint64 = 0x08
+GPIO_IMR: uint64 = 0x14
+GPIO_DR_SET: uint64 = 0x84
+GPIO_DR_CLEAR: uint64 = 0x88
+GPIO_DR_TOGGLE: uint64 = 0x8C
+
+
+def gpio_output(base: uint64, bit: uint32, level: uint32):
+    if level != 0:
+        reg_wr(base + GPIO_DR_SET, cast[uint32](1) << bit)
+    else:
+        reg_wr(base + GPIO_DR_CLEAR, cast[uint32](1) << bit)
+    reg_wr(base + GPIO_GDIR, reg_rd(base + GPIO_GDIR) | (cast[uint32](1) << bit))
+
+
+def gpio_input(base: uint64, bit: uint32):
+    reg_wr(base + GPIO_GDIR, reg_rd(base + GPIO_GDIR) & (0xFFFFFFFF ^ (cast[uint32](1) << bit)))
+
+
+def gpio_set(base: uint64, bit: uint32):
+    reg_wr(base + GPIO_DR_SET, cast[uint32](1) << bit)
+
+
+def gpio_clear(base: uint64, bit: uint32):
+    reg_wr(base + GPIO_DR_CLEAR, cast[uint32](1) << bit)
+
+
+def gpio_toggle(base: uint64, bit: uint32):
+    reg_wr(base + GPIO_DR_TOGGLE, cast[uint32](1) << bit)
+
+
+# The level at the pad (PSR), whatever the direction.
+def gpio_read(base: uint64, bit: uint32) -> uint32:
+    return (reg_rd(base + GPIO_PSR) >> bit) & 1

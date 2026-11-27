@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Stand-in for soc/imxrt/delay.ad in the uSDHC test image on QEMU's i.MX6UL
+# (no DWT there; QEMU's models answer at once, so a short loop is enough).
+# The drivers count their time limits in delay_us(1) calls, so every limit
+# is still a bounded number of polls.
+
+delay_calls: uint64 = 0
+
+
+def delay_init(max_core_mhz: uint32):
+    delay_calls = 0
+
+
+def delay_us(us: uint32):
+    delay_calls = delay_calls + cast[uint64](us)

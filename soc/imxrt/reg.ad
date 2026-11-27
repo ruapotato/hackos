@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- register access for the i.MX RT drivers (soc/imxrt/, soc/imxrt1062/).
+#
+# Every peripheral register the drivers touch goes through these functions,
+# so the driver code can be run unchanged against register models: the
+# driver tests (tests/imxrt/) build a tree in which this file is replaced by
+# one that hands accesses in the modelled address ranges to a model, the way
+# the hardware would answer them (write-one-to-clear flags, FIFOs that a read
+# pops, status that changes when a command is written).  On the board each
+# call is one volatile load or store of the stated width.
+
+from kernel.cpu import mmio_read32, mmio_write32
+
+
+def reg_rd(addr: uint64) -> uint32:
+    return mmio_read32(addr)
+
+
+def reg_wr(addr: uint64, v: uint32):
+    mmio_write32(addr, v)
+
+
+# 16-bit registers (WDOG1/WDOG2 must be accessed at 16 bits).
+def reg_rd16(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[volatile uint16]](addr)[0])
+
+
+def reg_wr16(addr: uint64, v: uint32):
+    cast[Ptr[volatile uint16]](addr)[0] = cast[uint16](v)
+
+
+def reg_set(addr: uint64, bits: uint32):
+    reg_wr(addr, reg_rd(addr) | bits)
+
+
+def reg_clr(addr: uint64, bits: uint32):
+    reg_wr(addr, reg_rd(addr) & (0xFFFFFFFF ^ bits))
+
+
+# Replace the bits of `mask` by `v` (v already shifted into place).
+def reg_field(addr: uint64, mask: uint32, v: uint32):
+    reg_wr(addr, (reg_rd(addr) & (0xFFFFFFFF ^ mask)) | (v & mask))

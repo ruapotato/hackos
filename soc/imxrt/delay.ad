@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- busy-wait delays for the i.MX RT drivers.
+#
+# Driver code waits for hardware with a time limit, and a few sequences need
+# a minimum delay (an SD card wants 1 ms after power-up).  HackOS does not
+# set the core clock (it runs on whatever the boot ROM left), so a delay is
+# counted in core cycles at the HIGHEST frequency the part allows: if the
+# core is slower, every delay is longer than asked, never shorter.
+#
+# The cycle counter is the DWT's CYCCNT.  If it does not count (not
+# implemented, or the trace block is held off), the loop still ends: it also
+# counts its own iterations, and an iteration takes more than one cycle.
+#
+# The driver tests replace this file (tests/imxrt/): there a delay advances
+# the models' clock instead.
+
+from soc.imxrt.reg import reg_rd, reg_wr
+
+DEMCR: uint64 = 0xE000EDFC           # unchecked: ARMv7-M debug block, not in the device header
+DEMCR_TRCENA: uint32 = 0x01000000    # unchecked: ARMv7-M architecture
+DWT_CTRL: uint64 = 0xE0001000        # unchecked: ARMv7-M architecture
+DWT_CYCCNT: uint64 = 0xE0001004      # unchecked: ARMv7-M architecture
+DWT_LAR: uint64 = 0xE0001FB0         # unchecked: CoreSight lock access (ignored where not implemented)
+
+# Cycles per microsecond assumed by delay_us: the fastest core clock of the
+# part (RT1062: 600 MHz; RT1176's M7: 1000 MHz).  Set by delay_init.
+delay_cycles_per_us: uint32 = 1000
+
+
+def delay_init(max_core_mhz: uint32):
+    delay_cycles_per_us = max_core_mhz
+    reg_wr(DEMCR, reg_rd(DEMCR) | DEMCR_TRCENA)
+    reg_wr(DWT_LAR, 0xC5ACCE55)
+    reg_wr(DWT_CTRL, reg_rd(DWT_CTRL) | 1)       # CYCCNTENA
+
+
+def delay_us(us: uint32):
+    need: uint32 = us * delay_cycles_per_us
+    start: uint32 = reg_rd(DWT_CYCCNT)
+    spins: uint32 = 0
+    while spins < need:
+        if reg_rd(DWT_CYCCNT) - start >= need:
+            return
+        spins = spins + 1

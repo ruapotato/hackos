@@ -1,0 +1,350 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- uSDHC host controller (i.MX RT1060 and RT1170 families), polled,
+# programmed I/O (no DMA: buffers may then live anywhere, including the
+# tightly coupled memory, and no cache maintenance is needed).
+#
+# UNTESTED ON HARDWARE.  Registers and masks are checked against the device
+# header.  This file and drivers/sd/sd.ad are run, unchanged, against QEMU's
+# own uSDHC model (hw/sd/sdhci.c, the i.MX variant) and its SD card model
+# (hw/sd/sd.c) on the emulated i.MX6UL board (tests/imxrt/usdhc_qemu.sh) --
+# models written by other people from the same family of manuals, not by me.
+# Not covered without a board: the RT1062's clock root and pads, signal
+# timing, real cards' busy times and quirks, card detection.
+#
+# Facts relied on that QEMU does NOT check (from the RT1060 reference
+# manual, read): SYS_CTRL bits 3:0 read 1111 and are written back as such;
+# MIX_CTRL holds the transfer-mode bits that SDHCI keeps in the low half of
+# CMD_XFR_TYP, and its bit 31 is written as 1 (reset value 0x80000000);
+# BREN/BWEN follow the watermark levels set in WTMK_LVL.
+
+from soc.imxrt.reg import reg_rd, reg_wr
+from soc.imxrt.delay import delay_us
+
+USDHC_BLK_ATT: uint64 = 0x04
+USDHC_CMD_ARG: uint64 = 0x08
+USDHC_CMD_XFR_TYP: uint64 = 0x0C
+USDHC_CMD_RSP0: uint64 = 0x10
+USDHC_CMD_RSP1: uint64 = 0x14
+USDHC_CMD_RSP2: uint64 = 0x18
+USDHC_CMD_RSP3: uint64 = 0x1C
+USDHC_DATA_BUFF_ACC_PORT: uint64 = 0x20
+USDHC_PRES_STATE: uint64 = 0x24
+USDHC_PROT_CTRL: uint64 = 0x28
+USDHC_SYS_CTRL: uint64 = 0x2C
+USDHC_INT_STATUS: uint64 = 0x30
+USDHC_INT_STATUS_EN: uint64 = 0x34
+USDHC_INT_SIGNAL_EN: uint64 = 0x38
+USDHC_WTMK_LVL: uint64 = 0x44
+USDHC_MIX_CTRL: uint64 = 0x48
+
+USDHC_CMD_XFR_TYP_RSPTYP_SHIFT: uint32 = 16
+USDHC_CMD_XFR_TYP_CCCEN: uint32 = 0x80000
+USDHC_CMD_XFR_TYP_CICEN: uint32 = 0x100000
+USDHC_CMD_XFR_TYP_DPSEL: uint32 = 0x200000
+USDHC_CMD_XFR_TYP_CMDINX_SHIFT: uint32 = 24
+USDHC_PRES_STATE_CIHB: uint32 = 0x1
+USDHC_PRES_STATE_CDIHB: uint32 = 0x2
+USDHC_PRES_STATE_SDSTB: uint32 = 0x8
+USDHC_PRES_STATE_BWEN: uint32 = 0x400
+USDHC_PRES_STATE_BREN: uint32 = 0x800
+USDHC_PRES_STATE_CINST: uint32 = 0x10000
+USDHC_PRES_STATE_DAT0: uint32 = 0x1000000   # unchecked: lowest bit of PRES_STATE.DLSL (0xFF000000), DATA0 level
+USDHC_PROT_CTRL_DTW: uint32 = 0x6
+USDHC_PROT_CTRL_EMODE: uint32 = 0x30
+USDHC_SYS_CTRL_DVS: uint32 = 0xF0
+USDHC_SYS_CTRL_DVS_SHIFT: uint32 = 4
+USDHC_SYS_CTRL_SDCLKFS: uint32 = 0xFF00
+USDHC_SYS_CTRL_SDCLKFS_SHIFT: uint32 = 8
+USDHC_SYS_CTRL_DTOCV: uint32 = 0xF0000
+USDHC_SYS_CTRL_DTOCV_SHIFT: uint32 = 16
+USDHC_SYS_CTRL_RSTA: uint32 = 0x1000000
+USDHC_SYS_CTRL_RSTC: uint32 = 0x2000000
+USDHC_SYS_CTRL_RSTD: uint32 = 0x4000000
+USDHC_SYS_CTRL_INITA: uint32 = 0x8000000
+USDHC_INT_STATUS_CC: uint32 = 0x1
+USDHC_INT_STATUS_TC: uint32 = 0x2
+USDHC_INT_STATUS_BWR: uint32 = 0x10
+USDHC_INT_STATUS_BRR: uint32 = 0x20
+USDHC_INT_STATUS_CTOE: uint32 = 0x10000
+USDHC_INT_STATUS_CCE: uint32 = 0x20000
+USDHC_INT_STATUS_CEBE: uint32 = 0x40000
+USDHC_INT_STATUS_CIE: uint32 = 0x80000
+USDHC_INT_STATUS_DTOE: uint32 = 0x100000
+USDHC_INT_STATUS_DCE: uint32 = 0x200000
+USDHC_INT_STATUS_DEBE: uint32 = 0x400000
+USDHC_INT_STATUS_AC12E: uint32 = 0x1000000
+USDHC_WTMK_LVL_WR_WML_SHIFT: uint32 = 16
+USDHC_WTMK_LVL_RD_BRST_LEN_SHIFT: uint32 = 8
+USDHC_WTMK_LVL_WR_BRST_LEN_SHIFT: uint32 = 24
+USDHC_MIX_CTRL_BCEN: uint32 = 0x2
+USDHC_MIX_CTRL_DTDSEL: uint32 = 0x10
+USDHC_MIX_CTRL_MSBSEL: uint32 = 0x20
+
+USDHC_SYS_CTRL_LOW: uint32 = 0xF          # unchecked: RT1060 RM, SYS_CTRL[3:0] reserved, reset 1111
+USDHC_MIX_CTRL_RSVD: uint32 = 0x80000000  # unchecked: RT1060 RM, MIX_CTRL reset value
+USDHC_WML_WORDS: uint32 = 16              # unchecked: driver policy, words moved per BREN/BWEN
+USDHC_EMODE_LE: uint32 = 0x20             # unchecked: PROT_CTRL.EMODE = 10b little endian (RM)
+
+# Command flags for usdhc_cmd (driver's own encoding).
+USDHC_RSP_NONE: uint32 = 0          # unchecked: driver encoding
+USDHC_RSP_R1: uint32 = 1            # unchecked: driver encoding; 48 bits, CRC + index (R1, R5, R6, R7)
+USDHC_RSP_R1B: uint32 = 2           # unchecked: driver encoding; R1 + busy on DAT0
+USDHC_RSP_R2: uint32 = 3            # unchecked: driver encoding; 136 bits, CRC (CID, CSD)
+USDHC_RSP_R3: uint32 = 4            # unchecked: driver encoding; 48 bits, no CRC, no index (OCR)
+USDHC_DATA_READ: uint32 = 0x10      # unchecked: driver encoding
+USDHC_DATA_WRITE: uint32 = 0x20     # unchecked: driver encoding
+USDHC_DATA_MULTI: uint32 = 0x40     # unchecked: driver encoding
+
+USDHC_OK: int32 = 0                 # unchecked: result code
+USDHC_E_TIMEOUT: int32 = -1         # unchecked: result code; the card did not answer
+USDHC_E_CRC: int32 = -2             # unchecked: result code
+USDHC_E_INDEX: int32 = -3           # unchecked: result code
+USDHC_E_BUSY: int32 = -4            # unchecked: result code; a line stayed busy
+USDHC_E_DATA: int32 = -5            # unchecked: result code; data timeout/CRC/end bit
+
+USDHC_CMD_TIMEOUT_US: uint32 = 100000     # unchecked: driver policy
+USDHC_DATA_TIMEOUT_US: uint32 = 500000    # unchecked: driver policy (SD write busy may be 250 ms)
+
+usdhc_sdclk_hz: uint32 = 0          # SD clock actually set by the last usdhc_set_clock
+
+
+def _usdhc_wait_clear(base: uint64, reg: uint64, bits: uint32, us: uint32) -> int32:
+    waited: uint32 = 0
+    while (reg_rd(base + reg) & bits) != 0:
+        if waited >= us:
+            return USDHC_E_BUSY
+        delay_us(1)
+        waited = waited + 1
+    return USDHC_OK
+
+
+# Reset the command or data half (RSTC / RSTD) after an error.
+def usdhc_reset_lines(base: uint64, bits: uint32):
+    reg_wr(base + USDHC_SYS_CTRL, reg_rd(base + USDHC_SYS_CTRL) | bits | USDHC_SYS_CTRL_LOW)
+    _usdhc_wait_clear(base, USDHC_SYS_CTRL, bits, USDHC_CMD_TIMEOUT_US)
+
+
+# Prescaler and divisor for an SD clock of at most `hz` from the root clock:
+# SDCLK = root / (P * D), P = 1, 2, 4 .. 256 (SDCLKFS = P / 2), D = 1..16
+# (DVS = D - 1).  Returns the SYS_CTRL field bits; usdhc_sdclk_hz gets the
+# resulting frequency.
+def usdhc_clock_fields(root_hz: uint32, hz: uint32) -> uint32:
+    p: uint32 = 1
+    while p < 256 and root_hz / (p * 16) > hz:
+        p = p * 2
+    d: uint32 = 1
+    while d < 16 and root_hz / (p * d) > hz:
+        d = d + 1
+    usdhc_sdclk_hz = root_hz / (p * d)
+    return ((p / 2) << USDHC_SYS_CTRL_SDCLKFS_SHIFT) | ((d - 1) << USDHC_SYS_CTRL_DVS_SHIFT)
+
+
+def usdhc_set_clock(base: uint64, root_hz: uint32, hz: uint32) -> int32:
+    f: uint32 = usdhc_clock_fields(root_hz, hz)
+    sc: uint32 = reg_rd(base + USDHC_SYS_CTRL) & (0xFFFFFFFF ^ (USDHC_SYS_CTRL_DTOCV | USDHC_SYS_CTRL_SDCLKFS | USDHC_SYS_CTRL_DVS))
+    # DTOCV 14: data timeout of 2^27 SD clocks (the largest that is not reserved)
+    reg_wr(base + USDHC_SYS_CTRL, sc | f | (14 << USDHC_SYS_CTRL_DTOCV_SHIFT) | USDHC_SYS_CTRL_LOW)
+    waited: uint32 = 0
+    while (reg_rd(base + USDHC_PRES_STATE) & USDHC_PRES_STATE_SDSTB) == 0:
+        if waited >= USDHC_CMD_TIMEOUT_US:
+            return USDHC_E_BUSY
+        delay_us(1)
+        waited = waited + 1
+    return USDHC_OK
+
+
+# Reset the controller, 1-bit bus, identification clock (<= 400 kHz), 80
+# clocks to the card.  Interrupt status bits are enabled (they latch) but
+# not signalled: everything is polled.
+def usdhc_init(base: uint64, root_hz: uint32) -> int32:
+    reg_wr(base + USDHC_SYS_CTRL, USDHC_SYS_CTRL_RSTA | USDHC_SYS_CTRL_LOW)
+    if _usdhc_wait_clear(base, USDHC_SYS_CTRL, USDHC_SYS_CTRL_RSTA, USDHC_CMD_TIMEOUT_US) != 0:
+        return USDHC_E_BUSY
+    pc: uint32 = reg_rd(base + USDHC_PROT_CTRL) & (0xFFFFFFFF ^ (USDHC_PROT_CTRL_DTW | USDHC_PROT_CTRL_EMODE))
+    reg_wr(base + USDHC_PROT_CTRL, pc | USDHC_EMODE_LE)
+    reg_wr(base + USDHC_WTMK_LVL, USDHC_WML_WORDS | (8 << USDHC_WTMK_LVL_RD_BRST_LEN_SHIFT) | (USDHC_WML_WORDS << USDHC_WTMK_LVL_WR_WML_SHIFT) | (8 << USDHC_WTMK_LVL_WR_BRST_LEN_SHIFT))
+    reg_wr(base + USDHC_MIX_CTRL, USDHC_MIX_CTRL_RSVD)
+    reg_wr(base + USDHC_INT_SIGNAL_EN, 0)
+    reg_wr(base + USDHC_INT_STATUS_EN, USDHC_INT_STATUS_CC | USDHC_INT_STATUS_TC | USDHC_INT_STATUS_BWR | USDHC_INT_STATUS_BRR | USDHC_INT_STATUS_CTOE | USDHC_INT_STATUS_CCE | USDHC_INT_STATUS_CEBE | USDHC_INT_STATUS_CIE | USDHC_INT_STATUS_DTOE | USDHC_INT_STATUS_DCE | USDHC_INT_STATUS_DEBE | USDHC_INT_STATUS_AC12E)
+    reg_wr(base + USDHC_INT_STATUS, 0xFFFFFFFF)
+    if usdhc_set_clock(base, root_hz, 400000) != 0:
+        return USDHC_E_BUSY
+    reg_wr(base + USDHC_SYS_CTRL, reg_rd(base + USDHC_SYS_CTRL) | USDHC_SYS_CTRL_INITA | USDHC_SYS_CTRL_LOW)
+    if _usdhc_wait_clear(base, USDHC_SYS_CTRL, USDHC_SYS_CTRL_INITA, USDHC_CMD_TIMEOUT_US) != 0:
+        return USDHC_E_BUSY
+    return USDHC_OK
+
+
+def usdhc_bus_width4(base: uint64):
+    pc: uint32 = reg_rd(base + USDHC_PROT_CTRL) & (0xFFFFFFFF ^ USDHC_PROT_CTRL_DTW)
+    reg_wr(base + USDHC_PROT_CTRL, pc | 0x2)                 # DTW = 01b, 4-bit
+
+
+def usdhc_card_present(base: uint64) -> uint32:
+    return (reg_rd(base + USDHC_PRES_STATE) & USDHC_PRES_STATE_CINST) >> 16
+
+
+def usdhc_rsp(base: uint64, i: uint32) -> uint32:
+    return reg_rd(base + USDHC_CMD_RSP0 + cast[uint64](i) * 4)
+
+
+# Send command `idx` with `arg`.  flags: one USDHC_RSP_*, plus
+# USDHC_DATA_READ/WRITE (+ MULTI) for a command with a data phase of
+# `blocks` blocks of 512 bytes (moved afterwards with usdhc_read_data /
+# usdhc_write_data).  Returns USDHC_OK or a USDHC_E_* code; the response is
+# in usdhc_rsp(base, 0..3).
+def usdhc_cmd(base: uint64, idx: uint32, arg: uint32, flags: uint32, blocks: uint32) -> int32:
+    rsp: uint32 = flags & 0xF
+    data: uint32 = flags & (USDHC_DATA_READ | USDHC_DATA_WRITE)
+    inhibit: uint32 = USDHC_PRES_STATE_CIHB
+    if data != 0 or rsp == USDHC_RSP_R1B:
+        inhibit = inhibit | USDHC_PRES_STATE_CDIHB
+    if _usdhc_wait_clear(base, USDHC_PRES_STATE, inhibit, USDHC_CMD_TIMEOUT_US) != 0:
+        return USDHC_E_BUSY
+    reg_wr(base + USDHC_INT_STATUS, 0xFFFFFFFF)
+    xfr: uint32 = idx << USDHC_CMD_XFR_TYP_CMDINX_SHIFT
+    if rsp == USDHC_RSP_R1:
+        xfr = xfr | (2 << USDHC_CMD_XFR_TYP_RSPTYP_SHIFT) | USDHC_CMD_XFR_TYP_CCCEN | USDHC_CMD_XFR_TYP_CICEN
+    elif rsp == USDHC_RSP_R1B:
+        xfr = xfr | (3 << USDHC_CMD_XFR_TYP_RSPTYP_SHIFT) | USDHC_CMD_XFR_TYP_CCCEN | USDHC_CMD_XFR_TYP_CICEN
+    elif rsp == USDHC_RSP_R2:
+        xfr = xfr | (1 << USDHC_CMD_XFR_TYP_RSPTYP_SHIFT) | USDHC_CMD_XFR_TYP_CCCEN
+    elif rsp == USDHC_RSP_R3:
+        xfr = xfr | (2 << USDHC_CMD_XFR_TYP_RSPTYP_SHIFT)
+    mix: uint32 = USDHC_MIX_CTRL_RSVD
+    if data != 0:
+        xfr = xfr | USDHC_CMD_XFR_TYP_DPSEL
+        reg_wr(base + USDHC_BLK_ATT, (blocks << 16) | 512)
+        if (flags & USDHC_DATA_READ) != 0:
+            mix = mix | USDHC_MIX_CTRL_DTDSEL
+        if (flags & USDHC_DATA_MULTI) != 0:
+            mix = mix | USDHC_MIX_CTRL_MSBSEL | USDHC_MIX_CTRL_BCEN
+    reg_wr(base + USDHC_MIX_CTRL, mix)
+    reg_wr(base + USDHC_CMD_ARG, arg)
+    reg_wr(base + USDHC_CMD_XFR_TYP, xfr)
+    errs: uint32 = USDHC_INT_STATUS_CTOE | USDHC_INT_STATUS_CCE | USDHC_INT_STATUS_CEBE | USDHC_INT_STATUS_CIE
+    waited: uint32 = 0
+    st: uint32 = reg_rd(base + USDHC_INT_STATUS)
+    while (st & (USDHC_INT_STATUS_CC | errs)) == 0:
+        if waited >= USDHC_CMD_TIMEOUT_US:
+            usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTC)
+            return USDHC_E_TIMEOUT
+        delay_us(1)
+        waited = waited + 1
+        st = reg_rd(base + USDHC_INT_STATUS)
+    if (st & errs) != 0:
+        reg_wr(base + USDHC_INT_STATUS, st)
+        usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTC)
+        if data != 0:
+            usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTD)
+        if (st & USDHC_INT_STATUS_CTOE) != 0:
+            return USDHC_E_TIMEOUT
+        if (st & USDHC_INT_STATUS_CIE) != 0:
+            return USDHC_E_INDEX
+        return USDHC_E_CRC
+    reg_wr(base + USDHC_INT_STATUS, USDHC_INT_STATUS_CC)
+    if rsp == USDHC_RSP_R1B:
+        # The card holds DATA0 low while busy.  End of busy is taken from
+        # either signal: transfer complete (if the controller raises it for a
+        # busy response) or DATA0 high with the data inhibit clear (what
+        # SdFat polls on the Teensy 4.1; QEMU's i.MX model raises no
+        # transfer complete here, and its bit 24 is always 1).
+        waited = 0
+        while (reg_rd(base + USDHC_INT_STATUS) & (USDHC_INT_STATUS_TC | USDHC_INT_STATUS_DTOE)) == 0:
+            ps: uint32 = reg_rd(base + USDHC_PRES_STATE)
+            if (ps & USDHC_PRES_STATE_DAT0) != 0 and (ps & USDHC_PRES_STATE_CDIHB) == 0:
+                break
+            if waited >= USDHC_DATA_TIMEOUT_US:
+                usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTD)
+                return USDHC_E_BUSY
+            delay_us(1)
+            waited = waited + 1
+        reg_wr(base + USDHC_INT_STATUS, USDHC_INT_STATUS_TC | USDHC_INT_STATUS_DTOE)
+    return USDHC_OK
+
+
+def _usdhc_data_err(base: uint64) -> int32:
+    st: uint32 = reg_rd(base + USDHC_INT_STATUS)
+    if (st & (USDHC_INT_STATUS_DTOE | USDHC_INT_STATUS_DCE | USDHC_INT_STATUS_DEBE)) != 0:
+        reg_wr(base + USDHC_INT_STATUS, st)
+        usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTD)
+        return USDHC_E_DATA
+    return USDHC_OK
+
+
+def _usdhc_wait_tc(base: uint64) -> int32:
+    waited: uint32 = 0
+    while (reg_rd(base + USDHC_INT_STATUS) & USDHC_INT_STATUS_TC) == 0:
+        e: int32 = _usdhc_data_err(base)
+        if e != 0:
+            return e
+        if waited >= USDHC_DATA_TIMEOUT_US:
+            usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTD)
+            return USDHC_E_DATA
+        delay_us(1)
+        waited = waited + 1
+    reg_wr(base + USDHC_INT_STATUS, USDHC_INT_STATUS_TC | USDHC_INT_STATUS_BRR | USDHC_INT_STATUS_BWR)
+    return USDHC_OK
+
+
+# Move the data phase of the last command into buf (blocks * 512 bytes),
+# USDHC_WML_WORDS words each time the controller reports BREN.  buf need not
+# be aligned.
+def usdhc_read_data(base: uint64, buf: Ptr[uint8], blocks: uint32) -> int32:
+    words: uint32 = blocks * 128
+    done: uint32 = 0
+    while done < words:
+        waited: uint32 = 0
+        while (reg_rd(base + USDHC_PRES_STATE) & USDHC_PRES_STATE_BREN) == 0:
+            e: int32 = _usdhc_data_err(base)
+            if e != 0:
+                return e
+            if waited >= USDHC_DATA_TIMEOUT_US:
+                usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTD)
+                return USDHC_E_DATA
+            delay_us(1)
+            waited = waited + 1
+        n: uint32 = USDHC_WML_WORDS
+        if words - done < n:
+            n = words - done
+        k: uint32 = 0
+        while k < n:
+            w: uint32 = reg_rd(base + USDHC_DATA_BUFF_ACC_PORT)
+            o: uint64 = cast[uint64](done + k) * 4
+            buf[o] = cast[uint8](w)
+            buf[o + 1] = cast[uint8](w >> 8)
+            buf[o + 2] = cast[uint8](w >> 16)
+            buf[o + 3] = cast[uint8](w >> 24)
+            k = k + 1
+        done = done + n
+        reg_wr(base + USDHC_INT_STATUS, USDHC_INT_STATUS_BRR)
+    return _usdhc_wait_tc(base)
+
+
+def usdhc_write_data(base: uint64, buf: Ptr[uint8], blocks: uint32) -> int32:
+    words: uint32 = blocks * 128
+    done: uint32 = 0
+    while done < words:
+        waited: uint32 = 0
+        while (reg_rd(base + USDHC_PRES_STATE) & USDHC_PRES_STATE_BWEN) == 0:
+            e: int32 = _usdhc_data_err(base)
+            if e != 0:
+                return e
+            if waited >= USDHC_DATA_TIMEOUT_US:
+                usdhc_reset_lines(base, USDHC_SYS_CTRL_RSTD)
+                return USDHC_E_DATA
+            delay_us(1)
+            waited = waited + 1
+        n: uint32 = USDHC_WML_WORDS
+        if words - done < n:
+            n = words - done
+        k: uint32 = 0
+        while k < n:
+            o: uint64 = cast[uint64](done + k) * 4
+            w: uint32 = cast[uint32](buf[o]) | (cast[uint32](buf[o + 1]) << 8) | (cast[uint32](buf[o + 2]) << 16) | (cast[uint32](buf[o + 3]) << 24)
+            reg_wr(base + USDHC_DATA_BUFF_ACC_PORT, w)
+            k = k + 1
+        done = done + n
+        reg_wr(base + USDHC_INT_STATUS, USDHC_INT_STATUS_BWR)
+    return _usdhc_wait_tc(base)

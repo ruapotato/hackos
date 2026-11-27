@@ -1,0 +1,268 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- SD memory card protocol (SD Physical Layer Simplified
+# Specification 3.01: card identification, data transfer in SD mode) over the
+# uSDHC host controller (soc/imxrt/usdhc.ad).  One card, one host.
+#
+# UNTESTED ON HARDWARE.  Run against QEMU's SD card model behind QEMU's
+# i.MX uSDHC model, as an SDSC card (byte addresses) and as an SDHC card
+# (block addresses) -- tests/imxrt/usdhc_qemu.sh.  Real cards are slower,
+# reject things QEMU accepts and need the 3.3 V supply the Teensy 4.1's
+# socket provides; none of that is modelled.
+#
+# sd_init identifies the card and leaves it selected in 4-bit mode at
+# <= 25 MHz.  sd_read / sd_write move whole 512-byte blocks; their (lba,
+# count, buffer address) -> 0 / -1 signature is the block layer's
+# (kernel/block/blk.ad), so `register_blockdev("sd0", sd_capacity(), ...)`
+# is all the FAT code needs.
+
+from soc.imxrt.usdhc import usdhc_init, usdhc_cmd, usdhc_rsp, usdhc_read_data, usdhc_write_data, usdhc_set_clock, usdhc_bus_width4, USDHC_RSP_NONE, USDHC_RSP_R1, USDHC_RSP_R1B, USDHC_RSP_R2, USDHC_RSP_R3, USDHC_DATA_READ, USDHC_DATA_WRITE, USDHC_DATA_MULTI, USDHC_E_TIMEOUT
+from soc.imxrt.delay import delay_us
+
+SD_R1_ERRORS: uint32 = 0xFDF98008    # unchecked: SD spec card status error bits (31-26, 24-19, 16, 15, 3)
+SD_R1_READY: uint32 = 0x100          # unchecked: SD spec READY_FOR_DATA
+SD_OCR_BUSY: uint32 = 0x80000000     # unchecked: SD spec, power-up complete
+SD_OCR_CCS: uint32 = 0x40000000      # unchecked: SD spec, card capacity status
+SD_OCR_VDD: uint32 = 0x00300000      # unchecked: SD spec, 3.2-3.4 V window
+SD_BLOCK: uint32 = 512               # unchecked: SD spec
+SD_MAX_MULTI: uint32 = 65535         # unchecked: BLK_ATT.BLKCNT is 16 bits
+
+SD_E_NOCARD: int32 = -10             # unchecked: result code
+SD_E_UNUSABLE: int32 = -11           # unchecked: result code
+SD_E_CMD: int32 = -12                # unchecked: result code
+
+sd_base: uint64 = 0
+sd_root_hz: uint32 = 0
+sd_ready: uint32 = 0
+sd_v2: uint32 = 0                    # answered CMD8 (physical layer 2.00 or later)
+sd_hc: uint32 = 0                    # SDHC/SDXC: block addresses
+sd_rca: uint32 = 0
+sd_sectors: uint64 = 0
+sd_ocr: uint32 = 0
+sd_last_status: uint32 = 0
+sd_last_error: int32 = 0
+sd_last_cmd: uint32 = 0
+sd_cid: Array[4, uint32]
+sd_csd: Array[4, uint32]
+
+
+def _sd_fail(cmd: uint32, e: int32) -> int32:
+    sd_last_cmd = cmd
+    sd_last_error = e
+    return e
+
+
+# R1 commands: the command itself and the card status it returns.
+def _sd_cmd_r1(idx: uint32, arg: uint32, flags: uint32, blocks: uint32) -> int32:
+    e: int32 = usdhc_cmd(sd_base, idx, arg, flags, blocks)
+    if e != 0:
+        return _sd_fail(idx, e)
+    sd_last_status = usdhc_rsp(sd_base, 0)
+    if (sd_last_status & SD_R1_ERRORS) != 0:
+        return _sd_fail(idx, SD_E_CMD)
+    return 0
+
+
+def _sd_acmd(idx: uint32, arg: uint32, flags: uint32) -> int32:
+    e: int32 = _sd_cmd_r1(55, sd_rca << 16, USDHC_RSP_R1, 0)
+    if e != 0:
+        return e
+    if flags == USDHC_RSP_R3:
+        e = usdhc_cmd(sd_base, idx, arg, flags, 0)
+        if e != 0:
+            return _sd_fail(idx, e)
+        return 0
+    return _sd_cmd_r1(idx, arg, flags, 0)
+
+
+# Bits [hi:lo] of a 128-bit register read with an R2 response.  The
+# controller drops the CRC byte: response bit n (n >= 8) is bit (n - 8) of
+# the 120 bits in RSP0..RSP3.
+def sd_r2_bits(r: Ptr[uint32], hi: uint32, lo: uint32) -> uint32:
+    v: uint32 = 0
+    b: uint32 = hi
+    while 1 == 1:
+        k: uint32 = b - 8
+        v = (v << 1) | ((r[k / 32] >> (k % 32)) & 1)
+        if b == lo:
+            return v
+        b = b - 1
+    return v
+
+
+# Capacity in 512-byte sectors from the CSD (versions 1.0 and 2.0).
+def sd_csd_sectors(csd: Ptr[uint32]) -> uint64:
+    structure: uint32 = sd_r2_bits(csd, 127, 126)
+    if structure == 1:
+        c_size: uint64 = cast[uint64](sd_r2_bits(csd, 69, 48))
+        return (c_size + 1) * 1024
+    if structure == 0:
+        read_bl_len: uint32 = sd_r2_bits(csd, 83, 80)
+        c_size1: uint64 = cast[uint64](sd_r2_bits(csd, 73, 62))
+        mult: uint32 = sd_r2_bits(csd, 49, 47)
+        bytes: uint64 = (c_size1 + 1) << (mult + 2 + read_bl_len)
+        return bytes / 512
+    return 0
+
+
+def _sd_rd4(dst: Ptr[uint32]):
+    i: uint32 = 0
+    while i < 4:
+        dst[i] = usdhc_rsp(sd_base, i)
+        i = i + 1
+
+
+# Identify and select the card.  root_hz: the uSDHC root clock.
+# Returns 0 or a negative code (sd_last_cmd names the command that failed).
+def sd_init(base: uint64, root_hz: uint32) -> int32:
+    sd_base = base
+    sd_root_hz = root_hz
+    sd_ready = 0
+    sd_rca = 0
+    sd_v2 = 0
+    sd_hc = 0
+    e: int32 = usdhc_init(base, root_hz)
+    if e != 0:
+        return _sd_fail(0, e)
+    delay_us(1000)                                   # power ramp, >= 1 ms
+    usdhc_cmd(base, 0, 0, USDHC_RSP_NONE, 0)          # GO_IDLE_STATE
+    delay_us(1000)
+    e = usdhc_cmd(base, 8, 0x1AA, USDHC_RSP_R1, 0)    # SEND_IF_COND: 2.7-3.6 V, pattern AA
+    if e == 0:
+        if (usdhc_rsp(base, 0) & 0xFFF) != 0x1AA:
+            return _sd_fail(8, SD_E_UNUSABLE)
+        sd_v2 = 1
+    elif e != USDHC_E_TIMEOUT:
+        return _sd_fail(8, e)
+    hcs: uint32 = 0
+    if sd_v2 != 0:
+        hcs = SD_OCR_CCS
+    tries: uint32 = 0
+    while 1 == 1:
+        e = _sd_acmd(41, hcs | SD_OCR_VDD, USDHC_RSP_R3)   # SD_SEND_OP_COND
+        if e != 0:
+            if tries == 0:
+                return _sd_fail(41, SD_E_NOCARD)
+            return e
+        sd_ocr = usdhc_rsp(base, 0)
+        if (sd_ocr & SD_OCR_BUSY) != 0:
+            break
+        tries = tries + 1
+        if tries > 1000:
+            return _sd_fail(41, SD_E_UNUSABLE)        # not ready after ~1 s
+        delay_us(1000)
+    if (sd_ocr & SD_OCR_CCS) != 0:
+        sd_hc = 1
+    e = usdhc_cmd(base, 2, 0, USDHC_RSP_R2, 0)        # ALL_SEND_CID
+    if e != 0:
+        return _sd_fail(2, e)
+    _sd_rd4(&sd_cid[0])
+    e = usdhc_cmd(base, 3, 0, USDHC_RSP_R1, 0)        # SEND_RELATIVE_ADDR (R6)
+    if e != 0:
+        return _sd_fail(3, e)
+    sd_rca = usdhc_rsp(base, 0) >> 16
+    e = usdhc_cmd(base, 9, sd_rca << 16, USDHC_RSP_R2, 0)   # SEND_CSD
+    if e != 0:
+        return _sd_fail(9, e)
+    _sd_rd4(&sd_csd[0])
+    sd_sectors = sd_csd_sectors(&sd_csd[0])
+    if sd_sectors == 0:
+        return _sd_fail(9, SD_E_UNUSABLE)
+    e = _sd_cmd_r1(7, sd_rca << 16, USDHC_RSP_R1B, 0)        # SELECT_CARD
+    if e != 0:
+        return e
+    if sd_hc == 0:
+        e = _sd_cmd_r1(16, SD_BLOCK, USDHC_RSP_R1, 0)         # SET_BLOCKLEN
+        if e != 0:
+            return e
+    e = _sd_acmd(6, 2, USDHC_RSP_R1)                          # SET_BUS_WIDTH 4 bits
+    if e != 0:
+        return e
+    usdhc_bus_width4(base)
+    e = usdhc_set_clock(base, root_hz, 25000000)               # default speed
+    if e != 0:
+        return _sd_fail(0, e)
+    sd_ready = 1
+    return 0
+
+
+def sd_capacity() -> uint64:
+    return sd_sectors
+
+
+def _sd_addr(lba: uint64) -> uint32:
+    if sd_hc != 0:
+        return cast[uint32](lba)
+    return cast[uint32](lba * 512)
+
+
+# Wait until the card is back in the transfer state and ready for data.
+def _sd_wait_ready() -> int32:
+    tries: uint32 = 0
+    while tries < 5000:
+        e: int32 = _sd_cmd_r1(13, sd_rca << 16, USDHC_RSP_R1, 0)   # SEND_STATUS
+        if e != 0:
+            return e
+        state: uint32 = (sd_last_status >> 9) & 0xF
+        if (sd_last_status & SD_R1_READY) != 0 and state == 4:
+            return 0
+        delay_us(100)
+        tries = tries + 1
+    return _sd_fail(13, SD_E_UNUSABLE)
+
+
+# Block layer entry points: (lba, count, buffer address) -> 0 or -1.
+def sd_read(lba: uint64, count: uint64, buf: uint64) -> int32:
+    if sd_ready == 0 or count == 0 or lba + count > sd_sectors:
+        return -1
+    done: uint64 = 0
+    while done < count:
+        n: uint64 = count - done
+        if n > cast[uint64](SD_MAX_MULTI):
+            n = cast[uint64](SD_MAX_MULTI)
+        p: Ptr[uint8] = cast[Ptr[uint8]](buf + done * 512)
+        if n == 1:
+            if _sd_cmd_r1(17, _sd_addr(lba + done), USDHC_RSP_R1 | USDHC_DATA_READ, 1) != 0:
+                return -1
+            if usdhc_read_data(sd_base, p, 1) != 0:
+                sd_last_cmd = 17
+                return -1
+        else:
+            if _sd_cmd_r1(18, _sd_addr(lba + done), USDHC_RSP_R1 | USDHC_DATA_READ | USDHC_DATA_MULTI, cast[uint32](n)) != 0:
+                return -1
+            rc: int32 = usdhc_read_data(sd_base, p, cast[uint32](n))
+            stop: int32 = _sd_cmd_r1(12, 0, USDHC_RSP_R1B, 0)       # STOP_TRANSMISSION
+            if rc != 0 or stop != 0:
+                sd_last_cmd = 18
+                return -1
+        done = done + n
+    return 0
+
+
+def sd_write(lba: uint64, count: uint64, buf: uint64) -> int32:
+    if sd_ready == 0 or count == 0 or lba + count > sd_sectors:
+        return -1
+    done: uint64 = 0
+    while done < count:
+        n: uint64 = count - done
+        if n > cast[uint64](SD_MAX_MULTI):
+            n = cast[uint64](SD_MAX_MULTI)
+        p: Ptr[uint8] = cast[Ptr[uint8]](buf + done * 512)
+        if n == 1:
+            if _sd_cmd_r1(24, _sd_addr(lba + done), USDHC_RSP_R1 | USDHC_DATA_WRITE, 1) != 0:
+                return -1
+            if usdhc_write_data(sd_base, p, 1) != 0:
+                sd_last_cmd = 24
+                return -1
+        else:
+            if _sd_cmd_r1(25, _sd_addr(lba + done), USDHC_RSP_R1 | USDHC_DATA_WRITE | USDHC_DATA_MULTI, cast[uint32](n)) != 0:
+                return -1
+            rc: int32 = usdhc_write_data(sd_base, p, cast[uint32](n))
+            stop: int32 = _sd_cmd_r1(12, 0, USDHC_RSP_R1B, 0)
+            if rc != 0 or stop != 0:
+                sd_last_cmd = 25
+                return -1
+        if _sd_wait_ready() != 0:
+            return -1
+        done = done + n
+    return 0

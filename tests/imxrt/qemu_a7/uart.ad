@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Output for the uSDHC test image: UART1 of QEMU's i.MX6UL (imx_serial).
+
+from kernel.cpu import mmio_write32
+
+A7_UART1: uint64 = 0x02020000
+
+
+def a7_uart_init():
+    mmio_write32(A7_UART1 + 0x80, 1)          # UCR1: UARTEN
+    mmio_write32(A7_UART1 + 0x84, 0x4027)     # UCR2: IRTS | TXEN | RXEN | SRST
+
+
+def a7_putc(c: uint32):
+    if c == 10:
+        mmio_write32(A7_UART1 + 0x40, 13)
+    mmio_write32(A7_UART1 + 0x40, c & 255)
+
+
+def a7_puts(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0:
+        a7_putc(cast[uint32](s[i]))
+        i = i + 1
+
+
+def a7_put_u64(v: uint64):
+    buf: Array[24, uint8]
+    n: uint32 = 0
+    if v == 0:
+        a7_putc(48)
+        return
+    while v != 0:
+        buf[n] = cast[uint8](48 + v % 10)
+        v = v / 10
+        n = n + 1
+    while n > 0:
+        n = n - 1
+        a7_putc(cast[uint32](buf[n]))
+
+
+def a7_put_hex(v: uint32):
+    a7_puts("0x")
+    i: int32 = 28
+    while i >= 0:
+        d: uint32 = (v >> cast[uint32](i)) & 15
+        if d < 10:
+            a7_putc(48 + d)
+        else:
+            a7_putc(87 + d)
+        i = i - 4

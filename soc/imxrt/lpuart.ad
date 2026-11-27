@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- LPUART (i.MX RT1060 and RT1170 families: the same IP block).
+#
+# UNTESTED ON HARDWARE.  Register layout and bit masks are checked against
+# NXP's MIMXRT1062.h (and compared with MIMXRT1176_cm7.h) by
+# tests/imxrt/check_regs.py; the behaviour below is tested against a register
+# model (tests/imxrt/models/lpuart_model.ad) written from the reference
+# manual's description, not against the chip.
+#
+# What the console needs: 8N1, polled transmit, receive through the RX FIFO
+# with an interrupt when it is not empty, error flags cleared by the
+# interrupt handler (an overrun stops the receiver until OR is cleared).
+#
+# Every function takes the instance's base address; the SoC files name them.
+
+from soc.imxrt.reg import reg_rd, reg_wr
+from soc.imxrt.delay import delay_us
+
+LPUART_GLOBAL: uint64 = 0x08
+LPUART_PINCFG: uint64 = 0x0C
+LPUART_BAUD: uint64 = 0x10
+LPUART_STAT: uint64 = 0x14
+LPUART_CTRL: uint64 = 0x18
+LPUART_DATA: uint64 = 0x1C
+LPUART_MODIR: uint64 = 0x24
+LPUART_FIFO: uint64 = 0x28
+LPUART_WATER: uint64 = 0x2C
+
+LPUART_GLOBAL_RST: uint32 = 0x2
+LPUART_BAUD_OSR: uint32 = 0x1F000000
+LPUART_BAUD_OSR_SHIFT: uint32 = 24
+LPUART_BAUD_SBR: uint32 = 0x1FFF
+LPUART_BAUD_BOTHEDGE: uint32 = 0x20000
+LPUART_STAT_TDRE: uint32 = 0x800000
+LPUART_STAT_TC: uint32 = 0x400000
+LPUART_STAT_RDRF: uint32 = 0x200000
+LPUART_STAT_IDLE: uint32 = 0x100000
+LPUART_STAT_OR: uint32 = 0x80000
+LPUART_STAT_NF: uint32 = 0x40000
+LPUART_STAT_FE: uint32 = 0x20000
+LPUART_STAT_PF: uint32 = 0x10000
+# STAT mixes configuration bits (read/write) with flags (write one to clear);
+# a write must carry the configuration bits through unchanged.
+LPUART_STAT_MSBF: uint32 = 0x20000000
+LPUART_STAT_RXINV: uint32 = 0x10000000
+LPUART_STAT_RWUID: uint32 = 0x8000000
+LPUART_STAT_BRK13: uint32 = 0x4000000
+LPUART_STAT_LBKDE: uint32 = 0x2000000
+LPUART_CTRL_TE: uint32 = 0x80000
+LPUART_CTRL_RE: uint32 = 0x40000
+LPUART_CTRL_RIE: uint32 = 0x200000
+LPUART_CTRL_ORIE: uint32 = 0x8000000
+LPUART_DATA_RXEMPT: uint32 = 0x1000
+LPUART_FIFO_TXFE: uint32 = 0x80
+LPUART_FIFO_RXFE: uint32 = 0x8
+LPUART_FIFO_TXFLUSH: uint32 = 0x8000
+LPUART_FIFO_RXFLUSH: uint32 = 0x4000
+LPUART_WATER_RXCOUNT: uint32 = 0x7000000
+LPUART_WATER_RXCOUNT_SHIFT: uint32 = 24
+
+LPUART_TX_TIMEOUT_US: uint32 = 10000      # unchecked: driver policy (a byte at 9600 baud is ~1 ms)
+
+lpuart_tx_timeouts: uint32 = 0
+lpuart_rx_errors: uint32 = 0
+
+
+# BAUD register value for `baud` from a module clock of `clk_hz`: the
+# oversampling ratio (4..32) and divisor (1..8191) with the smallest error,
+# the larger ratio on a tie; BOTHEDGE for ratios 4..7 as the reference manual
+# requires.  Returns 0 if no setting is within 3 %.
+def lpuart_baud_value(clk_hz: uint32, baud: uint32) -> uint32:
+    best_err: uint64 = 0xFFFFFFFF
+    best_osr: uint32 = 0
+    best_sbr: uint32 = 0
+    osr: uint32 = 4
+    while osr <= 32:
+        div: uint64 = cast[uint64](osr) * cast[uint64](baud)
+        sbr: uint64 = (cast[uint64](clk_hz) + div / 2) / div
+        if sbr < 1:
+            sbr = 1
+        if sbr > 8191:
+            sbr = 8191
+        actual: uint64 = cast[uint64](clk_hz) / (cast[uint64](osr) * sbr)
+        err: uint64 = 0
+        if actual > cast[uint64](baud):
+            err = actual - cast[uint64](baud)
+        else:
+            err = cast[uint64](baud) - actual
+        if err <= best_err:
+            best_err = err
+            best_osr = osr
+            best_sbr = cast[uint32](sbr)
+        osr = osr + 1
+    if best_err * 100 > cast[uint64](baud) * 3:
+        return 0
+    v: uint32 = ((best_osr - 1) << LPUART_BAUD_OSR_SHIFT) | best_sbr
+    if best_osr <= 7:
+        v = v | LPUART_BAUD_BOTHEDGE
+    return v
+
+
+# Reset the instance and start it at `baud`, 8N1, FIFOs on, receiver and
+# transmitter enabled, no interrupts.  Returns 0, or -1 if the baud rate
+# cannot be made from clk_hz.
+def lpuart_init(base: uint64, clk_hz: uint32, baud: uint32) -> int32:
+    bv: uint32 = lpuart_baud_value(clk_hz, baud)
+    if bv == 0:
+        return -1
+    reg_wr(base + LPUART_GLOBAL, LPUART_GLOBAL_RST)
+    reg_wr(base + LPUART_GLOBAL, 0)
+    reg_wr(base + LPUART_PINCFG, 0)
+    reg_wr(base + LPUART_BAUD, bv)
+    reg_wr(base + LPUART_MODIR, 0)
+    reg_wr(base + LPUART_WATER, 0)                       # TXWATER 0, RXWATER 0
+    reg_wr(base + LPUART_FIFO, LPUART_FIFO_TXFE | LPUART_FIFO_RXFE | LPUART_FIFO_TXFLUSH | LPUART_FIFO_RXFLUSH)
+    lpuart_clear_errors(base)
+    reg_wr(base + LPUART_CTRL, LPUART_CTRL_TE | LPUART_CTRL_RE)
+    return 0
+
+
+# Wait (bounded) for room in the transmit FIFO, then queue one byte.  A byte
+# that cannot be queued in time is dropped and counted: console output must
+# never hang the kernel on a dead line.
+def lpuart_putc(base: uint64, c: uint32):
+    waited: uint32 = 0
+    while (reg_rd(base + LPUART_STAT) & LPUART_STAT_TDRE) == 0:
+        if waited >= LPUART_TX_TIMEOUT_US:
+            lpuart_tx_timeouts = lpuart_tx_timeouts + 1
+            return
+        delay_us(1)
+        waited = waited + 1
+    reg_wr(base + LPUART_DATA, c & 0xFF)
+
+
+# Wait (bounded) until everything queued has left the shift register.
+def lpuart_flush(base: uint64):
+    waited: uint32 = 0
+    while (reg_rd(base + LPUART_STAT) & LPUART_STAT_TC) == 0 and waited < LPUART_TX_TIMEOUT_US:
+        delay_us(1)
+        waited = waited + 1
+
+
+# 1 if a received byte is waiting.
+def lpuart_rx_ready(base: uint64) -> uint32:
+    if (reg_rd(base + LPUART_WATER) & LPUART_WATER_RXCOUNT) != 0:
+        return 1
+    if (reg_rd(base + LPUART_STAT) & LPUART_STAT_RDRF) != 0:
+        return 1
+    return 0
+
+
+# The next received byte, or 0xFFFFFFFF if the FIFO was empty.
+def lpuart_getc(base: uint64) -> uint32:
+    d: uint32 = reg_rd(base + LPUART_DATA)
+    if (d & LPUART_DATA_RXEMPT) != 0:
+        return 0xFFFFFFFF
+    return d & 0xFF
+
+
+# Clear overrun, noise, framing and parity flags (write one to clear),
+# leaving STAT's configuration bits as they are.  Returns the flags found.
+def lpuart_clear_errors(base: uint64) -> uint32:
+    st: uint32 = reg_rd(base + LPUART_STAT)
+    keep: uint32 = st & (LPUART_STAT_MSBF | LPUART_STAT_RXINV | LPUART_STAT_RWUID | LPUART_STAT_BRK13 | LPUART_STAT_LBKDE)
+    errs: uint32 = st & (LPUART_STAT_OR | LPUART_STAT_NF | LPUART_STAT_FE | LPUART_STAT_PF)
+    if errs != 0:
+        reg_wr(base + LPUART_STAT, keep | errs)
+        lpuart_rx_errors = lpuart_rx_errors + 1
+    return errs
+
+
+# Receive interrupt on: RDRF (the FIFO holds more than RXWATER = 0 words)
+# and overrun.
+def lpuart_rx_irq_enable(base: uint64):
+    reg_wr(base + LPUART_CTRL, reg_rd(base + LPUART_CTRL) | LPUART_CTRL_RIE | LPUART_CTRL_ORIE)

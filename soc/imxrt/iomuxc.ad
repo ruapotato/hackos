@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- pin multiplexing (IOMUXC), i.MX RT1060 and RT1170 families.
+# UNTESTED ON HARDWARE.
+#
+# NXP describes each pad function by five numbers (fsl_iomuxc.h:
+# IOMUXC_<PAD>_<FUNCTION> = mux register, mux mode, input-select register,
+# input-select value, pad-control register).  iomuxc_pin takes exactly those
+# five, plus the pad-control value and SION, so a call can be compared with
+# NXP's macro mechanically: tests/imxrt/check_pins.py requires every call
+# to carry the macro's name in a trailing comment and to match it.  The
+# pad-control bit layout differs between the families; its values are the
+# SoC file's business.
+
+from soc.imxrt.reg import reg_wr
+
+IOMUXC_SION: uint32 = 0x10        # unchecked: bit 4 of every SW_MUX_CTL register (RM: "SION")
+
+
+def iomuxc_pin(mux_reg: uint64, mode: uint32, input_reg: uint64, input_val: uint32, cfg_reg: uint64, pad_ctl: uint32, sion: uint32):
+    m: uint32 = mode & 0xF
+    if sion != 0:
+        m = m | IOMUXC_SION
+    reg_wr(mux_reg, m)
+    if input_reg != 0:
+        reg_wr(input_reg, input_val)
+    if cfg_reg != 0:
+        reg_wr(cfg_reg, pad_ctl)
