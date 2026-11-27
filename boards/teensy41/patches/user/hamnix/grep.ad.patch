@@ -1,0 +1,18 @@
+HackOS teensy41 size patch to user/hamnix/grep.ad (build/teensy41/root only).
+
+Reason: the line buffer is 64 KiB of static data in a 736 KiB program
+arena.  Lines are now cut at 8 KiB (LINE_BUF bounds every use).
+
+--- a/user/hamnix/grep.ad
++++ b/user/hamnix/grep.ad
+@@ -79,8 +79,8 @@
+ active_pat: int32 = -1        # which pattern is currently compiled
+ 
+ # ---- current line + match span ----
+-LINE_BUF: uint64 = 65536
+-line: Array[65536, uint8]
++LINE_BUF: uint64 = 8192
++line: Array[8192, uint8]
+ gm_s: uint64 = 0
+ gm_e: uint64 = 0
+ 

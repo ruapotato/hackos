@@ -84,7 +84,7 @@ SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.
 PROGS_OWN    := hello ptest crel halt
 HEAP_ptest   := 8192
 PROGS_HAMNIX := echo cat ls cp rm mkdir wc head grep hamsh
-STACK_hamsh  := 65536
+STACK_hamsh  ?= 65536
 PROGS        := $(PROGS_OWN) $(PROGS_HAMNIX)
 PROG_BINS    := $(PROGS:%=$(B)/user/%)
 SRC_USER     := $(wildcard user/progs/*.ad user/hamnix/*.ad user/rt/*.ad lib/*.ad lib/*/*.ad kernel/rt.ad)
@@ -209,6 +209,19 @@ $(B)/sd.img: tests/sd/readme.txt $(B)/user/hello | $(B)
 	mcopy -i $@ $(B)/user/hello ::DOCS/HELLO
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 7 + 3) & 255 for i in range(40000)))" > $(B)/pattern.bin
 	mcopy -i $@ $(B)/pattern.bin ::PATTERN.BIN
+
+# Flash image for the Teensy loader (Intel HEX at the flash addresses) and
+# the raw image from 0x60000000 (what tests/imxrt/check_boot.py reads).
+$(B)/hackos.hex: $(B)/hackos.elf
+	$(OBJCOPY) -O ihex $< $@
+
+$(B)/hackos.bin: $(B)/hackos.elf
+	$(OBJCOPY) -O binary $< $@
+
+# The checks of the i.MX RT code that need no board (tests/imxrt/README).
+test-teensy:
+	$(MAKE) BOARD=teensy41 ADDER=$(ADDER)
+	ADDER=$(ADDER) bash tests/imxrt/run_all.sh
 
 run: $(B)/hackos.elf $(B)/sd.img
 	$(QEMU) -M mps2-an500 -nographic -no-reboot -device loader,file=$(B)/sd.img,addr=$(SD_ADDR) -kernel $<

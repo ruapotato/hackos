@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS board support: PJRC Teensy 4.1 (NXP i.MX RT1062, 600 MHz Cortex-M7,
+# 8 MiB QSPI flash W25Q64JV, 1 MiB on-chip RAM, microSD socket on uSDHC1).
+#
+# UNTESTED ON HARDWARE.  docs/boards/teensy41.md has the wiring, what the
+# first power-up should show, and the bring-up order.
+#
+#   console   LPUART6 = Teensy "Serial1": pin 1 TX, pin 0 RX, 115200 8N1,
+#             3.3 V levels; receive interrupt into the line discipline
+#   LED       pin 13 (GPIO_B0_03 = GPIO2 bit 3): on from the first
+#             instruction (vectors.S), blinking 1 Hz once the scheduler runs,
+#             a pattern of N flashes after a fatal error with code N
+#   /sd       the built-in microSD socket (uSDHC1, pads GPIO_SD_B0_00..05)
+#   clocks    as the boot ROM left them, see soc/imxrt1062/soc.ad; the boot
+#             report prints what they are
+#
+# Pin multiplexing: every iomuxc_pin call names NXP's fsl_iomuxc.h macro
+# and the Teensy pin in its comment; tests/imxrt/check_pins.py compares the
+# numbers with the macro and the pad with PJRC's Teensy 4.1 pin table.
+
+from kernel.cpu import mmio_read32, mmio_write32
+from kernel.print import kputs, kput_u64, kput_hex32
+from kernel.block.blk import register_blockdev
+from kernel.sched.core import thread_create, thread_sleep
+from soc.imxrt.reg import reg_rd, reg_wr
+from soc.imxrt.delay import delay_us
+from soc.imxrt.iomuxc import iomuxc_pin
+from soc.imxrt.lpuart import lpuart_init, lpuart_putc, lpuart_flush, lpuart_rx_ready, lpuart_getc, lpuart_clear_errors, lpuart_rx_irq_enable
+from soc.imxrt.gpio import gpio_output, gpio_set, gpio_clear, gpio_toggle
+from soc.imxrt.lpi2c import lpi2c_init
+from soc.imxrt.lpspi import lpspi_init
+from soc.imxrt1062.soc import LPUART6_BASE, LPUART6_IRQ, GPIO2_BASE, USDHC1_BASE, LPI2C1_BASE, LPSPI4_BASE, IOMUXC_GPR_BASE, IOMUXC_GPR_GPR14, IOMUXC_GPR_GPR16, IOMUXC_GPR_GPR17, CCM_GATE_LPUART6, CCM_GATE_GPIO2, CCM_GATE_USDHC1, CCM_GATE_LPI2C1, CCM_GATE_LPSPI4, CCM_GATE_IOMUXC, CCM_GATE_IOMUXC_GPR, ccm_gate_on, nvic_enable, imxrt1062_system_init, clk_uart_root_osc, clk_usdhc1_root, clk_lpi2c_root_osc, clk_lpspi_root_pll2, clk_read, clk_freq, F_PLL1, F_PLL2, F_PLL3, F_CORE, F_IPG, F_PERCLK, F_UART, F_LPI2C, F_LPSPI, F_USDHC1, F_FLEXSPI, icache_invalidate, measure_core_hz, SYST_CALIB
+from drivers.sd.sd import sd_init, sd_read, sd_write, sd_capacity, sd_last_cmd, sd_last_error, sd_hc
+
+extern def __xbss_start()
+extern def __xbss_end()
+
+LED_GPIO: uint64 = 0x401BC000       # unchecked: = GPIO2_BASE (checked in soc.ad)
+LED_BIT: uint32 = 3                 # unchecked: GPIO2_IO03, compared with PJRC's CORE_PIN13_BIT by check_pins.py
+
+# Pad control values, RT1062 SW_PAD_CTL layout (MIMXRT1062.h
+# IOMUXC_SW_PAD_CTL_PAD_*): SRE bit 0, DSE 5:3, SPEED 7:6, ODE 11, PKE 12,
+# PUE 13, PUS 15:14, HYS 16.  The values are PJRC's (Serial1, pinMode) and
+# SdFat's (the SD socket), which run on every Teensy 4.1.
+PAD_UART_RX: uint32 = 0x1F038       # pad: DSE=7 PKE PUE PUS=3 HYS; PUS 3 = 22k up (PJRC HardwareSerial)
+PAD_UART_TX: uint32 = 0x000D9       # pad: SRE DSE=3 SPEED=3 (PJRC HardwareSerial)
+PAD_LED: uint32 = 0x00038           # pad: DSE=7 (PJRC pinMode OUTPUT)
+PAD_SD_CLK: uint32 = 0x010B8        # pad: PKE DSE=7 SPEED=2 (SdFat, Teensy 4.1)
+PAD_I2C: uint32 = 0x1F861           # pad: ODE SRE DSE=4 SPEED=1 PKE PUE PUS=3 HYS; open drain, 22k up (PJRC Wire)
+PAD_SPI: uint32 = 0x010B0           # pad: DSE=6 SPEED=2 PKE
+PAD_SD_DATA: uint32 = 0x070B8       # pad: PKE DSE=7 SPEED=2 PUE PUS=1; PUS 1 = 47k up (SdFat, Teensy 4.1)
+
+core_hz_measured: uint32 = 0
+usdhc_root_hz: uint32 = 0
+
+
+def board_name() -> Ptr[uint8]:
+    return "Teensy 4.1 (NXP i.MX RT1062)"
+
+
+def board_cpu_hz() -> uint32:
+    if core_hz_measured != 0:
+        return core_hz_measured
+    return 600000000
+
+
+# hackos_start, after .data and .bss: the tables in .xbss are not cleared
+# there (QEMU's RAM starts as zeros; DTCM does not), so here; then watchdogs,
+# SysTick, NVIC, caches (soc.ad), and the clock gates of what the console
+# and the LED use.
+def board_init_early():
+    p: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&__xbss_start))
+    n: uint64 = (cast[uint64](&__xbss_end) - cast[uint64](&__xbss_start)) >> 2
+    i: uint64 = 0
+    while i < n:
+        p[i] = 0
+        i = i + 1
+    imxrt1062_system_init()
+    ccm_gate_on(CCM_GATE_IOMUXC)
+    ccm_gate_on(CCM_GATE_IOMUXC_GPR)
+    ccm_gate_on(CCM_GATE_GPIO2)
+    iomuxc_pin(0x401F8148, 0x5, 0, 0, 0x401F8338, PAD_LED, 0)   # IOMUXC_GPIO_B0_03_GPIO2_IO03, Teensy pin 13
+    gpio_output(LED_GPIO, LED_BIT, 1)
+
+
+# ---- console: LPUART6 on pins 0 (RX) and 1 (TX) ---------------------------
+def board_console_init():
+    hz: uint32 = clk_uart_root_osc()
+    ccm_gate_on(CCM_GATE_LPUART6)
+    iomuxc_pin(0x401F80C8, 0x2, 0x401F8550, 0x1, 0x401F82B8, PAD_UART_RX, 0)   # IOMUXC_GPIO_AD_B0_03_LPUART6_RX, Teensy pin 0
+    iomuxc_pin(0x401F80C4, 0x2, 0x401F8554, 0x1, 0x401F82B4, PAD_UART_TX, 0)   # IOMUXC_GPIO_AD_B0_02_LPUART6_TX, Teensy pin 1
+    lpuart_init(LPUART6_BASE, hz, 115200)
+
+
+def board_console_putc(c: uint32):
+    lpuart_putc(LPUART6_BASE, c)
+
+
+def board_console_rx_irq_enable():
+    lpuart_rx_irq_enable(LPUART6_BASE)
+    nvic_enable(LPUART6_IRQ, 0x80)
+
+
+def board_console_rx_ready() -> uint32:
+    return lpuart_rx_ready(LPUART6_BASE)
+
+
+def board_console_getc() -> uint32:
+    return lpuart_getc(LPUART6_BASE) & 0xFF
+
+
+def board_console_rx_irq_ack():
+    lpuart_clear_errors(LPUART6_BASE)
+
+
+# ---- scheduler tick: SysTick on its 100 kHz reference ---------------------
+# CLKSOURCE = 0 (the external reference, 100 kHz on the RT1062, as PJRC's
+# start-up uses it), TICKINT, ENABLE.  Independent of the core clock.
+def board_systick_csr() -> uint32:
+    return 3
+
+
+def board_systick_reload(hz: uint32) -> uint32:
+    return 100000 / hz - 1
+
+
+# ---- MPU plan (kernel/mpu.ad) ---------------------------------------------
+def board_mpu_code_base() -> uint32:
+    return 0x60000000
+
+
+def board_mpu_code_size() -> uint32:
+    return 0x800000
+
+
+def board_mpu_kram_base() -> uint32:
+    return 0x20000000
+
+
+def board_mpu_kram_size() -> uint32:
+    return 0x80000
+
+
+def board_mpu_xram_base() -> uint32:
+    return 0x20200000
+
+
+def board_mpu_xram_size() -> uint32:
+    return 0x100000             # 0x20200000 + 1 MB: covers the 736 KB arena
+
+
+# Regions 8 and 9: the FlexSPI2 window (PSRAM pads, 0x70000000) and the SEMC
+# window (0x80000000), where nothing answers on this board, made
+# no-access, execute-never, strongly ordered.  The default memory map calls
+# them normal memory, and the Cortex-M7 may read normal memory speculatively;
+# PJRC's start-up covers the whole address space for the same reason (ARM
+# knowledge base: "Why does the Cortex-M7 initiate AXIM read accesses to
+# memory addresses that do not fall under a defined MPU region?").
+def board_mpu_extra():
+    mmio_write32(0xE000ED98, 8)                                  # MPU_RNR
+    mmio_write32(0xE000ED9C, 0x70000000)                         # MPU_RBAR
+    mmio_write32(0xE000EDA0, 0x10000000 | (27 << 1) | 1)         # XN, AP 0, TEX/C/B 0, 256 MB
+    mmio_write32(0xE000ED98, 9)
+    mmio_write32(0xE000ED9C, 0x80000000)
+    mmio_write32(0xE000EDA0, 0x10000000 | (28 << 1) | 1)         # XN, AP 0, TEX/C/B 0, 512 MB
+
+
+# ---- /sd: the microSD socket ------------------------------------------------
+def _sd_pins():
+    iomuxc_pin(0x401F81BC, 0x0, 0, 0, 0x401F83AC, PAD_SD_DATA, 0)   # IOMUXC_GPIO_SD_B0_00_USDHC1_CMD
+    iomuxc_pin(0x401F81C0, 0x0, 0, 0, 0x401F83B0, PAD_SD_CLK, 0)    # IOMUXC_GPIO_SD_B0_01_USDHC1_CLK
+    iomuxc_pin(0x401F81C4, 0x0, 0, 0, 0x401F83B4, PAD_SD_DATA, 0)   # IOMUXC_GPIO_SD_B0_02_USDHC1_DATA0
+    iomuxc_pin(0x401F81C8, 0x0, 0, 0, 0x401F83B8, PAD_SD_DATA, 0)   # IOMUXC_GPIO_SD_B0_03_USDHC1_DATA1
+    iomuxc_pin(0x401F81CC, 0x0, 0, 0, 0x401F83BC, PAD_SD_DATA, 0)   # IOMUXC_GPIO_SD_B0_04_USDHC1_DATA2
+    iomuxc_pin(0x401F81D0, 0x0, 0, 0, 0x401F83C0, PAD_SD_DATA, 0)   # IOMUXC_GPIO_SD_B0_05_USDHC1_DATA3
+
+
+def board_storage_init() -> int32:
+    usdhc_root_hz = clk_usdhc1_root()
+    ccm_gate_on(CCM_GATE_USDHC1)
+    _sd_pins()
+    kputs("sd: uSDHC1 root clock ")
+    kput_u64(cast[uint64](usdhc_root_hz))
+    kputs(" Hz\n")
+    if usdhc_root_hz == 0:
+        kputs("sd: no clock for uSDHC1 (PLL2 off?); no /sd\n")
+        return -1
+    rc: int32 = sd_init(USDHC1_BASE, usdhc_root_hz)
+    if rc != 0:
+        kputs("sd: no usable card (error ")
+        kput_u64(cast[uint64](cast[int64](0) - cast[int64](rc)))
+        kputs(" at CMD")
+        kput_u64(cast[uint64](sd_last_cmd))
+        kputs("); no /sd\n")
+        return -1
+    kputs("sd: card of ")
+    kput_u64(sd_capacity() / 2048)
+    if sd_hc != 0:
+        kputs(" MiB (SDHC/SDXC)\n")
+    else:
+        kputs(" MiB (SDSC)\n")
+    return register_blockdev("sd0", sd_capacity(), sd_read, sd_write)
+
+
+# ---- the Teensy's default I2C and SPI buses (not used at boot) ------------
+# Wire: LPI2C1 on pins 18 (SDA) and 19 (SCL).  Returns lpi2c_init's result.
+def t41_i2c_init(hz: uint32) -> int32:
+    clk: uint32 = clk_lpi2c_root_osc()
+    ccm_gate_on(CCM_GATE_LPI2C1)
+    iomuxc_pin(0x401F80FC, 0x3, 0x401F84CC, 0x1, 0x401F82EC, PAD_I2C, 1)   # IOMUXC_GPIO_AD_B1_00_LPI2C1_SCL, Teensy pin 19
+    iomuxc_pin(0x401F8100, 0x3, 0x401F84D0, 0x1, 0x401F82F0, PAD_I2C, 1)   # IOMUXC_GPIO_AD_B1_01_LPI2C1_SDA, Teensy pin 18
+    return lpi2c_init(LPI2C1_BASE, clk, hz)
+
+
+# SPI: LPSPI4 on pins 10 (CS0), 11 (MOSI), 12 (MISO), 13 (SCK).  Pin 13 is
+# also the LED: after this the heartbeat no longer shows.
+def t41_spi_init(hz: uint32, mode: uint32) -> int32:
+    clk: uint32 = clk_lpspi_root_pll2()
+    ccm_gate_on(CCM_GATE_LPSPI4)
+    iomuxc_pin(0x401F813C, 0x3, 0x401F851C, 0x0, 0x401F832C, PAD_SPI, 0)   # IOMUXC_GPIO_B0_00_LPSPI4_PCS0, Teensy pin 10
+    iomuxc_pin(0x401F8144, 0x3, 0x401F8528, 0x0, 0x401F8334, PAD_SPI, 0)   # IOMUXC_GPIO_B0_02_LPSPI4_SDO, Teensy pin 11
+    iomuxc_pin(0x401F8140, 0x3, 0x401F8524, 0x0, 0x401F8330, PAD_SPI, 0)   # IOMUXC_GPIO_B0_01_LPSPI4_SDI, Teensy pin 12
+    iomuxc_pin(0x401F8148, 0x3, 0x401F8520, 0x0, 0x401F8338, PAD_SPI, 0)   # IOMUXC_GPIO_B0_03_LPSPI4_SCK, Teensy pin 13
+    return lpspi_init(LPSPI4_BASE, clk, hz, mode)
+
+
+def board_code_loaded(base: uint64, size: uint64):
+    icache_invalidate()
+
+
+# ---- after kernel_init: the boot report and the heartbeat -----------------
+def _mhz(name: Ptr[uint8], hz: uint32):
+    kputs(name)
+    kput_u64(cast[uint64](hz / 1000000))
+    kputs(".")
+    kput_u64(cast[uint64]((hz / 100000) % 10))
+    kputs(" MHz\n")
+
+
+def _led_main(arg: uint64) -> int64:
+    while 1 == 1:
+        gpio_toggle(LED_GPIO, LED_BIT)
+        thread_sleep(500)
+    return 0
+
+
+def board_late_init():
+    clk_read()
+    core_hz_measured = measure_core_hz(10)
+    kputs("clocks as the boot ROM left them (computed from CCM registers):\n")
+    _mhz("  PLL1 (ARM)  ", clk_freq[F_PLL1])
+    _mhz("  PLL2 (SYS)  ", clk_freq[F_PLL2])
+    _mhz("  PLL3 (USB1) ", clk_freq[F_PLL3])
+    _mhz("  core/AHB    ", clk_freq[F_CORE])
+    _mhz("  IPG         ", clk_freq[F_IPG])
+    _mhz("  PERCLK      ", clk_freq[F_PERCLK])
+    _mhz("  FlexSPI     ", clk_freq[F_FLEXSPI])
+    _mhz("  LPUART root ", clk_freq[F_UART])
+    _mhz("  uSDHC1 root ", clk_freq[F_USDHC1])
+    _mhz("core clock measured (DWT cycles per SysTick ms): ", core_hz_measured)
+    kputs("SYST_CALIB ")
+    kput_hex32(mmio_read32(SYST_CALIB))
+    kputs("  FlexRAM GPR17 ")
+    kput_hex32(reg_rd(IOMUXC_GPR_BASE + IOMUXC_GPR_GPR17))
+    kputs(" GPR16 ")
+    kput_hex32(reg_rd(IOMUXC_GPR_BASE + IOMUXC_GPR_GPR16))
+    kputs(" GPR14 ")
+    kput_hex32(reg_rd(IOMUXC_GPR_BASE + IOMUXC_GPR_GPR14))
+    kputs("\n")
+    thread_create("led", cast[uint64](&_led_main), 0, 6, 1024, 0)
+
+
+# hackos_exit(code): code 0 resets (the `halt` program ends a session that
+# way, and the board comes back up).  Any other code is a fatal error: the
+# report is on the console, and the LED repeats `code` short flashes
+# (at most 9) and a pause, forever, without resetting.
+def board_halt(code: uint32):
+    lpuart_flush(LPUART6_BASE)
+    if code == 0:
+        return
+    n: uint32 = code
+    if n > 9:
+        n = 9
+    while 1 == 1:
+        i: uint32 = 0
+        while i < n:
+            gpio_set(LED_GPIO, LED_BIT)
+            delay_us(150000)
+            gpio_clear(LED_GPIO, LED_BIT)
+            delay_us(250000)
+            i = i + 1
+        delay_us(1500000)

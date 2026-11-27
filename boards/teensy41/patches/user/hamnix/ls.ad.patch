@@ -1,0 +1,34 @@
+HackOS teensy41 size patch to user/hamnix/ls.ad (build/teensy41/root only).
+
+Reason: the directory-listing buffer is 64 KiB of static data, which makes
+`ls` an 80 KiB process.  16 KiB (LISTBUF bounds every use; a longer listing
+is reported as truncated, as before).
+
+--- a/user/hamnix/ls.ad
++++ b/user/hamnix/ls.ad
+@@ -47,7 +47,7 @@
+ # undercount. Same class as the hamsh argv/glob caps fixed 2026-07-28. 64 KiB
+ # holds ~8000 short names, and a FULL buffer is now reported on stderr with a
+ # nonzero exit rather than passed off as a complete listing.
+-LISTBUF:  uint64 = 65536
++LISTBUF:  uint64 = 16384
+ 
+ 
+ def strlen_u8(s: Ptr[uint8]) -> uint64:
+@@ -77,7 +77,7 @@
+ 
+ 
+ # BSS scratch buffers — Adder quirks: module-scope BSS only.
+-ls_buf: Array[65536, uint8]   # LISTBUF
++ls_buf: Array[16384, uint8]   # LISTBUF
+ ls_modebuf: Array[12, uint8]
+ 
+ 
+@@ -208,6 +208,6 @@
+         # The listing filled the buffer, so entries past it were never read.
+         # Say so and fail — a truncated listing reported as success is how a
+         # user (or a script) concludes a directory is smaller than it is.
+-        write_str(2, "ls: listing TRUNCATED at 65536 bytes — output is INCOMPLETE\n")
++        write_str(2, "ls: listing TRUNCATED at 16384 bytes — output is INCOMPLETE\n")
+         return 1
+     return 0

@@ -1,0 +1,55 @@
+NXP MCUXpresso SDK device files for the i.MX RT1062 -- third-party, unmodified.
+
+Upstream:   https://github.com/nxp-mcuxpresso/legacy-mcux-sdk (the repository
+            formerly nxp-mcuxpresso/mcux-sdk; archived by NXP, read-only)
+Commit:     8a289764d763ad06e0c3a05c885644ed98b970af (2025-10-31, branch main)
+Fetched:    2026-11-26, single files from raw.githubusercontent.com
+Licence:    BSD-3-Clause, Copyright NXP (and Freescale): every file below
+            carries `SPDX-License-Identifier: BSD-3-Clause` in its header,
+            and the SDK's SW-Content-Register.txt lists devices/<device>/
+            ("SDK SoC files") and devices/<device>/drivers ("SDK Peripheral
+            Driver") as BSD-3-Clause with licence file COPYING-BSD-3, which
+            is LICENSE here.  (The repository's top-level LICENSE is NXP's
+            proprietary LA_OPT agreement; it does not apply to these files
+            and was not taken.)  BSD-3-Clause code may be combined with an
+            AGPL-3.0-or-later work if its notices are kept.  The usual
+            reading, not legal advice.
+
+How HackOS uses them: as DATA.  Nothing here is compiled or linked into an
+image.  HackOS's drivers are Adder (soc/imxrt/, soc/imxrt1062/,
+boards/teensy41/); the scripts in tests/imxrt/ read these files as text and
+check every register address, offset, bit mask, interrupt number, pin-mux
+tuple and clock gate the Adder code uses against them, and check the boot
+header against the structures defined here.
+
+Files taken, byte for byte (sha256 below; tests/imxrt/run_all.sh verifies them):
+903d56aa5dd427d560106b22a196807bc49ed675ddedce3edaa0b8bb2881e9c2  LICENSE
+1ee70ed9eb7f3a75ed89943dd799314e8330538f54c6990ea7d9cae96fd263aa  MIMXRT1062.h
+631b8f79610486e331de149ab9b5be563061634371ea73577a7a6147c1b1ca40  system_MIMXRT1062.c
+f5407a4cb8f44ce1cdd313f4be9ea0e3c68a2967fbd379a7675e4b9ae857ccd8  fsl_iomuxc.h
+5b6f05d72e3e323277c80a8f8f9854d1716f16e998eb118480b64a02f03b179b  fsl_clock.h
+c862bc4a4636cbf679d541f65bf51a0465d463c9ef9720e03f82159fcf57cb43  fsl_flexspi_nor_boot.h
+bdb3d0c3aa603abf116316ec8918ed88dedeac7fe34be42c54ee1d337cba774a  evkmimxrt1060_flexspi_nor_config.h
+6856893c8f3bf8ca3f05c7934e84ca4320f6f0144487aa528b625f30d3ac05b1  MIMXRT1062xxxxx_flexspi_nor.ld
+
+Paths upstream: devices/MIMXRT1062/{MIMXRT1062.h, system_MIMXRT1062.c},
+devices/MIMXRT1062/drivers/{fsl_iomuxc.h, fsl_clock.h},
+devices/MIMXRT1062/xip/fsl_flexspi_nor_boot.h,
+boards/evkmimxrt1060/xip/evkmimxrt1060_flexspi_nor_config.h,
+devices/MIMXRT1062/gcc/MIMXRT1062xxxxx_flexspi_nor.ld, licenses/COPYING-BSD-3.
+
+Used for: MIMXRT1062.h (register layouts, masks, base addresses, IRQ
+numbers, field value documentation), fsl_iomuxc.h (pin-mux tuples),
+fsl_clock.h (clock-gate encoding), fsl_flexspi_nor_boot.h and
+evkmimxrt1060_flexspi_nor_config.h (IVT, boot data and FCB layouts),
+system_MIMXRT1062.c (what SystemInit does; soc/imxrt1062/soc.ad follows its
+order), MIMXRT1062xxxxx_flexspi_nor.ld (evidence that OCRAM2 and FlexRAM
+OCRAM are one contiguous range; read, not used).
+
+Not taken: the RT1176 counterparts (MIMXRT1176_cm7.h is 5.3 MB).  They were
+fetched from the same commit into a scratch directory to compare the shared
+IP blocks (tests/imxrt/check_regs.py --compare); the result is recorded in
+docs/boards/teensy41.md.  sha256 of the files read:
+  d9256970a9ddaaa3e5732bd231f75703450a35cda600a4244ad726d31b547bc3  devices/MIMXRT1176/MIMXRT1176_cm7.h
+  7d588de35a13f17be5dddf1d27453feddb70577282ea25ac95e4de9cb87caf06  devices/MIMXRT1176/drivers/fsl_iomuxc.h
+  c0f99f09b0a5e13648ddd1a591902700e6c1889efaab81056877da298963929a  devices/MIMXRT1176/drivers/fsl_clock.h

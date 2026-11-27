@@ -100,3 +100,22 @@ def clock_gates(path):
             raise ValueError('%s: index %d but CCGR%d' % (m.group(1), idx, ccgr))
         out[m.group(1)] = (ccgr, cg * 2)
     return out
+
+
+def field_doc(header, name):
+    """The value list NXP documents for field `name` (e.g. CCM_CBCMR_LPSPI_CLK_SEL):
+    {value: text} from the `/*! FIELD ... */` comment that follows its _MASK
+    and _SHIFT macros."""
+    t = header.text
+    i = t.find('#define %s_MASK' % name)
+    if i < 0:
+        raise KeyError(name)
+    end = t.find('#define %s(x)' % name, i)
+    j = t.find('/*! ', i, end if end > 0 else i + 4000)
+    if j < 0:
+        return {}
+    body = t[j:t.find('*/', j)]
+    out = {}
+    for m in re.finditer(r'\*\s+0b([01]+)\.\.(.*)', body):
+        out[int(m.group(1), 2)] = m.group(2).strip()
+    return out

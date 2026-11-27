@@ -1,0 +1,466 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- NXP i.MX RT1062 specifics: addresses, interrupt numbers, clock
+# gates and roots (CCM, CCM_ANALOG), FlexRAM, watchdogs, caches, NVIC reset.
+#
+# UNTESTED ON HARDWARE.  Every address, offset, mask and gate below is
+# checked by tests/imxrt/check_regs.py against NXP's MIMXRT1062.h and
+# fsl_clock.h (third_party/nxp-mcux-rt1062/); the clock arithmetic is
+# tested with register values whose frequencies are known (the reset values,
+# PJRC's 600 MHz set-up) in the driver test image.
+#
+# Clocks: HackOS does NOT set the core clock or the PLLs.  It runs on what
+# the boot ROM left, and every peripheral it uses takes a root it chooses:
+# LPUART and LPI2C from the 24 MHz oscillator (independent of the PLLs),
+# SysTick from its 100 kHz reference.  Only the uSDHC (PLL2 PFD0, set to
+# 396 MHz as SdFat does on the Teensy 4.1) and LPSPI (PLL2) depend on a PLL
+# running, and the clock report says whether it is.  The report also shows
+# what the ROM left for the core, which is what a first boot should tell us.
+#
+# The uSDHC, LPI2C, LPSPI and GPIO2..4 IP blocks are the same in the RT1170
+# family; the CCM is not (RT1170: CLOCK_ROOTn registers and LPCG gates), nor
+# the IOMUXC pad names and pad-control bits, nor the FlexRAM controls.  That
+# is why this file is per SoC and soc/imxrt/ is not.
+
+from soc.imxrt.reg import reg_rd, reg_wr, reg_rd16, reg_wr16
+from soc.imxrt.delay import delay_init, DWT_CYCCNT
+
+LPUART6_BASE: uint64 = 0x40198000
+GPIO2_BASE: uint64 = 0x401BC000
+LPI2C1_BASE: uint64 = 0x403F0000
+LPSPI4_BASE: uint64 = 0x403A0000
+USDHC1_BASE: uint64 = 0x402C0000
+CCM_BASE: uint64 = 0x400FC000
+CCM_ANALOG_BASE: uint64 = 0x400D8000
+IOMUXC_BASE: uint64 = 0x401F8000
+IOMUXC_GPR_BASE: uint64 = 0x400AC000
+WDOG1_BASE: uint64 = 0x400B8000
+WDOG2_BASE: uint64 = 0x400D0000
+RTWDOG_BASE: uint64 = 0x400BC000
+
+LPUART6_IRQ: uint32 = 25
+LPI2C1_IRQ: uint32 = 28
+LPSPI4_IRQ: uint32 = 35
+USDHC1_IRQ: uint32 = 110
+IMXRT1062_IRQS: uint32 = 158        # unchecked: NUMBER_OF_INT_VECTORS 174 - 16 (checked separately)
+
+IMXRT1062_MAX_MHZ: uint32 = 600     # unchecked: data sheet, highest core clock of the part
+
+# CCM
+CCM_CACRR: uint64 = 0x10
+CCM_CBCDR: uint64 = 0x14
+CCM_CBCMR: uint64 = 0x18
+CCM_CSCMR1: uint64 = 0x1C
+CCM_CSCDR1: uint64 = 0x24
+CCM_CSCDR2: uint64 = 0x38
+CCM_CCGR0: uint64 = 0x68
+CCM_CACRR_ARM_PODF: uint32 = 0x7
+CCM_CBCDR_IPG_PODF: uint32 = 0x300
+CCM_CBCDR_IPG_PODF_SHIFT: uint32 = 8
+CCM_CBCDR_AHB_PODF: uint32 = 0x1C00
+CCM_CBCDR_AHB_PODF_SHIFT: uint32 = 10
+CCM_CBCDR_PERIPH_CLK_SEL: uint32 = 0x2000000
+CCM_CBCDR_PERIPH_CLK2_PODF: uint32 = 0x38000000
+CCM_CBCDR_PERIPH_CLK2_PODF_SHIFT: uint32 = 27
+CCM_CBCMR_LPSPI_CLK_SEL: uint32 = 0x30
+CCM_CBCMR_LPSPI_CLK_SEL_SHIFT: uint32 = 4
+CCM_CBCMR_PERIPH_CLK2_SEL: uint32 = 0x3000
+CCM_CBCMR_PERIPH_CLK2_SEL_SHIFT: uint32 = 12
+CCM_CBCMR_PRE_PERIPH_CLK_SEL: uint32 = 0xC0000
+CCM_CBCMR_PRE_PERIPH_CLK_SEL_SHIFT: uint32 = 18
+CCM_CBCMR_LPSPI_PODF: uint32 = 0x1C000000
+CCM_CBCMR_LPSPI_PODF_SHIFT: uint32 = 26
+CCM_CSCMR1_PERCLK_PODF: uint32 = 0x3F
+CCM_CSCMR1_PERCLK_CLK_SEL: uint32 = 0x40
+CCM_CSCMR1_USDHC1_CLK_SEL: uint32 = 0x10000
+CCM_CSCMR1_FLEXSPI_PODF: uint32 = 0x3800000
+CCM_CSCMR1_FLEXSPI_PODF_SHIFT: uint32 = 23
+CCM_CSCMR1_FLEXSPI_CLK_SEL: uint32 = 0x60000000
+CCM_CSCMR1_FLEXSPI_CLK_SEL_SHIFT: uint32 = 29
+CCM_CSCDR1_UART_CLK_PODF: uint32 = 0x3F
+CCM_CSCDR1_UART_CLK_SEL: uint32 = 0x40
+CCM_CSCDR1_USDHC1_PODF: uint32 = 0x3800
+CCM_CSCDR1_USDHC1_PODF_SHIFT: uint32 = 11
+CCM_CSCDR2_LPI2C_CLK_SEL: uint32 = 0x40000
+CCM_CSCDR2_LPI2C_CLK_PODF: uint32 = 0x1F80000
+CCM_CSCDR2_LPI2C_CLK_PODF_SHIFT: uint32 = 19
+
+# CCM_ANALOG
+CCM_ANALOG_PLL_ARM: uint64 = 0x00
+CCM_ANALOG_PLL_USB1: uint64 = 0x10
+CCM_ANALOG_PLL_SYS: uint64 = 0x30
+CCM_ANALOG_PLL_SYS_NUM: uint64 = 0x50
+CCM_ANALOG_PLL_SYS_DENOM: uint64 = 0x60
+CCM_ANALOG_PFD_480: uint64 = 0xF0
+CCM_ANALOG_PFD_528: uint64 = 0x100
+CCM_ANALOG_PFD_528_SET: uint64 = 0x104
+CCM_ANALOG_PFD_528_CLR: uint64 = 0x108
+CCM_ANALOG_PLL_ARM_DIV_SELECT: uint32 = 0x7F
+CCM_ANALOG_PLL_ARM_POWERDOWN: uint32 = 0x1000
+CCM_ANALOG_PLL_ARM_ENABLE: uint32 = 0x2000
+CCM_ANALOG_PLL_ARM_BYPASS: uint32 = 0x10000
+CCM_ANALOG_PLL_ARM_LOCK: uint32 = 0x80000000
+CCM_ANALOG_PLL_SYS_DIV_SELECT: uint32 = 0x1
+CCM_ANALOG_PLL_SYS_POWERDOWN: uint32 = 0x1000
+CCM_ANALOG_PLL_SYS_BYPASS: uint32 = 0x10000
+CCM_ANALOG_PLL_SYS_LOCK: uint32 = 0x80000000
+CCM_ANALOG_PLL_USB1_DIV_SELECT: uint32 = 0x2
+CCM_ANALOG_PLL_USB1_POWER: uint32 = 0x1000
+CCM_ANALOG_PLL_USB1_BYPASS: uint32 = 0x10000
+CCM_ANALOG_PLL_USB1_LOCK: uint32 = 0x80000000
+CCM_ANALOG_PFD_528_PFD0_FRAC: uint32 = 0x3F
+CCM_ANALOG_PFD_528_PFD0_CLKGATE: uint32 = 0x80
+
+# Clock gates: (CCGR index << 8) | bit position of the 2-bit field, the
+# encoding of NXP's clock_ip_name_t (fsl_clock.h); the comment names it.
+CCM_GATE_LPUART6: uint32 = 0x0306   # kCLOCK_Lpuart6
+CCM_GATE_GPIO2: uint32 = 0x001E     # kCLOCK_Gpio2
+CCM_GATE_LPI2C1: uint32 = 0x0206    # kCLOCK_Lpi2c1
+CCM_GATE_LPSPI4: uint32 = 0x0106    # kCLOCK_Lpspi4
+CCM_GATE_USDHC1: uint32 = 0x0602    # kCLOCK_Usdhc1
+CCM_GATE_IOMUXC: uint32 = 0x0402    # kCLOCK_Iomuxc
+CCM_GATE_IOMUXC_GPR: uint32 = 0x0404   # kCLOCK_IomuxcGpr
+
+# IOMUXC_GPR: FlexRAM bank configuration (read back for the boot report;
+# written by boards/teensy41/vectors.S before the stack is used)
+IOMUXC_GPR_GPR14: uint64 = 0x38
+IOMUXC_GPR_GPR16: uint64 = 0x40
+IOMUXC_GPR_GPR17: uint64 = 0x44
+IOMUXC_GPR_GPR16_FLEXRAM_BANK_CFG_SEL: uint32 = 0x4
+
+# Watchdogs (WDOG1/2 registers are 16 bits wide)
+WDOG_WCR: uint64 = 0x0
+WDOG_WMCR: uint64 = 0x8
+WDOG_WCR_WDE: uint32 = 0x4
+WDOG_WMCR_PDE: uint32 = 0x1
+RTWDOG_CS: uint64 = 0x0
+RTWDOG_CNT: uint64 = 0x4
+RTWDOG_TOVAL: uint64 = 0x8
+RTWDOG_CS_EN: uint32 = 0x80
+RTWDOG_CS_UPDATE: uint32 = 0x20
+RTWDOG_CS_CMD32EN: uint32 = 0x2000
+
+# Cortex-M7 system control (architecture, not in the device header)
+SCB_CCR: uint64 = 0xE000ED14        # unchecked: ARMv7-M
+SCB_CCR_IC: uint32 = 0x20000        # unchecked: ARMv7-M, instruction cache enable
+SCB_ICIALLU: uint64 = 0xE000EF50    # unchecked: ARMv7-M, invalidate I-cache
+SYST_CSR: uint64 = 0xE000E010       # unchecked: ARMv7-M
+SYST_RVR: uint64 = 0xE000E014       # unchecked: ARMv7-M
+SYST_CVR: uint64 = 0xE000E018       # unchecked: ARMv7-M
+SYST_CALIB: uint64 = 0xE000E01C     # unchecked: ARMv7-M
+NVIC_ICER0: uint64 = 0xE000E180     # unchecked: ARMv7-M
+NVIC_ICPR0: uint64 = 0xE000E280     # unchecked: ARMv7-M
+NVIC_ISER0: uint64 = 0xE000E100     # unchecked: ARMv7-M
+NVIC_IPR0: uint64 = 0xE000E400      # unchecked: ARMv7-M
+
+OSC_HZ: uint32 = 24000000           # unchecked: the Teensy 4.1's 24 MHz crystal (RM: osc_clk)
+
+
+def ccm_gate_on(gate: uint32):
+    a: uint64 = CCM_BASE + CCM_CCGR0 + cast[uint64](gate >> 8) * 4
+    reg_wr(a, reg_rd(a) | (cast[uint32](3) << (gate & 0xFF)))
+
+
+def ccm_gate_off(gate: uint32):
+    a: uint64 = CCM_BASE + CCM_CCGR0 + cast[uint64](gate >> 8) * 4
+    reg_wr(a, reg_rd(a) & (0xFFFFFFFF ^ (cast[uint32](3) << (gate & 0xFF))))
+
+
+def nvic_enable(irq: uint32, prio: uint32):
+    cast[Ptr[volatile uint8]](NVIC_IPR0 + cast[uint64](irq))[0] = cast[uint8](prio)
+    reg_wr(NVIC_ISER0 + cast[uint64](irq / 32) * 4, cast[uint32](1) << (irq % 32))
+
+
+# ---- clock tree arithmetic (pure: register values in, frequencies out) ----
+# Register indices of clk_regs / the r argument:
+CLK_CACRR: uint32 = 0           # unchecked: index into the register snapshot
+CLK_CBCDR: uint32 = 1           # unchecked: index
+CLK_CBCMR: uint32 = 2           # unchecked: index
+CLK_CSCMR1: uint32 = 3          # unchecked: index
+CLK_CSCDR1: uint32 = 4          # unchecked: index
+CLK_CSCDR2: uint32 = 5          # unchecked: index
+CLK_PLL_ARM: uint32 = 6         # unchecked: index
+CLK_PLL_SYS: uint32 = 7         # unchecked: index
+CLK_PLL_SYS_NUM: uint32 = 8     # unchecked: index
+CLK_PLL_SYS_DENOM: uint32 = 9   # unchecked: index
+CLK_PLL_USB1: uint32 = 10       # unchecked: index
+CLK_PFD_480: uint32 = 11        # unchecked: index
+CLK_PFD_528: uint32 = 12        # unchecked: index
+CLK_NREGS: uint32 = 13          # unchecked: count
+# Frequencies computed into f[]:
+F_PLL1: uint32 = 0              # unchecked: index into the result
+F_PLL2: uint32 = 1              # unchecked: index
+F_PLL3: uint32 = 2              # unchecked: index
+F_CORE: uint32 = 3              # unchecked: index (core = AHB_CLK_ROOT)
+F_IPG: uint32 = 4               # unchecked: index
+F_PERCLK: uint32 = 5            # unchecked: index
+F_UART: uint32 = 6              # unchecked: index
+F_LPI2C: uint32 = 7             # unchecked: index
+F_LPSPI: uint32 = 8             # unchecked: index
+F_USDHC1: uint32 = 9            # unchecked: index
+F_FLEXSPI: uint32 = 10          # unchecked: index
+F_N: uint32 = 11                # unchecked: count
+
+clk_regs: Array[13, uint32]
+clk_freq: Array[11, uint32]
+
+
+def _fld(v: uint32, mask: uint32, shift: uint32) -> uint32:
+    return (v & mask) >> shift
+
+
+# PFD output: pll * 18 / frac, frac = 6 bits at 8*n (n = 0..3); a gated PFD
+# (bit 7 of its byte) gives 0.
+def clk_pfd(pll: uint32, pfd_reg: uint32, n: uint32) -> uint32:
+    b: uint32 = (pfd_reg >> (8 * n)) & 0xFF
+    frac: uint32 = b & 0x3F
+    if (b & 0x80) != 0 or frac == 0:
+        return 0
+    return cast[uint32](cast[uint64](pll) * 18 / cast[uint64](frac))
+
+
+# Frequencies (Hz) from a register snapshot r[CLK_NREGS] into f[F_N].
+# The mux encodings are NXP's (MIMXRT1062.h field comments, fsl_clock.c);
+# tests/imxrt/check_regs.py prints those comments next to this decoding.
+def clk_compute(r: Ptr[uint32], f: Ptr[uint32]):
+    # PLL1 (ARM): Fin * DIV_SELECT / 2
+    pa: uint32 = r[CLK_PLL_ARM]
+    if (pa & CCM_ANALOG_PLL_ARM_POWERDOWN) != 0:
+        f[F_PLL1] = 0
+    elif (pa & CCM_ANALOG_PLL_ARM_BYPASS) != 0:
+        f[F_PLL1] = OSC_HZ
+    else:
+        f[F_PLL1] = cast[uint32](cast[uint64](OSC_HZ) * cast[uint64](pa & CCM_ANALOG_PLL_ARM_DIV_SELECT) / 2)
+    # PLL2 (SYS): Fin * (20 or 22 + NUM / DENOM)
+    ps: uint32 = r[CLK_PLL_SYS]
+    if (ps & CCM_ANALOG_PLL_SYS_POWERDOWN) != 0:
+        f[F_PLL2] = 0
+    elif (ps & CCM_ANALOG_PLL_SYS_BYPASS) != 0:
+        f[F_PLL2] = OSC_HZ
+    else:
+        mul: uint64 = 20
+        if (ps & CCM_ANALOG_PLL_SYS_DIV_SELECT) != 0:
+            mul = 22
+        fr: uint64 = 0
+        if r[CLK_PLL_SYS_DENOM] != 0:
+            fr = cast[uint64](OSC_HZ) * cast[uint64](r[CLK_PLL_SYS_NUM] & 0x3FFFFFFF) / cast[uint64](r[CLK_PLL_SYS_DENOM] & 0x3FFFFFFF)
+        f[F_PLL2] = cast[uint32](cast[uint64](OSC_HZ) * mul + fr)
+    # PLL3 (USB1): POWER is active high on this PLL
+    pu: uint32 = r[CLK_PLL_USB1]
+    if (pu & CCM_ANALOG_PLL_USB1_POWER) == 0:
+        f[F_PLL3] = 0
+    elif (pu & CCM_ANALOG_PLL_USB1_BYPASS) != 0:
+        f[F_PLL3] = OSC_HZ
+    elif (pu & CCM_ANALOG_PLL_USB1_DIV_SELECT) != 0:
+        f[F_PLL3] = OSC_HZ * 22
+    else:
+        f[F_PLL3] = OSC_HZ * 20
+    cbcdr: uint32 = r[CLK_CBCDR]
+    cbcmr: uint32 = r[CLK_CBCMR]
+    cscmr1: uint32 = r[CLK_CSCMR1]
+    cscdr1: uint32 = r[CLK_CSCDR1]
+    cscdr2: uint32 = r[CLK_CSCDR2]
+    pfd528: uint32 = r[CLK_PFD_528]
+    pfd480: uint32 = r[CLK_PFD_480]
+    # periph_clk
+    periph: uint32 = 0
+    if (cbcdr & CCM_CBCDR_PERIPH_CLK_SEL) != 0:
+        c2: uint32 = _fld(cbcmr, CCM_CBCMR_PERIPH_CLK2_SEL, CCM_CBCMR_PERIPH_CLK2_SEL_SHIFT)
+        if c2 == 0:
+            periph = f[F_PLL3]                  # pll3_sw_clk
+        elif c2 == 1:
+            periph = OSC_HZ
+        elif c2 == 2:
+            periph = f[F_PLL2]                  # pll2_bypass_clk (fsl_clock.c: PLL2's frequency)
+        periph = periph / (_fld(cbcdr, CCM_CBCDR_PERIPH_CLK2_PODF, CCM_CBCDR_PERIPH_CLK2_PODF_SHIFT) + 1)
+    else:
+        pp: uint32 = _fld(cbcmr, CCM_CBCMR_PRE_PERIPH_CLK_SEL, CCM_CBCMR_PRE_PERIPH_CLK_SEL_SHIFT)
+        if pp == 0:
+            periph = f[F_PLL2]
+        elif pp == 1:
+            periph = clk_pfd(f[F_PLL2], pfd528, 2)
+        elif pp == 2:
+            periph = clk_pfd(f[F_PLL2], pfd528, 0)
+        else:
+            periph = f[F_PLL1] / ((r[CLK_CACRR] & CCM_CACRR_ARM_PODF) + 1)
+    f[F_CORE] = periph / (_fld(cbcdr, CCM_CBCDR_AHB_PODF, CCM_CBCDR_AHB_PODF_SHIFT) + 1)
+    f[F_IPG] = f[F_CORE] / (_fld(cbcdr, CCM_CBCDR_IPG_PODF, CCM_CBCDR_IPG_PODF_SHIFT) + 1)
+    pc: uint32 = f[F_IPG]
+    if (cscmr1 & CCM_CSCMR1_PERCLK_CLK_SEL) != 0:
+        pc = OSC_HZ
+    f[F_PERCLK] = pc / ((cscmr1 & CCM_CSCMR1_PERCLK_PODF) + 1)
+    u: uint32 = f[F_PLL3] / 6                   # pll3_80m
+    if (cscdr1 & CCM_CSCDR1_UART_CLK_SEL) != 0:
+        u = OSC_HZ
+    f[F_UART] = u / ((cscdr1 & CCM_CSCDR1_UART_CLK_PODF) + 1)
+    i2: uint32 = f[F_PLL3] / 8                  # pll3_60m
+    if (cscdr2 & CCM_CSCDR2_LPI2C_CLK_SEL) != 0:
+        i2 = OSC_HZ
+    f[F_LPI2C] = i2 / (_fld(cscdr2, CCM_CSCDR2_LPI2C_CLK_PODF, CCM_CSCDR2_LPI2C_CLK_PODF_SHIFT) + 1)
+    ls: uint32 = _fld(cbcmr, CCM_CBCMR_LPSPI_CLK_SEL, CCM_CBCMR_LPSPI_CLK_SEL_SHIFT)
+    sp: uint32 = 0
+    if ls == 0:
+        sp = clk_pfd(f[F_PLL3], pfd480, 1)
+    elif ls == 1:
+        sp = clk_pfd(f[F_PLL3], pfd480, 0)
+    elif ls == 2:
+        sp = f[F_PLL2]
+    else:
+        sp = clk_pfd(f[F_PLL2], pfd528, 2)
+    f[F_LPSPI] = sp / (_fld(cbcmr, CCM_CBCMR_LPSPI_PODF, CCM_CBCMR_LPSPI_PODF_SHIFT) + 1)
+    sd: uint32 = clk_pfd(f[F_PLL2], pfd528, 2)
+    if (cscmr1 & CCM_CSCMR1_USDHC1_CLK_SEL) != 0:
+        sd = clk_pfd(f[F_PLL2], pfd528, 0)
+    f[F_USDHC1] = sd / (_fld(cscdr1, CCM_CSCDR1_USDHC1_PODF, CCM_CSCDR1_USDHC1_PODF_SHIFT) + 1)
+    fs: uint32 = _fld(cscmr1, CCM_CSCMR1_FLEXSPI_CLK_SEL, CCM_CSCMR1_FLEXSPI_CLK_SEL_SHIFT)
+    fx: uint32 = 0                              # 0: semc_clk_root_pre, not computed here
+    if fs == 1:
+        fx = f[F_PLL3]
+    elif fs == 2:
+        fx = clk_pfd(f[F_PLL2], pfd528, 2)
+    elif fs == 3:
+        fx = clk_pfd(f[F_PLL3], pfd480, 0)
+    f[F_FLEXSPI] = fx / (_fld(cscmr1, CCM_CSCMR1_FLEXSPI_PODF, CCM_CSCMR1_FLEXSPI_PODF_SHIFT) + 1)
+
+
+# Snapshot the clock registers and compute clk_freq.
+def clk_read():
+    clk_regs[CLK_CACRR] = reg_rd(CCM_BASE + CCM_CACRR)
+    clk_regs[CLK_CBCDR] = reg_rd(CCM_BASE + CCM_CBCDR)
+    clk_regs[CLK_CBCMR] = reg_rd(CCM_BASE + CCM_CBCMR)
+    clk_regs[CLK_CSCMR1] = reg_rd(CCM_BASE + CCM_CSCMR1)
+    clk_regs[CLK_CSCDR1] = reg_rd(CCM_BASE + CCM_CSCDR1)
+    clk_regs[CLK_CSCDR2] = reg_rd(CCM_BASE + CCM_CSCDR2)
+    clk_regs[CLK_PLL_ARM] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PLL_ARM)
+    clk_regs[CLK_PLL_SYS] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PLL_SYS)
+    clk_regs[CLK_PLL_SYS_NUM] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PLL_SYS_NUM)
+    clk_regs[CLK_PLL_SYS_DENOM] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PLL_SYS_DENOM)
+    clk_regs[CLK_PLL_USB1] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PLL_USB1)
+    clk_regs[CLK_PFD_480] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PFD_480)
+    clk_regs[CLK_PFD_528] = reg_rd(CCM_ANALOG_BASE + CCM_ANALOG_PFD_528)
+    clk_compute(&clk_regs[0], &clk_freq[0])
+
+
+# ---- clock roots HackOS sets ----------------------------------------------
+# Each returns the root's frequency as computed from the registers afterwards.
+
+# LPUART: osc_clk / 1 = 24 MHz.
+def clk_uart_root_osc() -> uint32:
+    v: uint32 = reg_rd(CCM_BASE + CCM_CSCDR1) & (0xFFFFFFFF ^ (CCM_CSCDR1_UART_CLK_PODF | CCM_CSCDR1_UART_CLK_SEL))
+    reg_wr(CCM_BASE + CCM_CSCDR1, v | CCM_CSCDR1_UART_CLK_SEL)
+    clk_read()
+    return clk_freq[F_UART]
+
+
+# LPI2C: osc_clk / 1 = 24 MHz.
+def clk_lpi2c_root_osc() -> uint32:
+    ccm_gate_off(CCM_GATE_LPI2C1)
+    v: uint32 = reg_rd(CCM_BASE + CCM_CSCDR2) & (0xFFFFFFFF ^ (CCM_CSCDR2_LPI2C_CLK_PODF | CCM_CSCDR2_LPI2C_CLK_SEL))
+    reg_wr(CCM_BASE + CCM_CSCDR2, v | CCM_CSCDR2_LPI2C_CLK_SEL)
+    clk_read()
+    return clk_freq[F_LPI2C]
+
+
+# LPSPI: PLL2 / 8 (66 MHz when PLL2 runs at 528 MHz).
+def clk_lpspi_root_pll2() -> uint32:
+    ccm_gate_off(CCM_GATE_LPSPI4)
+    v: uint32 = reg_rd(CCM_BASE + CCM_CBCMR) & (0xFFFFFFFF ^ (CCM_CBCMR_LPSPI_CLK_SEL | CCM_CBCMR_LPSPI_PODF))
+    reg_wr(CCM_BASE + CCM_CBCMR, v | (2 << CCM_CBCMR_LPSPI_CLK_SEL_SHIFT) | (7 << CCM_CBCMR_LPSPI_PODF_SHIFT))
+    clk_read()
+    return clk_freq[F_LPSPI]
+
+
+# uSDHC1: PLL2 PFD0 set to 528 * 18 / 24 = 396 MHz, divided by 2 = 198 MHz
+# (the set-up SdFat uses on the Teensy 4.1).  The PFD is gated while its
+# fraction changes; nothing else of HackOS uses PFD0.
+def clk_usdhc1_root() -> uint32:
+    ccm_gate_off(CCM_GATE_USDHC1)
+    a: uint64 = CCM_ANALOG_BASE
+    reg_wr(a + CCM_ANALOG_PFD_528_SET, CCM_ANALOG_PFD_528_PFD0_CLKGATE)
+    reg_wr(a + CCM_ANALOG_PFD_528_CLR, CCM_ANALOG_PFD_528_PFD0_FRAC)
+    reg_wr(a + CCM_ANALOG_PFD_528_SET, 24)
+    reg_wr(a + CCM_ANALOG_PFD_528_CLR, CCM_ANALOG_PFD_528_PFD0_CLKGATE)
+    reg_wr(CCM_BASE + CCM_CSCMR1, reg_rd(CCM_BASE + CCM_CSCMR1) | CCM_CSCMR1_USDHC1_CLK_SEL)
+    v: uint32 = reg_rd(CCM_BASE + CCM_CSCDR1) & (0xFFFFFFFF ^ CCM_CSCDR1_USDHC1_PODF)
+    reg_wr(CCM_BASE + CCM_CSCDR1, v | (1 << CCM_CSCDR1_USDHC1_PODF_SHIFT))
+    clk_read()
+    return clk_freq[F_USDHC1]
+
+
+# ---- system set-up --------------------------------------------------------
+# What NXP's SystemInit (system_MIMXRT1062.c) does that HackOS needs, in its
+# order: watchdog power-down counters off (WDOG1/2 would otherwise assert
+# WDOG_B 16 s after reset), the three watchdogs disabled, SysTick stopped
+# (the ROM may leave it running), and the instruction cache on.  Also: every
+# NVIC interrupt disabled and un-pended (the ROM's own peripherals may have
+# left some), and the DWT cycle counter on (soc/imxrt/delay.ad).
+def imxrt1062_system_init():
+    reg_wr16(WDOG1_BASE + WDOG_WMCR, reg_rd16(WDOG1_BASE + WDOG_WMCR) & (0xFFFF ^ WDOG_WMCR_PDE))
+    reg_wr16(WDOG2_BASE + WDOG_WMCR, reg_rd16(WDOG2_BASE + WDOG_WMCR) & (0xFFFF ^ WDOG_WMCR_PDE))
+    if (reg_rd16(WDOG1_BASE + WDOG_WCR) & WDOG_WCR_WDE) != 0:
+        reg_wr16(WDOG1_BASE + WDOG_WCR, reg_rd16(WDOG1_BASE + WDOG_WCR) & (0xFFFF ^ WDOG_WCR_WDE))
+    if (reg_rd16(WDOG2_BASE + WDOG_WCR) & WDOG_WCR_WDE) != 0:
+        reg_wr16(WDOG2_BASE + WDOG_WCR, reg_rd16(WDOG2_BASE + WDOG_WCR) & (0xFFFF ^ WDOG_WCR_WDE))
+    if (reg_rd(RTWDOG_BASE + RTWDOG_CS) & RTWDOG_CS_CMD32EN) != 0:
+        reg_wr(RTWDOG_BASE + RTWDOG_CNT, 0xD928C520)          # update key
+    else:
+        reg_wr16(RTWDOG_BASE + RTWDOG_CNT, 0xC520)
+        reg_wr16(RTWDOG_BASE + RTWDOG_CNT, 0xD928)
+    reg_wr(RTWDOG_BASE + RTWDOG_TOVAL, 0xFFFF)
+    reg_wr(RTWDOG_BASE + RTWDOG_CS, (reg_rd(RTWDOG_BASE + RTWDOG_CS) & (0xFFFFFFFF ^ RTWDOG_CS_EN)) | RTWDOG_CS_UPDATE)
+    reg_wr(SYST_CSR, 0)
+    i: uint64 = 0
+    while i < 5:
+        reg_wr(NVIC_ICER0 + i * 4, 0xFFFFFFFF)
+        reg_wr(NVIC_ICPR0 + i * 4, 0xFFFFFFFF)
+        i = i + 1
+    delay_init(IMXRT1062_MAX_MHZ)
+    icache_enable()
+
+
+def icache_enable():
+    if (reg_rd(SCB_CCR) & SCB_CCR_IC) != 0:
+        return
+    asm_volatile("dsb\n isb")
+    reg_wr(SCB_ICIALLU, 0)
+    asm_volatile("dsb\n isb")
+    reg_wr(SCB_CCR, reg_rd(SCB_CCR) | SCB_CCR_IC)
+    asm_volatile("dsb\n isb")
+
+
+# After code was written to RAM: the instruction cache may hold what was at
+# those addresses before.  (The data cache is off, so the code is in RAM.)
+def icache_invalidate():
+    asm_volatile("dsb\n isb")
+    reg_wr(SCB_ICIALLU, 0)
+    asm_volatile("dsb\n isb")
+
+
+# Core cycles per SysTick reference period, measured over `periods` periods
+# of the 100 kHz reference (SysTick must be stopped).  With the DWT counting
+# core cycles this gives the core clock the ROM left, independently of the
+# clock registers.  Returns 0 if SysTick or the DWT does not count.
+def measure_core_hz(periods: uint32) -> uint32:
+    reg_wr(SYST_CSR, 0)
+    reg_wr(SYST_RVR, 99)                 # 1 ms of the 100 kHz reference
+    reg_wr(SYST_CVR, 0)
+    reg_wr(SYST_CSR, 1)                  # ENABLE, external reference, no interrupt
+    spins: uint32 = 0
+    while (reg_rd(SYST_CSR) & 0x10000) == 0:       # COUNTFLAG: first wrap
+        spins = spins + 1
+        if spins > 100000000:
+            reg_wr(SYST_CSR, 0)
+            return 0
+    c0: uint32 = reg_rd(DWT_CYCCNT)
+    n: uint32 = 0
+    while n < periods:
+        spins = 0
+        while (reg_rd(SYST_CSR) & 0x10000) == 0:
+            spins = spins + 1
+            if spins > 100000000:
+                reg_wr(SYST_CSR, 0)
+                return 0
+        n = n + 1
+    c1: uint32 = reg_rd(DWT_CYCCNT)
+    reg_wr(SYST_CSR, 0)
+    return cast[uint32](cast[uint64](c1 - c0) * 1000 / cast[uint64](periods))

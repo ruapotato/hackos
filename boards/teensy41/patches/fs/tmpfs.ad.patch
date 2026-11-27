@@ -1,0 +1,52 @@
+HackOS teensy41 size patch to fs/tmpfs.ad (on top of fs/tmpfs.ad.patch, which
+the committed fs/tmpfs.ad already carries).  Applied by scripts/mkroot.sh in
+build/teensy41/root only; the committed file is unchanged.
+
+Reason: the Teensy 4.1 has 1 MiB of RAM.  The table of 1024 entries is
+352 KiB, more than half of the 480 KiB of DTCM the kernel has.  128 entries
+(44 KiB); 64 chunks of 4 KiB per file, so a file is at most 256 KiB and its
+chunk-pointer table 512 bytes instead of 4 KiB.  Only constants and the one
+array length change, as in the first patch.
+
+--- a/fs/tmpfs.ad
++++ b/fs/tmpfs.ad
+@@ -230,10 +230,10 @@
+     return -1
+ 
+ 
+-TMPFS_MAX_FILES:  uint64 = 1024               # HackOS: was 8192
++TMPFS_MAX_FILES:  uint64 = 128                # HackOS teensy41: was 1024 (Hamnix 8192)
+ TMPFS_CHUNK_SIZE: uint64 = 4096               # HackOS: 4 KiB per storage chunk (was 65536)
+ TMPFS_CHUNK_ORDER: int32 = 0                  # HackOS: 2^0 pages = 4 KiB (was 4)
+-TMPFS_MAX_CHUNKS: uint64 = 512                # HackOS: max chunks per file (was 8192)
++TMPFS_MAX_CHUNKS: uint64 = 64                 # HackOS teensy41: max chunks per file (was 512; Hamnix 8192)
+ # BACKED-STORAGE cap: the highest file offset that can hold a real chunk
+ # (= CHUNK_SIZE * MAX_CHUNKS = 512 MiB). Was 64 MiB, was 16 MiB. This bounds
+ # the per-file chunk-pointer table (TMPFS_MAX_CHUNKS * 8 bytes = 64 KiB,
+@@ -253,7 +253,7 @@
+ # inside its 512 MiB pool (its CSD subsurface pool stays at low offsets, which
+ # masked the bug). Backing the whole 512 MiB pool keeps every buffer foot can
+ # allocate on the coherent DIRECT path → the content renders instead of black.
+-TMPFS_FILE_CAP:   uint64 = 2097152            # HackOS: = CHUNK_SIZE * MAX_CHUNKS (2 MiB; was 536870912)
++TMPFS_FILE_CAP:   uint64 = 262144             # HackOS teensy41: = CHUNK_SIZE * MAX_CHUNKS (256 KiB)
+ # LOGICAL-SIZE cap: the largest size ftruncate(2) may set and the largest
+ # mmap offset range a SPARSE file may span. DECOUPLED from the backed cap
+ # above because real wl_shm clients (foot) ftruncate their shm buffer POOL
+@@ -267,7 +267,7 @@
+ # ftruncates beyond a 512 MiB pool but never writes there.
+ # Without this cap, ftruncate(pool, 512 MiB) EINVAL'd and foot abort()ed
+ # before committing a single frame. 1 GiB covers any realistic wl_shm pool.
+-TMPFS_LOGICAL_CAP: uint64 = 2097152           # HackOS: no sparse band above FILE_CAP (was 1073741824)
++TMPFS_LOGICAL_CAP: uint64 = 262144            # HackOS teensy41: no sparse band above FILE_CAP
+ TMPFS_NAME_LEN:   uint64 = 256                # NUL-terminated path COMPONENT
+                                               # (Linux NAME_MAX 255 + NUL).
+                                               # Was 32 — too small for real
+@@ -385,7 +385,7 @@
+                                       # (TMPFS_NAME_LEN; Linux NAME_MAX+1)
+ 
+ 
+-tmpfs_table: Array[1024, TmpfsEntry]
++tmpfs_table: Array[128, TmpfsEntry]
+ _tmpfs_root_ready: uint64             # 0 until _tmpfs_ensure_root() has run
+ 
+ 
