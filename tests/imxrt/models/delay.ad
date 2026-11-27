@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Stand-in for soc/imxrt/delay.ad in the driver test image: a delay advances
+# the register models' clock by that many microseconds (tests/imxrt/models/).
+# Real time does not pass; a driver's time limit is a number of model
+# microseconds, so a test can tell "waited 20 ms, then gave up" exactly.
+
+from tests.imxrt.models.lpuart_model import mu_tick
+from tests.imxrt.models.lpi2c_model import mi_tick
+from tests.imxrt.models.lpspi_model import ms_tick
+
+# The names soc/imxrt/delay.ad exports besides the functions.
+DWT_CYCCNT: uint64 = 0xE0001004
+model_time_us: uint64 = 0
+delay_cycles_per_us: uint32 = 0
+
+
+def delay_init(max_core_mhz: uint32):
+    delay_cycles_per_us = max_core_mhz
+
+
+def delay_us(us: uint32):
+    i: uint32 = 0
+    while i < us:
+        mu_tick()
+        mi_tick()
+        ms_tick()
+        model_time_us = model_time_us + 1
+        i = i + 1

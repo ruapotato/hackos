@@ -5,6 +5,8 @@
 # The drivers count their time limits in delay_us(1) calls, so every limit
 # is still a bounded number of polls.
 
+# The names soc/imxrt/delay.ad exports besides the functions.
+DWT_CYCCNT: uint64 = 0xE0001004
 delay_calls: uint64 = 0
 
 

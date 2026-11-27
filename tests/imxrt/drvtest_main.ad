@@ -1,0 +1,413 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Driver test image (QEMU mps2-an500; tests/imxrt/drvtest.sh): the i.MX RT
+# drivers, compiled unchanged, against register models (tests/imxrt/models/).
+#
+# soc/imxrt/reg.ad and delay.ad are replaced in this image's source tree (and
+# imported here under those names: the same file under two paths would be
+# two modules), so
+# every register access of LPUART, LPI2C, LPSPI, GPIO, IOMUXC and the CCM
+# code is answered by a model at the RT1062's addresses, and every delay
+# advances the models' clock.  The models are my reading of the reference
+# manual (not an independent oracle); what this proves is that the drivers
+# do what that reading requires, including their error and time-out paths.
+# The clock arithmetic is checked against frequencies worked out by hand from
+# NXP's documented mux values.
+#
+# Output: "PASS name" / "FAIL name" per check, then the exit status line.
+
+from kernel.start import hackos_start
+from kernel.fault import hackos_fault
+from kernel.print import kputs, kputc, kput_u64, kput_hex32
+from soc.imxrt.reg import m_iomuxc, m_ccm, m_analog, m_unmodelled, m_unmodelled_addr
+from soc.imxrt.delay import model_time_us
+from tests.imxrt.models.lpuart_model import mu_reset_all, mu_rx_inject, mu_irq, mu_baud_hz, mu_wire, mu_wire_n, mu_tx_lost, mu_stuck, mu_cfg, mu_ctrl, mu_fifo, mu_baud, mu_flags, mu_tick
+from tests.imxrt.models.lpi2c_model import mi_reset_all, mi_mem, mi_busy, mi_log, mi_log_n, mi_nack_autostop, mi_arb_lose, mi_stall, mi_mcr, mi_mccr0, mi_cfg, mi_starts, mi_stops, mi_txn, mi_tx_lost
+from tests.imxrt.models.lpspi_model import ms_reset_all, ms_sck_hz, ms_win_n, ms_win_pcs, ms_win_len, ms_win_bytes, ms_pcs, ms_rx_lost, ms_tx_lost, ms_bad_frames, ms_cfgr1, ms_tcr
+from tests.imxrt.models.gpio_model import mg_reset, mg_dr, mg_gdir, mg_ext, mg_dr_writes
+from soc.imxrt.lpuart import lpuart_baud_value, lpuart_init, lpuart_putc, lpuart_flush, lpuart_rx_ready, lpuart_getc, lpuart_clear_errors, lpuart_rx_irq_enable, lpuart_tx_timeouts, LPUART_TX_TIMEOUT_US
+from soc.imxrt.lpi2c import lpi2c_timing, lpi2c_init, lpi2c_write, lpi2c_read, I2C_OK, I2C_NACK, I2C_ARB_LOST, I2C_TIMEOUT, I2C_BAD_ARG, LPI2C_TIMEOUT_US
+from soc.imxrt.lpspi import lpspi_divider, lpspi_init, lpspi_transfer
+from soc.imxrt.gpio import gpio_output, gpio_input, gpio_set, gpio_clear, gpio_toggle, gpio_read
+from soc.imxrt.iomuxc import iomuxc_pin
+from soc.imxrt.usdhc import usdhc_clock_fields, usdhc_sdclk_hz
+from soc.imxrt1062.soc import clk_compute, clk_pfd, clk_regs, clk_freq, clk_uart_root_osc, clk_usdhc1_root, clk_lpi2c_root_osc, clk_lpspi_root_pll2, ccm_gate_on, ccm_gate_off, CCM_GATE_LPUART6, CCM_GATE_USDHC1, CLK_CACRR, CLK_CBCDR, CLK_CBCMR, CLK_CSCMR1, CLK_CSCDR1, CLK_CSCDR2, CLK_PLL_ARM, CLK_PLL_SYS, CLK_PLL_SYS_NUM, CLK_PLL_SYS_DENOM, CLK_PLL_USB1, CLK_PFD_480, CLK_PFD_528, F_PLL1, F_PLL2, F_PLL3, F_CORE, F_IPG, F_PERCLK, F_UART, F_LPI2C, F_LPSPI, F_USDHC1, F_FLEXSPI
+
+LPUART6_T: uint64 = 0x40198000
+LPI2C1_T: uint64 = 0x403F0000
+LPSPI4_T: uint64 = 0x403A0000
+GPIO2_T: uint64 = 0x401BC000
+
+failures: uint32 = 0
+buf: Array[64, uint8]
+rbuf: Array[64, uint8]
+regs: Array[13, uint32]
+fq: Array[11, uint32]
+
+
+def check(ok: uint32, name: Ptr[uint8]):
+    if ok != 0:
+        kputs("PASS ")
+    else:
+        kputs("FAIL ")
+        failures = failures + 1
+    kputs(name)
+    kputc(10)
+
+
+def info(name: Ptr[uint8], v: uint64):
+    kputs("INFO ")
+    kputs(name)
+    kputs(" ")
+    kput_u64(v)
+    kputc(10)
+
+
+def near(a: uint32, b: uint32, permille: uint32) -> uint32:
+    d: uint64 = 0
+    if a > b:
+        d = cast[uint64](a - b)
+    else:
+        d = cast[uint64](b - a)
+    return cast[uint32](d * 1000 <= cast[uint64](b) * cast[uint64](permille))
+
+
+# ---- LPUART ------------------------------------------------------------------
+def baud_of(clk: uint32, v: uint32) -> uint32:
+    osr: uint32 = ((v >> 24) & 0x1F) + 1
+    sbr: uint32 = v & 0x1FFF
+    if sbr == 0:
+        return 0
+    return clk / (osr * sbr)
+
+
+def baud_ok(clk: uint32, baud: uint32) -> uint32:
+    v: uint32 = lpuart_baud_value(clk, baud)
+    osr: uint32 = ((v >> 24) & 0x1F) + 1
+    both: uint32 = (v >> 17) & 1
+    rule: uint32 = cast[uint32]((osr <= 7 and both == 1) or (osr > 7 and both == 0))
+    return cast[uint32](v != 0 and osr >= 4 and osr <= 32) & near(baud_of(clk, v), baud, 10) & rule
+
+
+def test_lpuart():
+    mu_reset_all()
+    check(baud_ok(24000000, 115200), "lpuart: 115200 from 24 MHz within 1 %, OSR 4..32, BOTHEDGE exactly when OSR < 8")
+    check(baud_ok(24000000, 9600) & baud_ok(24000000, 1000000) & baud_ok(24000000, 3000000) & baud_ok(80000000, 115200), "lpuart: 9600, 1 M, 3 M baud from 24 MHz and 115200 from 80 MHz")
+    check(cast[uint32](lpuart_baud_value(24000000, 10000000) == 0), "lpuart: an impossible rate (10 Mbaud from 24 MHz) is refused")
+    info("lpuart 115200 BAUD register", cast[uint64](lpuart_baud_value(24000000, 115200)))
+    mu_cfg = 0
+    check(cast[uint32](lpuart_init(LPUART6_T, 24000000, 115200) == 0), "lpuart_init returns 0")
+    check(cast[uint32]((mu_ctrl & 0xC0000) == 0xC0000 and (mu_fifo & 0x88) == 0x88) & near(mu_baud_hz(), 115200, 10), "lpuart_init: TE and RE on, both FIFOs on, the model sees 115200 baud")
+    t0: uint64 = model_time_us
+    msg: Ptr[uint8] = "Hello, Teensy!\n"
+    i: uint32 = 0
+    while msg[i] != 0:
+        lpuart_putc(LPUART6_T, cast[uint32](msg[i]))
+        i = i + 1
+    lpuart_flush(LPUART6_T)
+    t: uint64 = model_time_us - t0
+    same: uint32 = cast[uint32](mu_wire_n == 15)
+    i = 0
+    while i < 15 and same != 0:
+        if cast[uint32](mu_wire[i]) != cast[uint32](msg[i]):
+            same = 0
+        i = i + 1
+    check(same & cast[uint32](mu_tx_lost == 0), "lpuart: 15 bytes on the wire, in order, none lost to a full FIFO")
+    info("lpuart model microseconds for 15 characters", t)
+    check(cast[uint32](t >= 15 * 86 and t <= 15 * 90 + 20), "lpuart: the writer waited for the FIFO: 15 characters took 15 character times at 115200")
+    mu_rx_inject(97, 0)
+    mu_rx_inject(98, 0)
+    a: uint32 = lpuart_rx_ready(LPUART6_T)
+    c1: uint32 = lpuart_getc(LPUART6_T)
+    c2: uint32 = lpuart_getc(LPUART6_T)
+    check(cast[uint32](a == 1 and c1 == 97 and c2 == 98 and lpuart_rx_ready(LPUART6_T) == 0 and lpuart_getc(LPUART6_T) == 0xFFFFFFFF), "lpuart: receive two bytes, then empty (getc reports it)")
+    i = 0
+    while i < 6:
+        mu_rx_inject(48 + i, 0)
+        i = i + 1
+    check(cast[uint32]((mu_flags & 0x80000) != 0), "lpuart model: six bytes into a 4-byte FIFO overrun")
+    # the handler's order: acknowledge (clear the flags), then drain
+    e: uint32 = lpuart_clear_errors(LPUART6_T)
+    n: uint32 = 0
+    while lpuart_rx_ready(LPUART6_T) != 0 and n < 10:
+        lpuart_getc(LPUART6_T)
+        n = n + 1
+    mu_rx_inject(120, 0)
+    c3: uint32 = lpuart_getc(LPUART6_T)
+    check(cast[uint32](e == 0x80000 and n == 4 and c3 == 120 and (mu_flags & 0x80000) == 0), "lpuart: clear_errors reports and clears the overrun; the 4 bytes kept are drained, and reception resumes")
+    mu_cfg = 0x20000000
+    mu_rx_inject(65, 1)
+    e = lpuart_clear_errors(LPUART6_T)
+    check(cast[uint32](e == 0x20000 and mu_cfg == 0x20000000 and lpuart_getc(LPUART6_T) == 65), "lpuart: a framing error is cleared without touching STAT's configuration bits (MSBF kept)")
+    mu_cfg = 0
+    lpuart_rx_irq_enable(LPUART6_T)
+    mu_rx_inject(49, 0)
+    mu_rx_inject(50, 0)
+    irq1: uint32 = mu_irq()
+    # what the console's interrupt handler does: acknowledge, then drain
+    lpuart_clear_errors(LPUART6_T)
+    got: uint32 = 0
+    while lpuart_rx_ready(LPUART6_T) != 0:
+        got = (got << 8) | (lpuart_getc(LPUART6_T) & 0xFF)
+    check(cast[uint32](irq1 == 1 and mu_irq() == 0 and got == 0x3132 and (mu_ctrl & 0x8200000) == 0x8200000), "lpuart: RIE and ORIE on; the request is raised by data and dropped once the handler has drained the FIFO")
+    mu_stuck = 1
+    t0 = model_time_us
+    before: uint32 = lpuart_tx_timeouts
+    i = 0
+    while i < 6:
+        lpuart_putc(LPUART6_T, 88)
+        i = i + 1
+    t = model_time_us - t0
+    check(cast[uint32](lpuart_tx_timeouts == before + 2 and t >= cast[uint64](2 * LPUART_TX_TIMEOUT_US) and t <= cast[uint64](2 * LPUART_TX_TIMEOUT_US + 100)), "lpuart: a transmitter that never empties: two bytes dropped after the time limit each, no hang")
+    mu_stuck = 0
+
+
+# ---- GPIO and IOMUXC -----------------------------------------------------------
+def test_gpio():
+    mg_reset()
+    mg_dr = 0x000000F0
+    mg_gdir = 0x00000100
+    gpio_output(GPIO2_T, 3, 1)
+    check(cast[uint32](mg_gdir == 0x108 and mg_dr == 0xF8 and mg_dr_writes == 0), "gpio_output: bit 3 an output and high; the other bits of DR and GDIR untouched; DR never read-modify-written")
+    gpio_toggle(GPIO2_T, 3)
+    a: uint32 = gpio_read(GPIO2_T, 3)
+    gpio_set(GPIO2_T, 3)
+    b: uint32 = gpio_read(GPIO2_T, 3)
+    gpio_clear(GPIO2_T, 3)
+    check(cast[uint32](a == 0 and b == 1 and mg_dr == 0xF0), "gpio: toggle, set, clear through DR_TOGGLE/SET/CLEAR; read back through PSR")
+    gpio_input(GPIO2_T, 8)
+    mg_ext = 0x100
+    check(cast[uint32](mg_gdir == 0x8 and gpio_read(GPIO2_T, 8) == 1), "gpio: an input reads the level from outside")
+    m_iomuxc[(0x80C8) >> 2] = 0xFF
+    iomuxc_pin(0x401F80C8, 2, 0x401F8550, 1, 0x401F82B8, 0x1F038, 0)
+    iomuxc_pin(0x401F80FC, 3, 0, 0, 0x401F82EC, 0x1F861, 1)
+    ok1: uint32 = cast[uint32](m_iomuxc[0xC8 >> 2] == 2 and m_iomuxc[0x550 >> 2] == 1 and m_iomuxc[0x2B8 >> 2] == 0x1F038)
+    ok2: uint32 = cast[uint32](m_iomuxc[0xFC >> 2] == 0x13 and m_iomuxc[0x2EC >> 2] == 0x1F861)
+    check(ok1 & ok2, "iomuxc_pin: mux mode (+SION), input select, pad control written; no input select when there is none")
+
+
+# ---- clock tree -----------------------------------------------------------------
+def snap_pjrc600():
+    regs[CLK_CACRR] = 1                       # ARM_PODF /2
+    regs[CLK_CBCDR] = 0x300                   # PERIPH_CLK_SEL 0, AHB /1, IPG /4
+    regs[CLK_CBCMR] = 0xC0000 | (1 << 4) | (2 << 26)    # PRE_PERIPH = PLL1/ARM_PODF; LPSPI = PLL3 PFD0 /3
+    regs[CLK_CSCMR1] = 0x40 | 0x10000 | (3 << 29) | (5 << 23)  # PERCLK = OSC; USDHC1 = PFD0; FLEXSPI = PLL3 PFD0 /6
+    regs[CLK_CSCDR1] = 0x40 | (1 << 11)       # UART = OSC; USDHC1 /2
+    regs[CLK_CSCDR2] = 0x40000                # LPI2C = OSC
+    regs[CLK_PLL_ARM] = 0x2000 | 100          # 24 MHz * 100 / 2 = 1200 MHz
+    regs[CLK_PLL_SYS] = 0x2001                # 528 MHz
+    regs[CLK_PLL_SYS_NUM] = 0
+    regs[CLK_PLL_SYS_DENOM] = 1
+    regs[CLK_PLL_USB1] = 0x3040               # POWER, ENABLE, EN_USB_CLKS: 480 MHz
+    regs[CLK_PFD_480] = 0x13110D0C            # PJRC: PFD0 frac 12 = 720 MHz
+    regs[CLK_PFD_528] = 0x2018101B            # PJRC: PFD0 frac 27 = 352 MHz, PFD2 frac 24 = 396 MHz
+
+
+def test_clocks():
+    snap_pjrc600()
+    clk_compute(&regs[0], &fq[0])
+    check(cast[uint32](fq[F_PLL1] == 1200000000 and fq[F_PLL2] == 528000000 and fq[F_PLL3] == 480000000), "clocks: PLL1 1200, PLL2 528, PLL3 480 MHz from DIV_SELECT")
+    check(cast[uint32](fq[F_CORE] == 600000000 and fq[F_IPG] == 150000000 and fq[F_PERCLK] == 24000000), "clocks: PJRC's 600 MHz set-up: core 600, IPG 150, PERCLK 24 MHz")
+    check(cast[uint32](fq[F_UART] == 24000000 and fq[F_LPI2C] == 24000000 and fq[F_LPSPI] == 240000000 and fq[F_USDHC1] == 176000000 and fq[F_FLEXSPI] == 120000000), "clocks: UART 24, LPI2C 24, LPSPI 240, uSDHC1 176, FlexSPI 120 MHz")
+    regs[CLK_PLL_ARM] = 0x1000 | 100          # POWERDOWN
+    regs[CLK_PLL_USB1] = 0x2000               # POWER off
+    regs[CLK_CSCDR1] = (1 << 11)              # UART from pll3_80m
+    clk_compute(&regs[0], &fq[0])
+    check(cast[uint32](fq[F_PLL1] == 0 and fq[F_CORE] == 0 and fq[F_PLL3] == 0 and fq[F_UART] == 0), "clocks: a powered-down PLL gives 0 downstream (PLL1 off: core 0; PLL3 off: UART from pll3_80m 0)")
+    regs[CLK_PLL_USB1] = 0x3040
+    clk_compute(&regs[0], &fq[0])
+    check(cast[uint32](fq[F_UART] == 80000000), "clocks: UART from pll3_80m = 480 / 6")
+    regs[CLK_CBCDR] = 0x2000000 | 0x300       # PERIPH_CLK_SEL = periph_clk2
+    regs[CLK_CBCMR] = (1 << 12)               # PERIPH_CLK2_SEL = OSC
+    clk_compute(&regs[0], &fq[0])
+    check(cast[uint32](fq[F_CORE] == 24000000 and fq[F_IPG] == 6000000), "clocks: core on periph_clk2 from the oscillator (24 MHz)")
+    regs[CLK_PLL_SYS] = 0x2001
+    regs[CLK_PLL_SYS_NUM] = 1
+    regs[CLK_PLL_SYS_DENOM] = 2
+    regs[CLK_PLL_ARM] = 0x10000 | 100         # BYPASS
+    clk_compute(&regs[0], &fq[0])
+    check(cast[uint32](fq[F_PLL2] == 540000000 and fq[F_PLL1] == 24000000), "clocks: PLL2 with NUM/DENOM = 1/2 is 22.5 x 24 MHz; a bypassed PLL1 is 24 MHz")
+    check(cast[uint32](clk_pfd(528000000, 0x80, 0) == 0 and clk_pfd(528000000, 0x18, 0) == 396000000 and clk_pfd(480000000, 0x0C000000, 3) == 720000000), "clocks: PFD = PLL x 18 / frac; a gated PFD gives 0")
+    # the roots HackOS sets, on a ROM-like state (registers as plain memory)
+    snap_pjrc600()
+    i: uint32 = 0
+    while i < 64:
+        m_ccm[i] = 0
+        i = i + 1
+    m_ccm[0x10 >> 2] = regs[CLK_CACRR]
+    m_ccm[0x14 >> 2] = regs[CLK_CBCDR]
+    m_ccm[0x18 >> 2] = regs[CLK_CBCMR]
+    m_ccm[0x1C >> 2] = 0x40 | (3 << 29) | (5 << 23)      # USDHC1 from PFD2 as at reset
+    m_ccm[0x24 >> 2] = 0x06490B00                         # CSCDR1 reset value: UART from pll3_80m, USDHC1 /2
+    m_ccm[0x38 >> 2] = 0x29150F00
+    m_ccm[0x80 >> 2] = 0xFFFFFFFF                         # CCGR6: all gates on
+    m_analog[0] = regs[CLK_PLL_ARM]
+    m_analog[0x10 >> 2] = regs[CLK_PLL_USB1]
+    m_analog[0x30 >> 2] = regs[CLK_PLL_SYS]
+    m_analog[0x50 >> 2] = 0
+    m_analog[0x60 >> 2] = 1
+    m_analog[0xF0 >> 2] = regs[CLK_PFD_480]
+    m_analog[0x100 >> 2] = regs[CLK_PFD_528]
+    u: uint32 = clk_uart_root_osc()
+    check(cast[uint32](u == 24000000 and (m_ccm[0x24 >> 2] & 0x7F) == 0x40 and (m_ccm[0x24 >> 2] & 0xFFFFFF80) == (0x06490B00 & 0xFFFFFF80)), "clock root: LPUART on the oscillator, the rest of CSCDR1 unchanged")
+    s: uint32 = clk_usdhc1_root()
+    check(cast[uint32](s == 198000000 and (m_analog[0x100 >> 2] & 0xFF) == 24 and (m_analog[0x100 >> 2] & 0xFFFFFF00) == 0x20181000), "clock root: uSDHC1 = PLL2 PFD0 set to 396 MHz / 2 = 198 MHz; PFD0 ungated; PFD1-3 unchanged (SET/CLR aliases)")
+    check(cast[uint32]((m_ccm[0x1C >> 2] & 0x10000) != 0 and ((m_ccm[0x24 >> 2] >> 11) & 7) == 1 and (m_ccm[0x80 >> 2] & 0xC) == 0), "clock root: USDHC1_CLK_SEL = PFD0, USDHC1_PODF = /2, and its gate left off for the caller to open")
+    m_ccm[0x74 >> 2] = 0
+    ccm_gate_on(CCM_GATE_LPUART6)
+    check(cast[uint32](m_ccm[0x74 >> 2] == 0xC0), "ccm_gate_on(LPUART6) sets CCGR3 bits 7:6 and nothing else")
+    l: uint32 = clk_lpi2c_root_osc()
+    p: uint32 = clk_lpspi_root_pll2()
+    check(cast[uint32](l == 24000000 and p == 66000000), "clock roots: LPI2C 24 MHz (oscillator), LPSPI 66 MHz (PLL2 / 8)")
+    f: uint32 = usdhc_clock_fields(198000000, 400000)
+    a: uint32 = usdhc_sdclk_hz
+    f = usdhc_clock_fields(198000000, 25000000)
+    b: uint32 = usdhc_sdclk_hz
+    f = usdhc_clock_fields(176000000, 25000000)
+    c: uint32 = usdhc_sdclk_hz
+    check(cast[uint32](a <= 400000 and a > 300000 and b <= 25000000 and b > 20000000 and c <= 25000000 and c > 20000000), "usdhc clock: <= 400 kHz and <= 25 MHz from 198 or 176 MHz, no more than 25 % below")
+
+
+# ---- LPI2C -----------------------------------------------------------------------
+# SCL period and the low/high times (ns) per the RM formula, from (prescale<<32)|MCCR0.
+def i2c_ok(clk: uint32, hz: uint32, lo_ns: uint32, hi_ns: uint32) -> uint32:
+    t: uint64 = lpi2c_timing(clk, hz)
+    if t == 0:
+        return 0
+    p: uint64 = t >> 32
+    m: uint64 = t & 0xFFFFFFFF
+    lo: uint64 = m & 0x3F
+    hi: uint64 = (m >> 8) & 0x3F
+    lat: uint64 = (2 + 2) >> p
+    period: uint64 = (lo + hi + 2 + lat) << p
+    f: uint64 = cast[uint64](clk) / period
+    tlo: uint64 = (lo + 1) * (1000000000 >> 0) / (cast[uint64](clk) >> p)
+    thi: uint64 = (hi + 1 + lat) * 1000000000 / (cast[uint64](clk) >> p)
+    return cast[uint32](f <= cast[uint64](hz) and f * 100 >= cast[uint64](hz) * 85 and tlo >= cast[uint64](lo_ns) and thi >= cast[uint64](hi_ns))
+
+
+def bus_idle() -> uint32:
+    return cast[uint32](mi_busy == 0 and mi_txn == 0)
+
+
+def test_lpi2c():
+    mi_reset_all()
+    check(i2c_ok(24000000, 100000, 4700, 4000), "lpi2c timing: 100 kHz from 24 MHz: period >= 10 us, within 15 %; low >= 4.7 us, high >= 4.0 us")
+    check(i2c_ok(24000000, 400000, 1300, 600), "lpi2c timing: 400 kHz: low >= 1.3 us, high >= 0.6 us")
+    check(i2c_ok(24000000, 1000000, 500, 260), "lpi2c timing: 1 MHz: low >= 0.5 us, high >= 0.26 us")
+    check(cast[uint32](lpi2c_init(LPI2C1_T, 24000000, 100000) == I2C_OK and (mi_mcr & 1) == 1 and mi_mccr0 != 0 and mi_cfg[1] < 8), "lpi2c_init: enabled, clock and prescaler programmed")
+    buf[0] = 0x10
+    buf[1] = 1
+    buf[2] = 2
+    buf[3] = 3
+    r: int32 = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 4)
+    check(cast[uint32](r == I2C_OK and mi_mem[0x10] == 1 and mi_mem[0x11] == 2 and mi_mem[0x12] == 3 and bus_idle() == 1), "lpi2c: write register pointer + 3 bytes to 0x50; the device holds them; bus idle")
+    check(cast[uint32](mi_log_n == 6 and mi_log[0] == 0x1A0 and mi_log[5] == 0x300), "lpi2c: on the bus: START 0xA0, 4 bytes, STOP")
+    i: uint32 = 0
+    while i < 32:
+        mi_mem[0x20 + i] = cast[uint8](i * 3 + 1)
+        i = i + 1
+    buf[0] = 0x20
+    r = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 1)
+    r2: int32 = lpi2c_read(LPI2C1_T, 0x50, &rbuf[0], 20)
+    same: uint32 = 1
+    i = 0
+    while i < 20:
+        if cast[uint32](rbuf[i]) != i * 3 + 1:
+            same = 0
+        i = i + 1
+    check(cast[uint32](r == I2C_OK and r2 == I2C_OK) & same & bus_idle(), "lpi2c: read 20 bytes (more than the 4-word FIFOs) back in order")
+    k: uint32 = 0
+    while k < 2:
+        mi_nack_autostop = k
+        r = lpi2c_write(LPI2C1_T, 0x33, &buf[0], 2)
+        a: uint32 = cast[uint32](r == I2C_NACK) & bus_idle()
+        r = lpi2c_read(LPI2C1_T, 0x33, &rbuf[0], 2)
+        b: uint32 = cast[uint32](r == I2C_NACK) & bus_idle()
+        buf[0] = 7
+        buf[1] = 8
+        buf[2] = 9
+        r = lpi2c_write(LPI2C1_T, 0x44, &buf[0], 3)
+        c: uint32 = cast[uint32](r == I2C_NACK) & bus_idle()
+        buf[0] = 0x10
+        r = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 1)
+        r2 = lpi2c_read(LPI2C1_T, 0x50, &rbuf[0], 1)
+        d: uint32 = cast[uint32](r == I2C_OK and r2 == I2C_OK and rbuf[0] == 1) & bus_idle()
+        if k == 0:
+            check(a & b & c & d, "lpi2c, master that holds its FIFO after a NACK: no device (write, read) and a refused data byte are I2C_NACK, bus left idle, next transfer works")
+        else:
+            check(a & b & c & d, "lpi2c, master that sends STOP by itself after a NACK: the same")
+        k = k + 1
+    mi_nack_autostop = 1
+    mi_arb_lose = 1
+    r = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 1)
+    r2 = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 1)
+    check(cast[uint32](r == I2C_ARB_LOST and r2 == I2C_OK) & bus_idle(), "lpi2c: arbitration lost is reported; the next transfer works")
+    mi_stall = 1
+    t0: uint64 = model_time_us
+    r = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 3)
+    t: uint64 = model_time_us - t0
+    mi_stall = 0
+    info("lpi2c model microseconds until a stuck bus is given up", t)
+    check(cast[uint32](r == I2C_TIMEOUT and t <= 3 * cast[uint64](LPI2C_TIMEOUT_US)), "lpi2c: a bus that never moves: I2C_TIMEOUT within 3 time limits, no hang")
+    r = lpi2c_write(LPI2C1_T, 0x50, &buf[0], 1)
+    check(cast[uint32](r == I2C_OK) & bus_idle(), "lpi2c: after the stuck bus is released, a transfer works")
+    check(cast[uint32](lpi2c_write(LPI2C1_T, 0x80, &buf[0], 1) == I2C_BAD_ARG and lpi2c_read(LPI2C1_T, 0x50, &rbuf[0], 0) == I2C_BAD_ARG and lpi2c_read(LPI2C1_T, 0x50, &rbuf[0], 257) == I2C_BAD_ARG), "lpi2c: 8-bit address, zero-length and over-long reads refused")
+    check(cast[uint32](mi_tx_lost == 0), "lpi2c: no command was ever written into a full FIFO")
+
+
+# ---- LPSPI -----------------------------------------------------------------------
+def spi_div_ok(clk: uint32, hz: uint32) -> uint32:
+    d: uint32 = lpspi_divider(clk, hz)
+    if d == 0xFFFFFFFF:
+        return 0
+    f: uint32 = clk / ((cast[uint32](1) << (d >> 8)) * ((d & 0xFF) + 2))
+    return cast[uint32](f <= hz and f * 2 > hz)
+
+
+def test_lpspi():
+    ms_reset_all()
+    check(spi_div_ok(66000000, 1000000) & spi_div_ok(66000000, 20000000) & spi_div_ok(66000000, 400000) & spi_div_ok(66000000, 100000), "lpspi divider: SCK <= asked and more than half of it, at 20 M, 1 M, 400 k, 100 k from 66 MHz")
+    check(cast[uint32](lpspi_init(LPSPI4_T, 66000000, 4000000, 0) == 0 and (ms_cfgr1 & 1) == 1 and ms_sck_hz() <= 4000000), "lpspi_init: master, SCK <= 4 MHz")
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    r: int32 = lpspi_transfer(LPSPI4_T, 0, &buf[0], &rbuf[0], 3)
+    check(cast[uint32](r == 0 and rbuf[0] == 0x5B and rbuf[1] == 0x58 and rbuf[2] == 0x59), "lpspi: 3 bytes full duplex on PCS0, the replies come back in order")
+    check(cast[uint32](ms_win_n == 1 and ms_win_pcs[0] == 0 and ms_win_len[0] == 3 and ms_win_bytes[0] == 1 and ms_win_bytes[2] == 3 and ms_pcs == -1), "lpspi: one chip-select window of exactly 3 frames, released at the end")
+    i: uint32 = 0
+    while i < 40:
+        buf[i] = cast[uint8](i)
+        i = i + 1
+    r = lpspi_transfer(LPSPI4_T, 1, &buf[0], &rbuf[0], 40)
+    same: uint32 = 1
+    i = 0
+    while i < 40:
+        if rbuf[i] != 0x3C:
+            same = 0
+        i = i + 1
+    check(cast[uint32](r == 0 and ms_win_n == 2 and ms_win_pcs[1] == 1 and ms_win_len[1] == 40 and ms_rx_lost == 0 and ms_tx_lost == 0) & same, "lpspi: 40 bytes on PCS1 (more than the 16-word FIFOs): one window, nothing lost")
+    r = lpspi_transfer(LPSPI4_T, 0, cast[Ptr[uint8]](0), &rbuf[0], 4)
+    check(cast[uint32](r == 0 and ms_win_len[2] == 4 and ms_win_bytes[16] == 0xFF and rbuf[0] == 0xA5), "lpspi: no transmit buffer sends 0xFF")
+    r = lpspi_transfer(LPSPI4_T, 0, &buf[0], cast[Ptr[uint8]](0), 5)
+    check(cast[uint32](r == 0 and ms_win_len[3] == 5 and ms_bad_frames == 0), "lpspi: no receive buffer: the bytes are clocked and dropped")
+    info("lpspi chip-select windows so far", cast[uint64](ms_win_n))
+    lpspi_init(LPSPI4_T, 66000000, 1000000, 3)
+    r = lpspi_transfer(LPSPI4_T, 0, &buf[0], &rbuf[0], 1)
+    check(cast[uint32](r == 0 and (ms_tcr & 0xC0000000) == 0xC0000000 and ms_win_n == 5), "lpspi: mode 3 puts CPOL and CPHA in the command word")
+
+
+def main() -> int32:
+    kputs("\nHackOS i.MX RT driver test (register models, QEMU mps2-an500)\n")
+    test_lpuart()
+    test_gpio()
+    test_clocks()
+    test_lpi2c()
+    test_lpspi()
+    check(cast[uint32](m_unmodelled == 0), "every register access was to a modelled block")
+    if m_unmodelled != 0:
+        kputs("unmodelled access at ")
+        kput_hex32(cast[uint32](m_unmodelled_addr))
+        kputc(10)
+    info("model microseconds in all", model_time_us)
+    return cast[int32](failures)

@@ -1,0 +1,226 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# LPSPI master model (RT1060 RM, LPSPI chapter, as I read it); my reading,
+# not an independent oracle.
+#
+#   CR      MEN; RST resets the registers; RTF/RRF flush the FIFOs
+#   SR      WCF FCF TCF TEF REF DMF write one to clear; TDF (TX count <=
+#           TXWATER), RDF (RX count > RXWATER), MBF computed
+#   TCR     written into the TX FIFO as a command word, as the manual
+#           describes; reads back the command in effect.  A command that
+#           arrives while a continuous transfer (CONT) holds a chip select
+#           ends it unless it continues the same select with CONT set.
+#   TDR     data into the 16-word TX FIFO; RDR pops the 16-word RX FIFO
+#           (RSR.RXEMPTY when empty); a received frame with the RX FIFO full
+#           sets REF and is lost
+#   frames  8 bits (FRAMESZ = 7 is all this model accepts; others set TEF)
+#           every 4 model microseconds; the chip select is asserted from the
+#           first frame and released after a frame without CONT, or by a
+#           command that ends the continuous transfer
+#   devices on PCS0 the reply to byte b is b ^ 0x5A; on PCS1 0x3C
+# Recorded: every chip-select window (which select, how many frames, the
+# first 8 bytes sent) and the SCK the clock settings give from 66 MHz.
+
+MS_CLK: uint32 = 66000000
+
+ms_cr: uint32 = 0
+ms_flags: uint32 = 0
+ms_ier: uint32 = 0
+ms_der: uint32 = 0
+ms_cfgr0: uint32 = 0
+ms_cfgr1: uint32 = 0
+ms_ccr: uint32 = 0
+ms_fcr: uint32 = 0
+ms_tcr: uint32 = 0x0000001F              # reset value: FRAMESZ 31 (what reads return)
+ms_tcr_eff: uint32 = 0x0000001F          # the command in effect for the frames being shifted
+ms_q: Array[16, uint32]
+ms_qk: Array[16, uint32]                 # 1: that entry is a command word (TCR)
+ms_qn: uint32 = 0
+ms_rx: Array[16, uint32]
+ms_rxn: uint32 = 0
+ms_pcs: int32 = -1                       # select held, -1 none
+ms_wait: uint32 = 0
+ms_win_n: uint32 = 0
+ms_win_pcs: Array[8, uint32]
+ms_win_len: Array[8, uint32]
+ms_win_bytes: Array[64, uint8]           # first 8 bytes of each window
+ms_rx_lost: uint32 = 0
+ms_tx_lost: uint32 = 0
+ms_bad_frames: uint32 = 0
+
+
+def ms_reset_regs():
+    ms_cr = 0
+    ms_flags = 0
+    ms_ier = 0
+    ms_der = 0
+    ms_cfgr0 = 0
+    ms_cfgr1 = 0
+    ms_ccr = 0
+    ms_fcr = 0
+    ms_tcr = 0x1F
+    ms_tcr_eff = 0x1F
+    ms_qn = 0
+    ms_rxn = 0
+    ms_pcs = -1
+
+
+def ms_reset_all():
+    ms_reset_regs()
+    ms_win_n = 0
+    ms_rx_lost = 0
+    ms_tx_lost = 0
+    ms_bad_frames = 0
+
+
+# SCK the current settings give (Hz).
+def ms_sck_hz() -> uint32:
+    pre: uint32 = cast[uint32](1) << ((ms_tcr >> 27) & 7)
+    return MS_CLK / (pre * ((ms_ccr & 0xFF) + 2))
+
+
+def _ms_push(w: uint32, kind: uint32):
+    if ms_qn >= 16:
+        ms_tx_lost = ms_tx_lost + 1
+        ms_flags = ms_flags | 0x800          # TEF
+        return
+    ms_q[ms_qn] = w
+    ms_qk[ms_qn] = kind
+    ms_qn = ms_qn + 1
+
+
+def ms_rd(off: uint64) -> uint32:
+    if off == 0x00:
+        return 0x01020004
+    if off == 0x04:
+        return 0x00040404                    # PCSNUM 4, RXFIFO 4, TXFIFO 4: 16 words
+    if off == 0x10:
+        return ms_cr
+    if off == 0x14:
+        s: uint32 = ms_flags
+        if ms_qn <= (ms_fcr & 0xF):
+            s = s | 1
+        if ms_rxn > ((ms_fcr >> 16) & 0xF):
+            s = s | 2
+        if ms_qn != 0 or ms_pcs >= 0:
+            s = s | 0x1000000
+        return s
+    if off == 0x18:
+        return ms_ier
+    if off == 0x1C:
+        return ms_der
+    if off == 0x20:
+        return ms_cfgr0
+    if off == 0x24:
+        return ms_cfgr1
+    if off == 0x40:
+        return ms_ccr
+    if off == 0x58:
+        return ms_fcr
+    if off == 0x5C:
+        return ms_qn | (ms_rxn << 16)
+    if off == 0x60:
+        return ms_tcr
+    if off == 0x70:
+        if ms_rxn == 0:
+            return 2
+        return 0
+    if off == 0x74:
+        if ms_rxn == 0:
+            return 0
+        d: uint32 = ms_rx[0]
+        i: uint32 = 1
+        while i < ms_rxn:
+            ms_rx[i - 1] = ms_rx[i]
+            i = i + 1
+        ms_rxn = ms_rxn - 1
+        return d
+    return 0
+
+
+def ms_wr(off: uint64, v: uint32):
+    if off == 0x10:
+        if (v & 2) != 0:
+            ms_reset_regs()
+        if (v & 0x100) != 0:
+            ms_qn = 0
+        if (v & 0x200) != 0:
+            ms_rxn = 0
+        ms_cr = v & 0xB
+    elif off == 0x14:
+        ms_flags = ms_flags & (0xFFFFFFFF ^ (v & 0x3F00))
+    elif off == 0x18:
+        ms_ier = v
+    elif off == 0x1C:
+        ms_der = v
+    elif off == 0x20:
+        ms_cfgr0 = v
+    elif off == 0x24:
+        ms_cfgr1 = v
+    elif off == 0x40:
+        ms_ccr = v
+    elif off == 0x58:
+        ms_fcr = v
+    elif off == 0x60:
+        _ms_push(v, 1)
+        ms_tcr = v
+    elif off == 0x64:
+        _ms_push(v & 0xFF, 0)
+
+
+def _ms_end_window():
+    ms_pcs = -1
+
+
+def ms_tick():
+    if (ms_cr & 1) == 0 or (ms_cfgr1 & 1) == 0:
+        return
+    if ms_wait > 0:
+        ms_wait = ms_wait - 1
+        return
+    if ms_qn == 0:
+        return
+    ms_wait = 4
+    w: uint32 = ms_q[0]
+    k: uint32 = ms_qk[0]
+    i: uint32 = 1
+    while i < ms_qn:
+        ms_q[i - 1] = ms_q[i]
+        ms_qk[i - 1] = ms_qk[i]
+        i = i + 1
+    ms_qn = ms_qn - 1
+    if k != 0:
+        c: uint32 = w
+        if ms_pcs >= 0:
+            same: uint32 = cast[uint32](cast[int32]((c >> 24) & 3) == ms_pcs)
+            if (c & 0x200000) == 0 or same == 0:
+                _ms_end_window()
+        ms_tcr_eff = c
+        return
+    if (ms_tcr_eff & 0xFFF) != 7:
+        ms_bad_frames = ms_bad_frames + 1
+        ms_flags = ms_flags | 0x800
+        return
+    p: uint32 = (ms_tcr_eff >> 24) & 3
+    if ms_pcs < 0:
+        ms_pcs = cast[int32](p)
+        if ms_win_n < 8:
+            ms_win_pcs[ms_win_n] = p
+            ms_win_len[ms_win_n] = 0
+        ms_win_n = ms_win_n + 1
+    wi: uint32 = ms_win_n - 1
+    if wi < 8:
+        if ms_win_len[wi] < 8:
+            ms_win_bytes[wi * 8 + ms_win_len[wi]] = cast[uint8](w)
+        ms_win_len[wi] = ms_win_len[wi] + 1
+    r: uint32 = 0x3C
+    if p == 0:
+        r = (w ^ 0x5A) & 0xFF
+    if ms_rxn >= 16:
+        ms_rx_lost = ms_rx_lost + 1
+        ms_flags = ms_flags | 0x1000         # REF
+    else:
+        ms_rx[ms_rxn] = r
+        ms_rxn = ms_rxn + 1
+    if (ms_tcr_eff & 0x200000) == 0:
+        _ms_end_window()

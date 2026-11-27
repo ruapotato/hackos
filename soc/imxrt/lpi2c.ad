@@ -81,13 +81,20 @@ lpi2c_fifo_words: uint32 = 4
 
 # MCCR0 and the prescaler for `hz` from a module clock of `clk_hz`.  The
 # reference manual's period is (CLKLO + CLKHI + 2 + SCL_LATENCY) * 2^PRESCALE
-# clocks with SCL_LATENCY = floor((2 + FILTSCL) / 2^PRESCALE); the smallest
-# prescaler whose CLKLO and CLKHI fit 6 bits is used, with SCL low for 55 %
-# of the period (I2C needs low >= high in fast mode).  Returns
-# (prescale << 32) | MCCR0, or 0 if `hz` cannot be reached.
+# clocks with SCL_LATENCY = floor((2 + FILTSCL) / 2^PRESCALE), SCL low for
+# CLKLO + 1 of them.  The smallest prescaler whose CLKLO and CLKHI fit 6 bits
+# is used; SCL is low for 55 % of the period or for the I2C minimum of the
+# mode (4.7 us up to 100 kHz, 1.3 us up to 400 kHz, 0.5 us above), whichever
+# is longer.  Returns (prescale << 32) | MCCR0, or 0 if `hz` cannot be
+# reached.
 def lpi2c_timing(clk_hz: uint32, hz: uint32) -> uint64:
     if hz == 0 or clk_hz == 0:
         return 0
+    tlow_ns: uint64 = 500
+    if hz <= 100000:
+        tlow_ns = 4700
+    elif hz <= 400000:
+        tlow_ns = 1300
     p: uint32 = 0
     while p < 8:
         cycles: uint64 = cast[uint64](clk_hz) / (cast[uint64](hz) << p)
@@ -95,7 +102,15 @@ def lpi2c_timing(clk_hz: uint32, hz: uint32) -> uint64:
         if cycles > 2 + lat:
             total: uint64 = cycles - 2 - lat
             lo: uint64 = total * 11 / 20
-            hi: uint64 = total - lo
+            fclk: uint64 = cast[uint64](clk_hz >> p)
+            lo_min: uint64 = (tlow_ns * fclk + 999999999) / 1000000000
+            if lo_min > 0:
+                lo_min = lo_min - 1
+            if lo < lo_min:
+                lo = lo_min
+            hi: uint64 = 0
+            if total > lo:
+                hi = total - lo
             if lo >= 1 and lo <= 63 and hi >= 1 and hi <= 63:
                 sethold: uint64 = hi
                 datavd: uint64 = hi / 2
@@ -130,13 +145,18 @@ def _lpi2c_clear(base: uint64):
     reg_wr(base + LPI2C_MSR, LPI2C_MSR_EPF | LPI2C_MSR_SDF | LPI2C_MSR_NDF | LPI2C_MSR_ALF | LPI2C_MSR_FEF | LPI2C_MSR_PLTF | LPI2C_MSR_DMF)
 
 
-# An error was seen: drop what is queued, end the transfer, clear the flags.
+# An error was seen: clear the flags, drop what is queued, and end the
+# transfer with a STOP if the master is still busy.  The flags are cleared
+# first: whether the master sends a STOP by itself after a NACK or holds
+# its command FIFO until NDF is cleared, this sequence leaves the bus idle
+# (the model tests both behaviours).
 def _lpi2c_abort(base: uint64, code: int32) -> int32:
+    _lpi2c_clear(base)
     reg_wr(base + LPI2C_MCR, LPI2C_MCR_MEN | LPI2C_MCR_RTF | LPI2C_MCR_RRF)
     if (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_MBF) != 0:
         reg_wr(base + LPI2C_MTDR, LPI2C_CMD_STOP)
         waited: uint32 = 0
-        while (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_SDF) == 0 and waited < LPI2C_TIMEOUT_US:
+        while (reg_rd(base + LPI2C_MSR) & LPI2C_MSR_MBF) != 0 and waited < LPI2C_TIMEOUT_US:
             delay_us(1)
             waited = waited + 1
     _lpi2c_clear(base)

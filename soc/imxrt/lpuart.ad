@@ -59,6 +59,7 @@ LPUART_FIFO_RXFLUSH: uint32 = 0x4000
 LPUART_WATER_RXCOUNT: uint32 = 0x7000000
 LPUART_WATER_RXCOUNT_SHIFT: uint32 = 24
 
+LPUART_TXWATER_ROOM: uint32 = 3          # unchecked: TXWATER for the 4-word FIFO (RM: must be below the FIFO size)
 LPUART_TX_TIMEOUT_US: uint32 = 10000      # unchecked: driver policy (a byte at 9600 baud is ~1 ms)
 
 lpuart_tx_timeouts: uint32 = 0
@@ -112,7 +113,10 @@ def lpuart_init(base: uint64, clk_hz: uint32, baud: uint32) -> int32:
     reg_wr(base + LPUART_PINCFG, 0)
     reg_wr(base + LPUART_BAUD, bv)
     reg_wr(base + LPUART_MODIR, 0)
-    reg_wr(base + LPUART_WATER, 0)                       # TXWATER 0, RXWATER 0
+    # RXWATER 0: RDRF as soon as one byte waits.  TXWATER 3: TDRE while the
+    # 4-word FIFO has room (with 0 it would mean "empty", and the FIFO would
+    # hold one byte at a time).
+    reg_wr(base + LPUART_WATER, LPUART_TXWATER_ROOM)
     reg_wr(base + LPUART_FIFO, LPUART_FIFO_TXFE | LPUART_FIFO_RXFE | LPUART_FIFO_TXFLUSH | LPUART_FIFO_RXFLUSH)
     lpuart_clear_errors(base)
     reg_wr(base + LPUART_CTRL, LPUART_CTRL_TE | LPUART_CTRL_RE)

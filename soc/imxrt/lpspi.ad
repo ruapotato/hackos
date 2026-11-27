@@ -158,8 +158,16 @@ def lpspi_transfer(base: uint64, pcs: uint32, tx: Ptr[uint8], rx: Ptr[uint8], n:
             waited = waited + 1
         else:
             waited = 0
-    # end the continuous transfer: chip select is released
+    # end the continuous transfer: the chip select is released once this
+    # command leaves the FIFO; wait for that, so the caller may touch the
+    # bus (or another select) as soon as this returns
     if _lpspi_wait_tx_room(base) != 0:
         return -1
     reg_wr(base + LPSPI_TCR, tcr)
+    waited: uint32 = 0
+    while (reg_rd(base + LPSPI_FSR) & LPSPI_FSR_TXCOUNT) != 0 or (reg_rd(base + LPSPI_SR) & LPSPI_SR_MBF) != 0:
+        if waited >= LPSPI_TIMEOUT_US:
+            return -1
+        delay_us(1)
+        waited = waited + 1
     return 0

@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# LPUART register model (RT1060 RM, LPUART chapter, as I read it; the
+# register layout is the one check_regs.py verifies against MIMXRT1062.h).
+#
+#   GLOBAL.RST   resets every register (the wire log survives)
+#   STAT         configuration bits read/write; OR NF FE PF IDLE write one to
+#                clear; TDRE (TX FIFO count <= TXWATER), TC (FIFO and shift
+#                register empty), RDRF (RX FIFO count > RXWATER) computed
+#   DATA         write: into the TX FIFO when CTRL.TE (dropped and counted if
+#                full); read: pops the RX FIFO, RXEMPT (bit 12) when empty
+#   FIFO         TXFE/RXFE enable 4-word FIFOs (else 1 word); TXFLUSH/RXFLUSH
+#                empty them and read back as 0; FIFO sizes read as 001b (4)
+#   WATER        TXWATER/RXWATER; TXCOUNT/RXCOUNT computed
+#   receiver     a byte arriving with the RX FIFO full sets OR and is lost;
+#                while OR is set every arriving byte is lost
+#   transmitter  one character per 10 bit times at the baud rate BAUD gives
+#                from the 24 MHz root, onto a wire log
+# Test controls: mu_rx_inject(byte, error), mu_stuck (transmitter never
+# finishes), mu_baud_hz() (what the BAUD register means).
+
+MU_STAT_W1C: uint32 = 0x001F0000         # IDLE OR NF FE PF
+MU_STAT_CFG: uint32 = 0x3E000000         # MSBF RXINV RWUID BRK13 LBKDE
+MU_CLK: uint32 = 24000000
+
+mu_global: uint32 = 0
+mu_pincfg: uint32 = 0
+mu_baud: uint32 = 0x0F000004             # reset value: OSR 15 (16x), SBR 4
+mu_cfg: uint32 = 0
+mu_flags: uint32 = 0
+mu_ctrl: uint32 = 0
+mu_fifo: uint32 = 0
+mu_water: uint32 = 0
+mu_modir: uint32 = 0
+mu_tx: Array[4, uint32]
+mu_txn: uint32 = 0
+mu_rx: Array[4, uint32]
+mu_rxn: uint32 = 0
+mu_shift_left: uint32 = 0                # microseconds until the shift register is empty
+mu_shift_byte: uint32 = 0
+mu_wire: Array[512, uint8]
+mu_wire_n: uint32 = 0
+mu_tx_lost: uint32 = 0
+mu_rx_lost: uint32 = 0
+mu_stuck: uint32 = 0
+
+
+def mu_reset_regs():
+    mu_global = 0
+    mu_pincfg = 0
+    mu_baud = 0x0F000004
+    mu_cfg = 0
+    mu_flags = 0
+    mu_ctrl = 0
+    mu_fifo = 0
+    mu_water = 0
+    mu_modir = 0
+    mu_txn = 0
+    mu_rxn = 0
+    mu_shift_left = 0
+
+
+def mu_reset_all():
+    mu_reset_regs()
+    mu_wire_n = 0
+    mu_tx_lost = 0
+    mu_rx_lost = 0
+    mu_stuck = 0
+
+
+def _mu_depth_tx() -> uint32:
+    if (mu_fifo & 0x80) != 0:
+        return 4
+    return 1
+
+
+def _mu_depth_rx() -> uint32:
+    if (mu_fifo & 0x8) != 0:
+        return 4
+    return 1
+
+
+def mu_baud_hz() -> uint32:
+    osr: uint32 = ((mu_baud >> 24) & 0x1F) + 1
+    sbr: uint32 = mu_baud & 0x1FFF
+    if sbr == 0 or osr < 4:
+        return 0
+    return MU_CLK / (osr * sbr)
+
+
+def mu_rd(off: uint64) -> uint32:
+    if off == 0x00:
+        return 0x04010003                # VERID (any plausible value)
+    if off == 0x04:
+        return 0x0202                    # PARAM: RXFIFO 2, TXFIFO 2 (4 words)
+    if off == 0x08:
+        return mu_global
+    if off == 0x0C:
+        return mu_pincfg
+    if off == 0x10:
+        return mu_baud
+    if off == 0x14:
+        s: uint32 = mu_cfg | mu_flags
+        if mu_txn <= (mu_water & 3):
+            s = s | 0x800000             # TDRE
+        if mu_txn == 0 and mu_shift_left == 0:
+            s = s | 0x400000             # TC
+        if mu_rxn > ((mu_water >> 16) & 3):
+            s = s | 0x200000             # RDRF
+        return s
+    if off == 0x18:
+        return mu_ctrl
+    if off == 0x1C:
+        if mu_rxn == 0:
+            return 0x1000                # RXEMPT
+        d: uint32 = mu_rx[0]
+        i: uint32 = 1
+        while i < mu_rxn:
+            mu_rx[i - 1] = mu_rx[i]
+            i = i + 1
+        mu_rxn = mu_rxn - 1
+        return d
+    if off == 0x24:
+        return mu_modir
+    if off == 0x28:
+        return (mu_fifo & 0x88) | 0x11
+    if off == 0x2C:
+        return (mu_water & 0x30003) | (mu_txn << 8) | (mu_rxn << 24)
+    return 0
+
+
+def mu_wr(off: uint64, v: uint32):
+    if off == 0x08:
+        if (v & 2) != 0:
+            mu_reset_regs()
+        mu_global = v & 2
+    elif off == 0x0C:
+        mu_pincfg = v
+    elif off == 0x10:
+        mu_baud = v
+    elif off == 0x14:
+        mu_cfg = v & MU_STAT_CFG
+        mu_flags = mu_flags & (0xFFFFFFFF ^ (v & MU_STAT_W1C))
+    elif off == 0x18:
+        mu_ctrl = v
+    elif off == 0x1C:
+        if (mu_ctrl & 0x80000) == 0:
+            mu_tx_lost = mu_tx_lost + 1
+        elif mu_txn >= _mu_depth_tx():
+            mu_tx_lost = mu_tx_lost + 1
+        else:
+            mu_tx[mu_txn] = v & 0xFF
+            mu_txn = mu_txn + 1
+    elif off == 0x24:
+        mu_modir = v
+    elif off == 0x28:
+        mu_fifo = v & 0x88
+        if (v & 0x8000) != 0:
+            mu_txn = 0
+        if (v & 0x4000) != 0:
+            mu_rxn = 0
+    elif off == 0x2C:
+        mu_water = v & 0x30003
+
+
+# One microsecond of the transmitter.
+def mu_tick():
+    if mu_stuck != 0:
+        return
+    if mu_shift_left > 0:
+        mu_shift_left = mu_shift_left - 1
+        if mu_shift_left == 0 and mu_wire_n < 512:
+            mu_wire[mu_wire_n] = cast[uint8](mu_shift_byte)
+            mu_wire_n = mu_wire_n + 1
+        return
+    if mu_txn > 0 and (mu_ctrl & 0x80000) != 0:
+        mu_shift_byte = mu_tx[0]
+        i: uint32 = 1
+        while i < mu_txn:
+            mu_tx[i - 1] = mu_tx[i]
+            i = i + 1
+        mu_txn = mu_txn - 1
+        b: uint32 = mu_baud_hz()
+        t: uint32 = 1
+        if b != 0:
+            t = 10000000 / b
+        if t == 0:
+            t = 1
+        mu_shift_left = t
+
+
+# A byte arrives on RX.  err: 0 none, 1 framing, 2 noise, 3 parity.
+def mu_rx_inject(byte: uint32, err: uint32):
+    if (mu_ctrl & 0x40000) == 0:
+        mu_rx_lost = mu_rx_lost + 1
+        return
+    if (mu_flags & 0x80000) != 0:
+        mu_rx_lost = mu_rx_lost + 1
+        return
+    if mu_rxn >= _mu_depth_rx():
+        mu_flags = mu_flags | 0x80000    # OR
+        mu_rx_lost = mu_rx_lost + 1
+        return
+    mu_rx[mu_rxn] = byte & 0xFF
+    mu_rxn = mu_rxn + 1
+    if err == 1:
+        mu_flags = mu_flags | 0x20000
+    elif err == 2:
+        mu_flags = mu_flags | 0x40000
+    elif err == 3:
+        mu_flags = mu_flags | 0x10000
+
+
+# The interrupt request the NVIC would see.
+def mu_irq() -> uint32:
+    if (mu_ctrl & 0x200000) != 0 and mu_rxn > ((mu_water >> 16) & 3):
+        return 1
+    if (mu_ctrl & 0x8000000) != 0 and (mu_flags & 0x80000) != 0:
+        return 1
+    return 0

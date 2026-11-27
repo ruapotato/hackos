@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# GPIO register model (RT1060 RM, GPIO chapter): DR, GDIR, PSR (the pad level:
+# DR for outputs, the outside world for inputs), and the write-only DR_SET,
+# DR_CLEAR, DR_TOGGLE, which change only the bits written as 1.
+
+mg_dr: uint32 = 0
+mg_gdir: uint32 = 0
+mg_ext: uint32 = 0          # levels driven from outside, for inputs
+mg_dr_writes: uint32 = 0    # direct writes of DR (the driver should not need them)
+
+
+def mg_reset():
+    mg_dr = 0
+    mg_gdir = 0
+    mg_ext = 0
+    mg_dr_writes = 0
+
+
+def mg_rd(off: uint64) -> uint32:
+    if off == 0x00:
+        return mg_dr
+    if off == 0x04:
+        return mg_gdir
+    if off == 0x08:
+        return (mg_dr & mg_gdir) | (mg_ext & (0xFFFFFFFF ^ mg_gdir))
+    return 0                # ICR, IMR, ISR, EDGE_SEL: 0; DR_SET/CLEAR/TOGGLE read as 0
+
+
+def mg_wr(off: uint64, v: uint32):
+    if off == 0x00:
+        mg_dr = v
+        mg_dr_writes = mg_dr_writes + 1
+    elif off == 0x04:
+        mg_gdir = v
+    elif off == 0x84:
+        mg_dr = mg_dr | v
+    elif off == 0x88:
+        mg_dr = mg_dr & (0xFFFFFFFF ^ v)
+    elif off == 0x8C:
+        mg_dr = mg_dr ^ v

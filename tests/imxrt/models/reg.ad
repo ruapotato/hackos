@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Stand-in for soc/imxrt/reg.ad in the driver test image: every register
+# access of the drivers lands here and is answered by a model of that block
+# (tests/imxrt/models/*_model.ad) at the RT1062's real addresses, so the
+# drivers run with their production base addresses.  Blocks without
+# behaviour that matters here (IOMUXC, CCM, CCM_ANALOG, IOMUXC_GPR) are plain
+# memory that the tests read back (CCM_ANALOG with its SET/CLR/TOG aliases).  An access anywhere else is counted as
+# unmodelled (a test fails on it) and reads 0; it never reaches the bus.
+
+from tests.imxrt.models.lpuart_model import mu_rd, mu_wr
+from tests.imxrt.models.lpi2c_model import mi_rd, mi_wr
+from tests.imxrt.models.lpspi_model import ms_rd, ms_wr
+from tests.imxrt.models.gpio_model import mg_rd, mg_wr
+
+M_LPUART6: uint64 = 0x40198000
+M_LPI2C1: uint64 = 0x403F0000
+M_LPSPI4: uint64 = 0x403A0000
+M_GPIO2: uint64 = 0x401BC000
+M_IOMUXC: uint64 = 0x401F8000
+M_CCM: uint64 = 0x400FC000
+M_ANALOG: uint64 = 0x400D8000
+M_GPR: uint64 = 0x400AC000
+
+m_iomuxc: Array[1024, uint32]
+m_ccm: Array[64, uint32]
+m_analog: Array[128, uint32]
+m_gpr: Array[32, uint32]
+m_unmodelled: uint32 = 0
+m_unmodelled_addr: uint64 = 0
+m_writes: uint32 = 0
+
+
+# CCM_ANALOG registers have SET, CLR and TOG aliases at +4, +8, +0xC.
+def _analog_alias(addr: uint64, v: uint32) -> uint32:
+    if addr < M_ANALOG or addr >= M_ANALOG + 512:
+        return 0
+    sub: uint64 = (addr - M_ANALOG) & 0xF
+    if sub == 0:
+        return 0
+    i: uint64 = (addr - M_ANALOG - sub) >> 2
+    if sub == 4:
+        m_analog[i] = m_analog[i] | v
+    elif sub == 8:
+        m_analog[i] = m_analog[i] & (0xFFFFFFFF ^ v)
+    else:
+        m_analog[i] = m_analog[i] ^ v
+    return 1
+
+
+def _mem(addr: uint64) -> Ptr[uint32]:
+    if addr >= M_IOMUXC and addr < M_IOMUXC + 4096:
+        return &m_iomuxc[(addr - M_IOMUXC) >> 2]
+    if addr >= M_CCM and addr < M_CCM + 256:
+        return &m_ccm[(addr - M_CCM) >> 2]
+    if addr >= M_ANALOG and addr < M_ANALOG + 512:
+        return &m_analog[(addr - M_ANALOG) >> 2]
+    if addr >= M_GPR and addr < M_GPR + 128:
+        return &m_gpr[(addr - M_GPR) >> 2]
+    return cast[Ptr[uint32]](0)
+
+
+def reg_rd(addr: uint64) -> uint32:
+    if addr >= M_LPUART6 and addr < M_LPUART6 + 0x30:
+        return mu_rd(addr - M_LPUART6)
+    if addr >= M_LPI2C1 and addr < M_LPI2C1 + 0x180:
+        return mi_rd(addr - M_LPI2C1)
+    if addr >= M_LPSPI4 and addr < M_LPSPI4 + 0x78:
+        return ms_rd(addr - M_LPSPI4)
+    if addr >= M_GPIO2 and addr < M_GPIO2 + 0x90:
+        return mg_rd(addr - M_GPIO2)
+    p: Ptr[uint32] = _mem(addr)
+    if cast[uint64](p) != 0:
+        return p[0]
+    m_unmodelled = m_unmodelled + 1
+    m_unmodelled_addr = addr
+    return 0
+
+
+def reg_wr(addr: uint64, v: uint32):
+    m_writes = m_writes + 1
+    if addr >= M_LPUART6 and addr < M_LPUART6 + 0x30:
+        mu_wr(addr - M_LPUART6, v)
+        return
+    if addr >= M_LPI2C1 and addr < M_LPI2C1 + 0x180:
+        mi_wr(addr - M_LPI2C1, v)
+        return
+    if addr >= M_LPSPI4 and addr < M_LPSPI4 + 0x78:
+        ms_wr(addr - M_LPSPI4, v)
+        return
+    if addr >= M_GPIO2 and addr < M_GPIO2 + 0x90:
+        mg_wr(addr - M_GPIO2, v)
+        return
+    if _analog_alias(addr, v) != 0:
+        return
+    p: Ptr[uint32] = _mem(addr)
+    if cast[uint64](p) != 0:
+        p[0] = v
+        return
+    m_unmodelled = m_unmodelled + 1
+    m_unmodelled_addr = addr
+
+
+def reg_rd16(addr: uint64) -> uint32:
+    return reg_rd(addr) & 0xFFFF
+
+
+def reg_wr16(addr: uint64, v: uint32):
+    reg_wr(addr, v & 0xFFFF)
+
+
+def reg_set(addr: uint64, bits: uint32):
+    reg_wr(addr, reg_rd(addr) | bits)
+
+
+def reg_clr(addr: uint64, bits: uint32):
+    reg_wr(addr, reg_rd(addr) & (0xFFFFFFFF ^ bits))
+
+
+def reg_field(addr: uint64, mask: uint32, v: uint32):
+    reg_wr(addr, (reg_rd(addr) & (0xFFFFFFFF ^ mask)) | (v & mask))

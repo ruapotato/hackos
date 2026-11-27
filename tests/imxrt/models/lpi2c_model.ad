@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# LPI2C master model (RT1060 RM, LPI2C chapter, as I read it) with two
+# devices on the bus.  My reading of the manual is all this checks against:
+# it is not an independent oracle.
+#
+#   MCR      MEN; RST resets the registers; RTF/RRF flush the FIFOs (read 0)
+#   MSR      EPF SDF NDF ALF FEF PLTF DMF write one to clear; TDF (TX count
+#            <= TXWATER), RDF (RX count > RXWATER), MBF (master busy: between
+#            START and STOP), BBF computed
+#   MTDR     a 4-word command FIFO: 000 transmit DATA, 001 receive DATA+1,
+#            010 STOP, 100 START + address byte DATA
+#   MRDR     pops the RX FIFO, RXEMPTY (bit 14) when empty
+#   timing   one command (or one received byte) per 10 model microseconds
+#   errors   no device at the address, or a device refusing a byte: NDF.
+#            mi_nack_autostop = 1: the master sends STOP by itself and drops
+#            its FIFO; = 0: it holds its command FIFO until NDF is cleared.
+#            Both are plausible readings; the driver must work with either.
+#            A command needing a transfer outside START..STOP: FEF.
+#            mi_arb_lose: the next START loses arbitration (ALF, not busy).
+#            mi_stall: the bus never moves (a slave holding SCL low).
+#   devices  0x50: 256-byte memory; the first byte written after START sets
+#            the pointer, later bytes are stored there, reads return from it
+#            (an EEPROM-like register file).  0x44: acknowledges its address
+#            and one data byte, then refuses the next (NACK on data).
+
+mi_mcr: uint32 = 0
+mi_flags: uint32 = 0
+mi_mier: uint32 = 0
+mi_cfg: Array[4, uint32]
+mi_mccr0: uint32 = 0
+mi_mfcr: uint32 = 0
+mi_tx: Array[4, uint32]
+mi_txn: uint32 = 0
+mi_rx: Array[4, uint32]
+mi_rxn: uint32 = 0
+mi_busy: uint32 = 0
+mi_addr: uint32 = 0
+mi_read: uint32 = 0
+mi_rx_left: uint32 = 0
+mi_first: uint32 = 0          # next byte written to 0x50 is its pointer
+mi_wait: uint32 = 0
+mi_nack_autostop: uint32 = 1
+mi_arb_lose: uint32 = 0
+mi_stall: uint32 = 0
+mi_mem: Array[256, uint8]
+mi_ptr: uint32 = 0
+mi_44_count: uint32 = 0
+mi_starts: uint32 = 0
+mi_stops: uint32 = 0
+mi_tx_lost: uint32 = 0
+mi_log: Array[64, uint32]     # bus events: 0x1AA start(addr<<1|rw), 0x2DD byte, 0x300 stop
+mi_log_n: uint32 = 0
+
+
+def _mi_log(e: uint32):
+    if mi_log_n < 64:
+        mi_log[mi_log_n] = e
+        mi_log_n = mi_log_n + 1
+
+
+def mi_reset_regs():
+    mi_mcr = 0
+    mi_flags = 0
+    mi_mier = 0
+    i: uint32 = 0
+    while i < 4:
+        mi_cfg[i] = 0
+        i = i + 1
+    mi_mccr0 = 0
+    mi_mfcr = 0
+    mi_txn = 0
+    mi_rxn = 0
+    mi_busy = 0
+    mi_rx_left = 0
+
+
+def mi_reset_all():
+    mi_reset_regs()
+    mi_nack_autostop = 1
+    mi_arb_lose = 0
+    mi_stall = 0
+    mi_starts = 0
+    mi_stops = 0
+    mi_tx_lost = 0
+    mi_log_n = 0
+    mi_44_count = 0
+
+
+def mi_rd(off: uint64) -> uint32:
+    if off == 0x00:
+        return 0x01000003
+    if off == 0x04:
+        return 0x0202                       # MRXFIFO 2, MTXFIFO 2: 4 words
+    if off == 0x10:
+        return mi_mcr
+    if off == 0x14:
+        s: uint32 = mi_flags
+        if mi_txn <= (mi_mfcr & 3):
+            s = s | 1
+        if mi_rxn > ((mi_mfcr >> 16) & 3):
+            s = s | 2
+        if mi_busy != 0:
+            s = s | 0x3000000
+        return s
+    if off == 0x18:
+        return mi_mier
+    if off >= 0x20 and off <= 0x2C:
+        return mi_cfg[cast[uint32]((off - 0x20) >> 2)]
+    if off == 0x48:
+        return mi_mccr0
+    if off == 0x58:
+        return mi_mfcr
+    if off == 0x5C:
+        return mi_txn | (mi_rxn << 16)
+    if off == 0x70:
+        if mi_rxn == 0:
+            return 0x4000
+        d: uint32 = mi_rx[0]
+        i: uint32 = 1
+        while i < mi_rxn:
+            mi_rx[i - 1] = mi_rx[i]
+            i = i + 1
+        mi_rxn = mi_rxn - 1
+        return d
+    return 0
+
+
+def mi_wr(off: uint64, v: uint32):
+    if off == 0x10:
+        if (v & 2) != 0:
+            mi_reset_regs()
+        if (v & 0x100) != 0:
+            mi_txn = 0
+        if (v & 0x200) != 0:
+            mi_rxn = 0
+        mi_mcr = v & 0x30F
+        mi_mcr = mi_mcr & (0xFFFFFFFF ^ 0x300)
+    elif off == 0x14:
+        mi_flags = mi_flags & (0xFFFFFFFF ^ (v & 0x7F00))
+    elif off == 0x18:
+        mi_mier = v
+    elif off >= 0x20 and off <= 0x2C:
+        mi_cfg[cast[uint32]((off - 0x20) >> 2)] = v
+    elif off == 0x48:
+        mi_mccr0 = v
+    elif off == 0x58:
+        mi_mfcr = v
+    elif off == 0x60:
+        if mi_txn >= 4:
+            mi_tx_lost = mi_tx_lost + 1
+        else:
+            mi_tx[mi_txn] = v & 0x7FF
+            mi_txn = mi_txn + 1
+
+
+def _mi_present(a: uint32) -> uint32:
+    if a == 0x50 or a == 0x44:
+        return 1
+    return 0
+
+
+def _mi_nack():
+    mi_flags = mi_flags | 0x400
+    if mi_nack_autostop != 0:
+        mi_txn = 0
+        mi_rx_left = 0
+        mi_busy = 0
+        mi_flags = mi_flags | 0x200          # SDF: the STOP it sent
+        mi_stops = mi_stops + 1
+        _mi_log(0x300)
+
+
+# A data byte to the addressed device; 1 = acknowledged.
+def _mi_dev_write(b: uint32) -> uint32:
+    if mi_addr == 0x50:
+        if mi_first != 0:
+            mi_ptr = b
+            mi_first = 0
+        else:
+            mi_mem[mi_ptr & 255] = cast[uint8](b)
+            mi_ptr = mi_ptr + 1
+        return 1
+    mi_44_count = mi_44_count + 1
+    if mi_44_count > 1:
+        return 0
+    return 1
+
+
+def _mi_dev_read() -> uint32:
+    if mi_addr == 0x50:
+        b: uint32 = cast[uint32](mi_mem[mi_ptr & 255])
+        mi_ptr = mi_ptr + 1
+        return b
+    return 0x44
+
+
+def mi_tick():
+    if mi_stall != 0 or (mi_mcr & 1) == 0:
+        return
+    if mi_wait > 0:
+        mi_wait = mi_wait - 1
+        return
+    mi_wait = 10
+    if (mi_flags & 0x400) != 0 and mi_nack_autostop == 0:
+        return                               # held until NDF is cleared
+    if mi_rx_left > 0:
+        if mi_rxn < 4:
+            mi_rx[mi_rxn] = _mi_dev_read()
+            mi_rxn = mi_rxn + 1
+            mi_rx_left = mi_rx_left - 1
+            _mi_log(0x200 | mi_rx[mi_rxn - 1])
+        return
+    if mi_txn == 0:
+        return
+    w: uint32 = mi_tx[0]
+    i: uint32 = 1
+    while i < mi_txn:
+        mi_tx[i - 1] = mi_tx[i]
+        i = i + 1
+    mi_txn = mi_txn - 1
+    cmd: uint32 = (w >> 8) & 7
+    d: uint32 = w & 0xFF
+    if cmd == 4:
+        mi_starts = mi_starts + 1
+        if mi_arb_lose != 0:
+            mi_arb_lose = 0
+            mi_flags = mi_flags | 0x800      # ALF
+            mi_busy = 0
+            mi_txn = 0
+            return
+        mi_busy = 1
+        mi_addr = d >> 1
+        mi_read = d & 1
+        mi_first = 1
+        mi_44_count = 0
+        _mi_log(0x100 | d)
+        if _mi_present(mi_addr) == 0:
+            _mi_nack()
+    elif cmd == 0:
+        if mi_busy == 0 or mi_read != 0:
+            mi_flags = mi_flags | 0x1000     # FEF
+            return
+        _mi_log(0x200 | d)
+        if _mi_dev_write(d) == 0:
+            _mi_nack()
+    elif cmd == 1:
+        if mi_busy == 0 or mi_read == 0:
+            mi_flags = mi_flags | 0x1000
+            return
+        mi_rx_left = d + 1
+    elif cmd == 2:
+        if mi_busy != 0:
+            mi_busy = 0
+            mi_flags = mi_flags | 0x200
+            mi_stops = mi_stops + 1
+            _mi_log(0x300)
