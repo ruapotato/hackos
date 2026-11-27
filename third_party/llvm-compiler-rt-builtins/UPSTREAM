@@ -1,0 +1,56 @@
+LLVM compiler-rt builtins: software double precision -- third-party, unmodified.
+
+Upstream:   https://github.com/llvm/llvm-project, compiler-rt/lib/builtins/
+Tag:        llvmorg-19.1.7 (the clang version HackOS is built with)
+Fetched:    2026-11-27, single files from raw.githubusercontent.com
+Licence:    Apache-2.0 WITH LLVM-exception (LICENSE, the project's
+            LICENSE.TXT; every file carries the SPDX line).  Apache-2.0 code
+            may be combined into a GPL-3.0/AGPL-3.0 work (FSF: Apache 2.0 is
+            compatible with GPLv3); the LLVM exception further waives the
+            notice requirements for compiled forms.  The usual reading, not
+            legal advice.
+
+Why: the Cortex-M4F's FPU (fpv4-sp-d16) has no double precision.  clang
+then lowers float64 arithmetic to the run-time ABI helpers __aeabi_dadd,
+__aeabi_dmul, __aeabi_ddiv, __aeabi_dcmp*, __aeabi_d2iz, __aeabi_i2d, ...
+These files provide them.  Built only when a board sets SOFT_DOUBLE=1
+(BOARD=feather-nrf52840), with -DCOMPILER_RT_ARMHF_TARGET (hard-float ABI:
+the __aeabi_* entry points take doubles in core registers, the __*df3
+functions in d-registers, as compiler-rt's own armhf build does).  The
+64-bit integer <-> double helpers stay HackOS's own (arch/armv7m/aeabi.S,
+kernel/rt.ad).  Not every file below is compiled; the headers and .inc
+files are what the compiled ones include.
+
+Files taken, byte for byte (sha256; tests/nrf52/run_all.sh verifies them):
+1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d  LICENSE
+c948665a4272f7155fd0cd51c3f2bb218bfd0d1dc0ab556565ee1a4eb315eb26  builtins/adddf3.c
+c2af3f6a5ae89c08e5ee25b3ec03170b7e98d5dc699646c14820e359cd54fde5  builtins/comparedf2.c
+2c8850a107c4ab79d518d1c3246ff936dd28446c82e17c1f347717a36b7a88a8  builtins/divdf3.c
+0da160f7dcf46bf7d54a688a21477db5dfcb7147ad62e74895e00ea9778d78bf  builtins/extendsfdf2.c
+7a17622bf348e1854ff5c47a3290acf7f7d85ddfd97f35e2af7d51d05964ebb2  builtins/fixdfsi.c
+57b6312618aedf3f0f1c13bd1de12b5ea4b7c3070d2bb549d4fc93aca33abb28  builtins/fixunsdfsi.c
+d5141b5b7e860113c75f2d03d0cf39ca41aeea3e75390c40f73979c4ac172b51  builtins/floatsidf.c
+9f3593197c2584c14c86a4760051be18c788d0835cf8ffdb9f11834c2ce9bf5b  builtins/floatunsidf.c
+e35d748cefd466cb17e4d0fd4ef9d92e0911fea97bb7a59ad138479ba9c0d553  builtins/muldf3.c
+201404b61436f1f617221ac20aeee67e41349baaf13ef838f0f5969e3b8b86ab  builtins/subdf3.c
+2842933c7721ae3e6c9d4f8d131f77f9c8228c1d5f77b1b05102c7e8b1f9b515  builtins/truncdfsf2.c
+dc287749a96dfb58345d4ad76697fdea61ea04bace341d6c927ff17122b59064  builtins/assembly.h
+b3da60a65ab5aca4b93ddd36df8af90051912d1c455c4cea2de0e50ce37c526d  builtins/fp_extend.h
+f16da551301b3fe3d21987ee967686f6b9e4b233eecd0ae7b5a0ab461350b55c  builtins/fp_lib.h
+874aa9eee8990ae2a6f48127ddb48c3198a8fa741f634f93053ebac3f89e1e83  builtins/fp_mode.h
+73cc0158ec0150924bd06ecf56ff6abf5c4ae27bcb9c86133d72d33af253203c  builtins/fp_trunc.h
+ec5175561075845b7b16a92ad5ecdfd42a284de2736dd07e4ca7011b75c37709  builtins/int_endianness.h
+b31130f10484636895daa13b91b63d47ea82b45547f29e4dd136b48a67854d30  builtins/int_lib.h
+42d83ee41543909de016379a8251e211a6890cbc7945c433bb30f4ba29d7b10c  builtins/int_math.h
+b4b768e1b2251df4c0161b4c1f120417500ff4883b7008120104d042eeb2151f  builtins/int_types.h
+63d06198ab720a75c20bfd84be895c2746581b129168bae6201e7384bbb0473b  builtins/int_util.h
+327276adbb45d7e2cb2da1cf98b508da00b43b0cb84d4883d07878a0a9a1cd07  builtins/fp_add_impl.inc
+b3a602d7e840571537aef20a2ad57ad124f2efc7f0a456a37bece30e9dde6394  builtins/fp_compare_impl.inc
+3f11a70cfba89f7f444da2b615bf9d507ab9db05ccd93a304843f2bb5b450d7e  builtins/fp_div_impl.inc
+63f9cd801c0c2a04e8becbd22f189eaaa47b5466bc098acc214fe69fd525f92a  builtins/fp_extend_impl.inc
+9f783582b31c028721a14561f2c5741b5bb19befa557a4575e1436381f966f4e  builtins/fp_fixint_impl.inc
+fc0d0b1b6fd1b3ec61ed3cd96e634de9f380eb76b7161fea91ddbddece71ac09  builtins/fp_fixuint_impl.inc
+5fd5ec9eaf57c983ed521f3501346660221d6f2d49d48d186b2046702b54d8c3  builtins/fp_mul_impl.inc
+17098ba776ada9f2cc568a02cf34317bb0b59b8a603ff8a92ea909b7bc8c214b  builtins/fp_trunc_impl.inc
+040510d725d732192eb06ab4eab3956b535009a7792074b25ec020aa5558ab5a  builtins/arm/aeabi_dcmp.S
+c8ca4aee5ac8e775d4ee9fe0959646a17cf842f0cef3fca8e2189240ca495d92  builtins/arm/fp_mode.c
