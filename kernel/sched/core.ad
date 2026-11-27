@@ -34,7 +34,7 @@ from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq
 from kernel.rt import rt_memset
 from mm.slab import kmalloc_aligned, kfree, umalloc_aligned, ufree, pfree
 from kernel.mpu import mpu_switch
-from board.board import board_systick_csr, board_systick_reload
+from board.board import board_tick_start
 
 THREAD_MAX: uint32 = 32
 SCHED_PRIOS: uint32 = 8
@@ -86,7 +86,9 @@ class Thread:
     svc_exc: uint32                 # 16 EXC_RETURN of the SVC that entered the system call
     kstack_top: uint32              # 20 top of the kernel stack
     svc_ctrl: uint32                # 24 CONTROL.nPRIV of the system-call caller
-    pad0: uint32                    # 28
+    exec_sb: uint32                 # 28 r9 for the program an exec has just loaded (an RWPI
+                                    #    program's static base), set by syscall_trampoline
+                                    #    on the way out and cleared; 0 = leave r9 alone
     svc_regs: Array[8, uint32]      # 32 caller's r4-r11 at system-call entry
     # ---- scheduler ----
     tid: uint32                     # 64
@@ -946,8 +948,5 @@ def sched_start():
     sched_current = nxt
     sched_mpu_apply(nxt)
     sched_running = 1
-    mmio_write32(0xE000E010, 0)
-    mmio_write32(0xE000E014, board_systick_reload(SCHED_HZ))
-    mmio_write32(0xE000E018, 0)
-    mmio_write32(0xE000E010, board_systick_csr())
+    board_tick_start(SCHED_HZ)          # calls systick_handler SCHED_HZ times a second
     sched_launch()

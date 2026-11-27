@@ -11,6 +11,13 @@
 #     load segments to wherever the block happens to be, clears the rest and
 #     applies the R_ARM_RELATIVE relocations (add the load address).  Code
 #     reaches data PC-relative, so code and data move together.
+#   * Or (PROG_ABI=rwpi, a board with little RAM) an ET_EXEC built with
+#     `-fropi -frwpi` (user/rt/prog_rwpi.ld): code and constants reach each
+#     other PC-relative, data is reached from r9.  The code segment is run
+#     IN PLACE when the file is in the ROM table and the board has a flash
+#     window for it (board_xip_lo/hi, MPU region 4), else copied into the
+#     block above the data; only the data segment is copied, and the program
+#     starts with r9 = where it went.  _load_rwpi.
 #   * One block holds everything the process may touch:
 #
 #         base                         load                      end
@@ -44,11 +51,11 @@
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.rt import rt_memcpy, rt_memset
-from board.board import board_code_loaded
+from board.board import board_code_loaded, board_xip_lo, board_xip_hi
 from kernel.mpu import mpu_proc_rasr, mpu_proc_rbar
 from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, thread_killed, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, WAIT_FOREVER
 from mm.slab import kmalloc, kfree, palloc_aligned, pfree
-from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, OREAD, ENOMEM, EFAULT, EINVAL
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, vfs_rom_addr, OREAD, ENOMEM, EFAULT, EINVAL
 from kernel.pipe import EAGAIN
 from kernel.uaccess import uok, ustr
 
@@ -81,6 +88,8 @@ proc_last_block: uint32 = 0         # bytes of the block the last load used
 proc_last_image: uint32 = 0         # of them: the image (text, data, bss)
 proc_last_stack: uint32 = 0         # the stack
 proc_last_relocs: uint32 = 0        # relocations applied
+proc_last_xip: uint32 = 0           # 1: the last load ran its code in place (flash)
+proc_xip_loads: uint64 = 0          # loads whose code stayed in flash
 
 
 # What a load produced.
@@ -93,6 +102,8 @@ class Image:
     load: uint32                    # where the image's address 0 is
     entry: uint32
     stack_top: uint32               # == load: the stack lies below the image
+    sb: uint32                      # RWPI: r9, the data segment's address; 0 for a PIE
+    pad: uint32
 
 
 def _rd16(p: Ptr[uint8], off: uint32) -> uint32:
@@ -158,7 +169,8 @@ def _load_fd(fd: int32, hdr: Ptr[uint8], ph: Ptr[uint8], img: Ptr[Image]) -> int
     # 0x7F 'E' 'L' 'F', 32-bit, little-endian; ET_DYN (3); EM_ARM (40)
     if _rd32(hdr, 0) != 0x464C457F or hdr[4] != 1 or hdr[5] != 1:
         return _fail(ENOEXEC, "exec: not a 32-bit little-endian ELF file")
-    if _rd16(hdr, 16) != 3 or _rd16(hdr, 18) != 40:
+    etype: uint32 = _rd16(hdr, 16)
+    if (etype != 3 and etype != 2) or _rd16(hdr, 18) != 40:
         return _fail(ENOEXEC, "exec: not a position-independent ARM executable")
     entry: uint32 = _rd32(hdr, 24)
     phoff: uint32 = _rd32(hdr, 28)
@@ -166,6 +178,8 @@ def _load_fd(fd: int32, hdr: Ptr[uint8], ph: Ptr[uint8], img: Ptr[Image]) -> int
     phnum: uint32 = _rd16(hdr, 44)
     if phentsize != 32 or phnum == 0 or phnum > 16:
         return _fail(ENOEXEC, "exec: bad program header table")
+    if etype == 2:
+        return _load_rwpi(fd, ph, img, entry, phoff, phnum)
     # pass 1: extent of the image, stack size
     hi: uint32 = 0
     stack: uint32 = PROC_STACK_DEFAULT
@@ -277,10 +291,115 @@ def _load_fd(fd: int32, hdr: Ptr[uint8], ph: Ptr[uint8], img: Ptr[Image]) -> int
     img[0].load = load
     img[0].entry = load + (entry & 0xFFFFFFFE)
     img[0].stack_top = load
+    img[0].sb = 0
     proc_last_block = bsize
     proc_last_image = hi
     proc_last_stack = stack
     proc_last_relocs = nrel
+    proc_last_xip = 0
+    return 0
+
+
+# An RWPI program (ET_EXEC, user/rt/prog_rwpi.ld): one R+X load segment
+# linked at 0 (code, constants), one R+W segment (data, bss, heap) linked
+# elsewhere.  The block:
+#
+#     base                  load = sb                         end
+#     | stack (grows down) | argv | data, bss, heap | [code, if not in place] |
+#
+# The code runs in place when the file is in the ROM table, inside the
+# board's flash window, 8-byte aligned (its link alignment); otherwise it is
+# copied.  No relocations: the build refuses a program that would need one.
+def _load_rwpi(fd: int32, ph: Ptr[uint8], img: Ptr[Image], entry: uint32, phoff: uint32, phnum: uint32) -> int32:
+    toff: uint32 = 0
+    tsize: uint32 = 0
+    ntext: uint32 = 0
+    doff: uint32 = 0
+    dfile: uint32 = 0
+    dmem: uint32 = 0
+    ndata: uint32 = 0
+    stack: uint32 = PROC_STACK_DEFAULT
+    i: uint32 = 0
+    while i < phnum:
+        if _read_at(fd, phoff + i * 32, cast[uint64](ph), 32) != 0:
+            return _fail(ENOEXEC, "exec: truncated program headers")
+        ptype: uint32 = _rd32(ph, 0)
+        pflags: uint32 = _rd32(ph, 24)
+        if ptype == PT_LOAD and _rd32(ph, 20) != 0:
+            filesz: uint32 = _rd32(ph, 16)
+            memsz: uint32 = _rd32(ph, 20)
+            if filesz > memsz or memsz > 0x4000000:
+                return _fail(ENOEXEC, "exec: bad load segment")
+            if (pflags & 2) != 0:               # PF_W: the data segment
+                doff = _rd32(ph, 4)
+                dfile = filesz
+                dmem = memsz
+                ndata = ndata + 1
+            else:                               # the code segment, at 0
+                if _rd32(ph, 8) != 0 or filesz != memsz:
+                    return _fail(ENOEXEC, "exec: code segment not at 0")
+                toff = _rd32(ph, 4)
+                tsize = filesz
+                ntext = ntext + 1
+        elif ptype == PT_GNU_STACK and _rd32(ph, 20) != 0:
+            stack = _rd32(ph, 20)
+        elif ptype == PT_DYNAMIC:
+            return _fail(ENOEXEC, "exec: an RWPI program must not need relocations")
+        i = i + 1
+    if ntext != 1 or ndata > 1 or tsize == 0:
+        return _fail(ENOEXEC, "exec: not one code and at most one data segment")
+    if (entry & 0xFFFFFFFE) >= tsize:
+        return _fail(ENOEXEC, "exec: entry point outside the code")
+    if stack < PROC_STACK_MIN:
+        stack = PROC_STACK_MIN
+    if stack > PROC_STACK_MAX:
+        return _fail(ENOEXEC, "exec: stack size out of range")
+    stack = (stack + 15) & 0xFFFFFFF0
+    dsize: uint32 = (dmem + 15) & 0xFFFFFFF0
+    code: uint64 = 0
+    rom: uint64 = vfs_rom_addr(fd)
+    if rom != 0:
+        c: uint64 = rom + cast[uint64](toff)
+        if (c & 7) == 0 and c >= board_xip_lo() and c + cast[uint64](tsize) <= board_xip_hi():
+            code = c
+    need: uint32 = stack + dsize
+    if code == 0:
+        need = need + ((tsize + 15) & 0xFFFFFFF0)
+    k: uint32 = 0
+    rsize: uint32 = _region_for(need, &k)
+    bsize: uint32 = (rsize / 8) * k
+    base: uint64 = palloc_aligned(cast[uint64](bsize), cast[uint64](rsize))
+    if base == 0:
+        return _fail(ENOMEM, "exec: out of program memory")
+    rt_memset(base, 0, cast[uint64](bsize))
+    load: uint32 = cast[uint32](base) + stack
+    if dfile != 0:
+        if _read_at(fd, doff, cast[uint64](load), dfile) != 0:
+            pfree(base)
+            return _fail(ENOEXEC, "exec: truncated data segment")
+    xip: uint32 = 1
+    if code == 0:
+        xip = 0
+        code = cast[uint64](load + dsize)
+        if _read_at(fd, toff, code, tsize) != 0:
+            pfree(base)
+            return _fail(ENOEXEC, "exec: truncated code segment")
+        board_code_loaded(code, cast[uint64](tsize))
+    img[0].base = base
+    img[0].lo = cast[uint32](base)
+    img[0].hi = cast[uint32](base) + bsize
+    img[0].rbar = mpu_proc_rbar(cast[uint32](base))
+    img[0].rasr = mpu_proc_rasr(rsize, k)
+    img[0].load = load
+    img[0].entry = cast[uint32](code) + (entry & 0xFFFFFFFE)
+    img[0].stack_top = load
+    img[0].sb = load
+    proc_last_block = bsize
+    proc_last_image = dmem + (1 - xip) * tsize
+    proc_last_stack = stack
+    proc_last_relocs = 0
+    proc_last_xip = xip
+    proc_xip_loads = proc_xip_loads + cast[uint64](xip)
     return 0
 
 
@@ -414,6 +533,7 @@ def _spawn_args(path: Ptr[uint8], a: Ptr[Args], prio: uint32, flags: uint32) -> 
     t[0].pgid = current_thread()[0].pgid
     # the first switch to the thread pops r4-r11 and returns through the frame
     rt_memset(cast[uint64](frame - 32), 0, 32)
+    cast[Ptr[uint32]](cast[uint64](frame - 32))[5] = img.sb        # r9
     t[0].sp = frame - 32
     proc_spawned = proc_spawned + 1
     pid: int32 = cast[int32](t[0].tid)
@@ -520,6 +640,7 @@ def proc_exec(path: Ptr[uint8], argv: uint64, envp: uint64) -> int32:
     t[0].usp = frame                    # svc #1 returns through this frame
     t[0].svc_exc = 0xFFFFFFFD           # thread mode, process stack, no FP context
     t[0].svc_ctrl = 1
+    t[0].exec_sb = img.sb               # r9 on the way out (switch.S)
     was_vfork: uint32 = t[0].pflags & PF_VFORK
     t[0].pflags = (t[0].pflags & (0xFFFFFFFF ^ PF_VFORK)) | PF_VFDONE
     sched_mpu_apply(cast[uint64](t))

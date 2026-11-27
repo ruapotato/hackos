@@ -24,8 +24,13 @@
  *   A pointer passed TO Adder must have its high word zero.
  */
         .syntax unified
+#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+        .cpu cortex-m4
+        .fpu fpv4-sp-d16
+#else
         .cpu cortex-m7
         .fpu fpv5-d16
+#endif
         .thumb
 
 /* ------------------------------------------------------------------ */

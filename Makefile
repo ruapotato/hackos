@@ -27,9 +27,10 @@
 BOARD   ?= qemu-mps2
 BOARD_DIR_qemu-mps2 := mps2_an500
 BOARD_DIR_teensy41  := teensy41
+BOARD_DIR_feather-nrf52840 := feather_nrf52840
 BOARD_DIR := $(BOARD_DIR_$(BOARD))
 ifeq ($(BOARD_DIR),)
-$(error unknown BOARD=$(BOARD); known: qemu-mps2 teensy41)
+$(error unknown BOARD=$(BOARD); known: qemu-mps2 teensy41 feather-nrf52840)
 endif
 ADDER   ?= ../adder
 CLANG   ?= clang
@@ -42,12 +43,6 @@ QEMU    ?= qemu-system-arm
 HOST_AC := $(ADDER)/build/cutover/host_ac.elf
 HOST_AC_ABS = $(abspath $(HOST_AC))
 TRIPLE  := thumbv7em-none-eabihf
-CPUFLAGS := --target=$(TRIPLE) -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb
-OPT     ?= -O2
-# -ffunction-sections/-fdata-sections + --gc-sections: only what is reachable
-# from the vector table is linked.
-LLFLAGS := $(CPUFLAGS) $(OPT) -ffreestanding -fno-pic -ffunction-sections -fdata-sections -Wno-override-module
-ASFLAGS := $(CPUFLAGS) -ffreestanding -Iboards/$(BOARD_DIR)
 
 ifeq ($(BOARD),qemu-mps2)
 B := build
@@ -55,11 +50,37 @@ else
 B := build/$(BOARD)
 endif
 # Defaults a board.mk may change.
+#   CPU, FPU      clang's -mcpu/-mfpu.  The Adder target is the same
+#                 (thumbv7em-none-eabihf) for the Cortex-M7 and the M4F.
+#   SOFT_DOUBLE   1 when the FPU has no double precision (Cortex-M4F:
+#                 fpv4-sp-d16): float64 arithmetic becomes calls to the
+#                 __aeabi_d* helpers, which then come from
+#                 third_party/llvm-compiler-rt-builtins (kernel and programs).
+#   PROG_ABI      pie: a program is a PIE copied whole into RAM (default);
+#                 rwpi: code and constants PC-relative (ROPI), data
+#                 r9-relative (RWPI), so the kernel can run a program's code
+#                 in place from flash and copy only its data (docs/porting.md).
+#   PROGS_SKIP    programs not built for this board.
 LINK_LD       := boards/$(BOARD_DIR)/link.ld
 IMAGES        := hackos
 BOARD_PATCHES :=
 PROG_AFLAGS   :=
+CPU           := cortex-m7
+FPU           := fpv5-d16
+SOFT_DOUBLE   := 0
+PROG_ABI      := pie
+PROGS_SKIP    :=
 include boards/$(BOARD_DIR)/board.mk
+
+CPUFLAGS := --target=$(TRIPLE) -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=hard -mthumb
+ifeq ($(CPU),cortex-m4)
+CPUFLAGS += -DHACKOS_CPU_M4
+endif
+OPT     ?= -O2
+# -ffunction-sections/-fdata-sections + --gc-sections: only what is reachable
+# from the vector table is linked.
+LLFLAGS := $(CPUFLAGS) $(OPT) -ffreestanding -fno-pic -ffunction-sections -fdata-sections -Wno-override-module
+ASFLAGS := $(CPUFLAGS) -ffreestanding -Iboards/$(BOARD_DIR)
 LDFLAGS := -T $(LINK_LD) --gc-sections -nostdlib -static
 
 # C code (third-party drivers and their tests): natural C ABI, no C library
@@ -85,13 +106,32 @@ PROGS_OWN    := hello ptest crel halt
 HEAP_ptest   := 8192
 PROGS_HAMNIX := echo cat ls cp rm mkdir wc head grep hamsh
 STACK_hamsh  ?= 65536
-PROGS        := $(PROGS_OWN) $(PROGS_HAMNIX)
+PROGS        := $(filter-out $(PROGS_SKIP),$(PROGS_OWN) $(PROGS_HAMNIX))
 PROG_BINS    := $(PROGS:%=$(B)/user/%)
 SRC_USER     := $(wildcard user/progs/*.ad user/hamnix/*.ad user/rt/*.ad lib/*.ad lib/*/*.ad kernel/rt.ad)
-UFLAGS  := $(CPUFLAGS) $(OPT) -ffreestanding -fPIE -ffunction-sections -fdata-sections -Wno-override-module
+ifeq ($(PROG_ABI),rwpi)
+UPIC    := -fropi -frwpi
+UAFLAGS := $(CPUFLAGS) -ffreestanding -DHACKOS_RWPI
+ULDFLAGS := -static -T user/rt/prog_rwpi.ld --gc-sections -nostdlib -z max-page-size=16
+else
+UPIC    := -fPIE
 UAFLAGS := $(CPUFLAGS) -ffreestanding -fPIE
 ULDFLAGS := -pie --no-dynamic-linker --omagic -T user/rt/prog.ld --gc-sections -nostdlib -z norelro
+endif
+UFLAGS  := $(CPUFLAGS) $(OPT) -ffreestanding $(UPIC) -ffunction-sections -fdata-sections -Wno-override-module
 URT     := $(B)/user/crt.o $(B)/user/aeabi.o $(B)/user/rt.o
+
+# Soft double precision (SOFT_DOUBLE=1): compiler-rt's builtins, unmodified,
+# compiled twice: for the kernel (absolute) and for programs (as UPIC).
+CRT_DIR  := third_party/llvm-compiler-rt-builtins/builtins
+CRT_SRCS := adddf3 subdf3 muldf3 divdf3 comparedf2 fixdfsi fixunsdfsi floatsidf floatunsidf extendsfdf2 truncdfsf2
+CRT_CFLAGS := $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -ffunction-sections -fdata-sections -DCOMPILER_RT_ARMHF_TARGET -w
+ifeq ($(SOFT_DOUBLE),1)
+KRT_OBJS := $(CRT_SRCS:%=$(B)/crt/k_%.o) $(B)/crt/k_aeabi_dcmp.o $(B)/crt/k_fp_mode.o
+URT      += $(CRT_SRCS:%=$(B)/crt/u_%.o) $(B)/crt/u_aeabi_dcmp.o $(B)/crt/u_fp_mode.o
+else
+KRT_OBJS :=
+endif
 STRIP   ?= llvm-strip
 
 .SECONDARY:
@@ -150,7 +190,7 @@ $(B)/user/%.o: $(B)/user/%.ll
 
 # A C program: natural C code, position-independent, no C library.
 $(B)/user/%.o: user/progs/%.c | $(B)/user
-	$(CLANG) $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fPIE -ffunction-sections -fdata-sections -Wall -Wextra -c $< -o $@
+	$(CLANG) $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc $(UPIC) -ffunction-sections -fdata-sections -Wall -Wextra -c $< -o $@
 
 $(B)/user/crt.o: user/rt/crt.S | $(B)/user
 	$(CLANG) $(UAFLAGS) -c $< -o $@
@@ -158,7 +198,28 @@ $(B)/user/crt.o: user/rt/crt.S | $(B)/user
 $(B)/user/aeabi.o: arch/armv7m/aeabi.S | $(B)/user
 	$(CLANG) $(UAFLAGS) -c $< -o $@
 
-$(B)/user/%.elf: $(B)/user/%.o $(URT) user/rt/prog.ld
+$(B)/crt:
+	mkdir -p $(B)/crt
+
+$(B)/crt/k_%.o: $(CRT_DIR)/%.c | $(B)/crt
+	$(CLANG) $(CRT_CFLAGS) -fno-pic -c $< -o $@
+
+$(B)/crt/u_%.o: $(CRT_DIR)/%.c | $(B)/crt
+	$(CLANG) $(CRT_CFLAGS) $(UPIC) -c $< -o $@
+
+$(B)/crt/k_fp_mode.o: $(CRT_DIR)/arm/fp_mode.c | $(B)/crt
+	$(CLANG) $(CRT_CFLAGS) -fno-pic -c $< -o $@
+
+$(B)/crt/u_fp_mode.o: $(CRT_DIR)/arm/fp_mode.c | $(B)/crt
+	$(CLANG) $(CRT_CFLAGS) $(UPIC) -c $< -o $@
+
+$(B)/crt/k_aeabi_dcmp.o: $(CRT_DIR)/arm/aeabi_dcmp.S | $(B)/crt
+	$(CLANG) $(CRT_CFLAGS) -c $< -o $@
+
+$(B)/crt/u_aeabi_dcmp.o: $(CRT_DIR)/arm/aeabi_dcmp.S | $(B)/crt
+	$(CLANG) $(CRT_CFLAGS) -c $< -o $@
+
+$(B)/user/%.elf: $(B)/user/%.o $(URT) user/rt/prog.ld user/rt/prog_rwpi.ld
 	$(LLD) $(ULDFLAGS) -z stack-size=$(or $(STACK_$*),8192) --defsym=__heap_size=$(or $(HEAP_$*),0) -Map=$(B)/user/$*.map -o $@ $(URT) $<
 
 $(B)/user/%: $(B)/user/%.elf
@@ -191,9 +252,9 @@ $(B)/c/%.o: lib/cshim/%.c | $(B)
 $(B)/%.o: tests/arch/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/fptest.o $(B)/romfs.o $(COBJS_ktest) $(LINK_LD)
-	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(B)/romfs.o $<
-	$(OBJDUMP) -d --mcpu=cortex-m7 --no-show-raw-insn $@ > $(B)/$*.lst
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/romfs.o $(KRT_OBJS) $(foreach i,$(IMAGES),$(KOBJS_$(i)) $(COBJS_$(i))) $(LINK_LD)
+	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(B)/romfs.o $(KRT_OBJS) $<
+	$(OBJDUMP) -d --mcpu=$(CPU) --no-show-raw-insn $@ > $(B)/$*.lst
 
 # The "card": a 2 MiB FAT32 image made with mtools, loaded by QEMU into the
 # RAM disk (boards/mps2_an500/link.ld: __ramdisk_start) before the kernel

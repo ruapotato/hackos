@@ -12,8 +12,13 @@
  * from any context, including nested interrupts.
  */
         .syntax unified
+#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+        .cpu cortex-m4
+        .fpu fpv4-sp-d16
+#else
         .cpu cortex-m7
         .fpu fpv5-d16
+#endif
         .thumb
 
 /* Interrupts whose priority value is >= KERNEL_BASEPRI are "kernel aware":

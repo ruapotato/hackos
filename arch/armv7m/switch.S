@@ -11,6 +11,7 @@
         .equ    T_SVC_EXC,    16        /* EXC_RETURN of the entering SVC  */
         .equ    T_KSTACK_TOP, 20
         .equ    T_SVC_CTRL,   24        /* caller's CONTROL.nPRIV          */
+        .equ    T_EXEC_SB,    28        /* r9 for a just-exec'ed RWPI program */
         .equ    T_SVC_REGS,   32        /* caller's r4-r11 at system-call entry */
         .equ    T_STATE,      68        /* scheduler state                 */
         .equ    T_ZOMBIE,      4
@@ -18,8 +19,13 @@
         .equ    FPCCR,        0xE000EF34
 
         .syntax unified
+#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+        .cpu cortex-m4
+        .fpu fpv4-sp-d16
+#else
         .cpu cortex-m7
         .fpu fpv5-d16
+#endif
         .thumb
 
         .macro  func name
@@ -244,7 +250,20 @@ svc_bad:
 /* Thread mode, privileged, on the kernel stack.  r0:r1 = caller's frame. */
         func    syscall_trampoline
         bl      syscall_dispatch        /* Adder; writes the result into   */
-        svc     #1                      /* the caller's frame              */
+                                        /* the caller's frame              */
+        /* An exec that loaded an RWPI program (kernel/proc.ad) leaves the
+         * new program's static base in T_EXEC_SB: it returns with r9 set to
+         * that.  Otherwise r9 is still the caller's, as the kernel's code
+         * preserves it (AAPCS callee-saved).                               */
+        movw    r3, #:lower16:sched_current
+        movt    r3, #:upper16:sched_current
+        ldr     r2, [r3]
+        ldr     r0, [r2, #T_EXEC_SB]
+        cbz     r0, 2f
+        mov     r9, r0
+        movs    r0, #0
+        str     r0, [r2, #T_EXEC_SB]
+2:      svc     #1
 1:      b       1b
         .size   syscall_trampoline, . - syscall_trampoline
 

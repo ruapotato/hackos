@@ -17,8 +17,11 @@ from kernel.rt import rt_memcpy, rt_memmove, rt_memset, rt_udivmod64, rt_sdivmod
 
 extern def hackos_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64
 extern def main(argc: int32, argv: Ptr[uint64]) -> int32
-extern def __heap_start()
-extern def __heap_end()
+# Where the heap is (user/rt/crt.S): computed PC-relative in a PIE and from
+# the static base r9 in an RWPI program, where the data does not move with
+# the code and `&__heap_start` (code-relative) would be wrong.
+extern def hackos_heap_lo() -> uint64
+extern def hackos_heap_hi() -> uint64
 
 # The environment the program was started with: a NULL-terminated vector of
 # "NAME=value" strings (8-byte entries), or an empty vector.
@@ -290,8 +293,8 @@ def _hset(b: uint64, size: uint64, used: uint64):
 
 # Anonymous memory only: fd must be -1.  Returns the address or -12.
 def sys_mmap(addr: uint64, length: uint64, prot: int32, flags: int32, fd: int32, off: int64) -> int64:
-    lo: uint64 = cast[uint64](&__heap_start)
-    hi: uint64 = cast[uint64](&__heap_end)
+    lo: uint64 = hackos_heap_lo()
+    hi: uint64 = hackos_heap_hi()
     if fd != -1 or length == 0 or hi - lo < 32:
         return -12
     if heap_ready == 0:
@@ -320,8 +323,8 @@ def sys_mmap(addr: uint64, length: uint64, prot: int32, flags: int32, fd: int32,
 
 
 def sys_munmap(addr: uint64, length: uint64) -> int64:
-    lo: uint64 = cast[uint64](&__heap_start)
-    hi: uint64 = cast[uint64](&__heap_end)
+    lo: uint64 = hackos_heap_lo()
+    hi: uint64 = hackos_heap_hi()
     if addr < lo + 16 or addr >= hi or (addr & 15) != 0 or _hused(addr - 16) != 1:
         return -22
     _hset(addr - 16, _hsize(addr - 16), 0)

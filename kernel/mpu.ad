@@ -18,6 +18,9 @@
 #                                                                   program arena
 #   4  shared user arena           read/write   (*)           no    stacks and mmap memory of
 #                                                                   in-image unprivileged threads
+#      or, while a process runs, on a board whose programs execute in place
+#      (board_mpu_xip_rasr() != 0): the flash window of /bin, read-only for
+#      everyone, executable: the code of every program in the ROM table
 #   5  the current process's block read/write   read/write    yes   one loaded program: stack,
 #                                                                   code, data (off otherwise)
 #   6  1 KB at the bottom of the current thread's user stack    none / none
@@ -61,7 +64,7 @@
 #   * A kernel-stack frame larger than the 1 KB guard can step over it.
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_isb
-from board.board import board_mpu_code_base, board_mpu_code_size, board_mpu_kram_base, board_mpu_kram_size, board_mpu_xram_base, board_mpu_xram_size, board_mpu_extra
+from board.board import board_mpu_code_base, board_mpu_code_size, board_mpu_kram_base, board_mpu_kram_size, board_mpu_xram_base, board_mpu_xram_size, board_mpu_extra, board_mpu_xip_rbar, board_mpu_xip_rasr
 
 extern def __user_start()
 extern def __user_end()
@@ -171,6 +174,9 @@ def mpu_switch(ustack_base: uint64, kstack_base: uint64, kind: uint32, rbar: uin
         if mpu_mode != MPU_MODE_PROC:
             mmio_write32(MPU_RNR, 4)
             mmio_write32(MPU_RASR, 0)
+            if board_mpu_xip_rasr() != 0:
+                mmio_write32(MPU_RBAR, board_mpu_xip_rbar())     # VALID | region 4
+                mmio_write32(MPU_RASR, board_mpu_xip_rasr())
             mpu_region(0, board_mpu_code_base(), board_mpu_code_size(), MPU_AP_PRIV_RO, 0)
             mpu_mode = MPU_MODE_PROC
     elif kind == 1:

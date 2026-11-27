@@ -17,7 +17,8 @@
 # Makefile: BOARD, scripts/mkroot.sh):
 #   board_name, board_cpu_hz, board_init_early, board_late_init
 #   board_console_{init,putc,rx_irq_enable,rx_ready,getc,rx_irq_ack}
-#   board_systick_csr, board_systick_reload      scheduler tick source
+#   board_tick_start (board_systick_csr, board_systick_reload)   scheduler tick
+#   board_mpu_xip_{rbar,rasr}, board_xip_{lo,hi}   flash window of /bin (XIP)
 #   board_mpu_{code,kram,xram}_{base,size}, board_mpu_extra   MPU plan
 #   board_storage_init     registers the block device FAT is mounted from
 #   board_code_loaded      after a program image was written to RAM
@@ -53,6 +54,33 @@ def board_systick_csr() -> uint32:
 
 def board_systick_reload(hz: uint32) -> uint32:
     return board_cpu_hz() / hz - 1
+
+
+# The scheduler's tick: SysTick, `hz` times a second, calling the kernel's
+# systick_handler (exception 15) directly.
+def board_tick_start(hz: uint32):
+    mmio_write32(0xE000E010, 0)
+    mmio_write32(0xE000E014, board_systick_reload(hz))
+    mmio_write32(0xE000E018, 0)
+    mmio_write32(0xE000E010, board_systick_csr())
+
+
+# Programs are copied whole into RAM here (PROG_ABI=pie): no flash window
+# for running code in place (kernel/mpu.ad region 4, kernel/uaccess.ad).
+def board_mpu_xip_rbar() -> uint32:
+    return 0
+
+
+def board_mpu_xip_rasr() -> uint32:
+    return 0
+
+
+def board_xip_lo() -> uint64:
+    return 0
+
+
+def board_xip_hi() -> uint64:
+    return 0
 
 
 # Regions 0, 2 and 3 of the MPU plan (kernel/mpu.ad): the code region, the

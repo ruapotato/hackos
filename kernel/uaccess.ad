@@ -4,7 +4,9 @@
 #
 # A pointer from an unprivileged caller is checked against what the MPU lets
 # that caller touch before the kernel uses it:
-#   * a process: its own block, nothing else;
+#   * a process: its own block, and for reading only the flash window of
+#     /bin on a board whose programs run in place (their constants are
+#     there; kernel/mpu.ad region 4);
 #   * an unprivileged thread of the kernel image: the shared user arena
 #     (read/write) and the image's text and constants (read-only; string
 #     literals live there);
@@ -12,6 +14,7 @@
 
 from kernel.sched.core import Thread, thr, sched_current, TF_PROC
 from mm.slab import user_arena_start, user_arena_end
+from board.board import board_xip_lo, board_xip_hi
 
 extern def __text_end()
 extern def __vectors_start()
@@ -27,6 +30,8 @@ def uok(addr: uint64, len: uint64, write: uint32) -> uint32:
         return 0
     if (t[0].flags & TF_PROC) != 0:
         if addr >= cast[uint64](t[0].mem_lo) and end <= cast[uint64](t[0].mem_hi):
+            return 1
+        if write == 0 and addr >= board_xip_lo() and end <= board_xip_hi():
             return 1
         return 0
     if addr >= user_arena_start() and end <= user_arena_end():

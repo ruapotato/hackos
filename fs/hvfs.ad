@@ -933,6 +933,20 @@ def vfs_write(fd: int32, buf: Ptr[uint8], n: uint64) -> int64:
     return cast[int64](w)
 
 
+# Where a /bin file's bytes are, if `fd` is one: the ROM table is in the
+# kernel image, readable in place (the loader runs a program's code from
+# there on a board whose programs execute in place, kernel/proc.ad).  0 for
+# any other kind of file.
+def vfs_rom_addr(fd: int32) -> uint64:
+    mutex_lock(&fs_lock)
+    f: Ptr[OpenFile] = _fd_file(fd)
+    a: uint64 = 0
+    if f != cast[Ptr[OpenFile]](0) and f[0].kind == OF_ROM:
+        a = rom_data(cast[uint32](f[0].slot))
+    mutex_unlock(&fs_lock)
+    return a
+
+
 def vfs_lseek(fd: int32, off: int64, whence: uint32) -> int64:
     mutex_lock(&fs_lock)
     f: Ptr[OpenFile] = _fd_file(fd)

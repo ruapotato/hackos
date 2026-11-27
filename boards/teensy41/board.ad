@@ -125,6 +125,33 @@ def board_systick_reload(hz: uint32) -> uint32:
     return 100000 / hz - 1
 
 
+# The scheduler's tick: SysTick, `hz` times a second, calling the kernel's
+# systick_handler (exception 15) directly.
+def board_tick_start(hz: uint32):
+    mmio_write32(0xE000E010, 0)
+    mmio_write32(0xE000E014, board_systick_reload(hz))
+    mmio_write32(0xE000E018, 0)
+    mmio_write32(0xE000E010, board_systick_csr())
+
+
+# Programs are copied whole into RAM here (PROG_ABI=pie): no flash window
+# for running code in place (kernel/mpu.ad region 4, kernel/uaccess.ad).
+def board_mpu_xip_rbar() -> uint32:
+    return 0
+
+
+def board_mpu_xip_rasr() -> uint32:
+    return 0
+
+
+def board_xip_lo() -> uint64:
+    return 0
+
+
+def board_xip_hi() -> uint64:
+    return 0
+
+
 # ---- MPU plan (kernel/mpu.ad) ---------------------------------------------
 def board_mpu_code_base() -> uint32:
     return 0x60000000
