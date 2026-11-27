@@ -81,7 +81,7 @@ OPT     ?= -O2
 # from the vector table is linked.
 LLFLAGS := $(CPUFLAGS) $(OPT) -ffreestanding -fno-pic -ffunction-sections -fdata-sections -Wno-override-module
 ASFLAGS := $(CPUFLAGS) -ffreestanding -Iboards/$(BOARD_DIR)
-LDFLAGS := -T $(LINK_LD) --gc-sections -nostdlib -static
+LDFLAGS := -T $(LINK_LD) --gc-sections -nostdlib -static $(LDFLAGS_BOARD)
 
 # C code (third-party drivers and their tests): natural C ABI, no C library
 # except lib/cshim, whose functions carry hackos_c_ names (the forced include
@@ -112,7 +112,7 @@ SRC_USER     := $(wildcard user/progs/*.ad user/hamnix/*.ad user/rt/*.ad lib/*.a
 ifeq ($(PROG_ABI),rwpi)
 UPIC    := -fropi -frwpi
 UAFLAGS := $(CPUFLAGS) -ffreestanding -DHACKOS_RWPI
-ULDFLAGS := -static -T user/rt/prog_rwpi.ld --gc-sections -nostdlib -z max-page-size=16
+ULDFLAGS := -static -T user/rt/prog_rwpi.ld --gc-sections -nostdlib -z max-page-size=16 --no-rosegment
 else
 UPIC    := -fPIE
 UAFLAGS := $(CPUFLAGS) -ffreestanding -fPIE
@@ -135,7 +135,7 @@ endif
 STRIP   ?= llvm-strip
 
 .SECONDARY:
-.PHONY: all test run size measure clean compiler test-teensy
+.PHONY: all test run size measure clean compiler test-teensy test-nrf52
 all: $(IMAGES:%=$(B)/%.elf) $(BOARD_ALL)
 
 # Bootstrap the compiler in ITS tree if its binary is missing or older than
@@ -220,7 +220,7 @@ $(B)/crt/u_aeabi_dcmp.o: $(CRT_DIR)/arm/aeabi_dcmp.S | $(B)/crt
 	$(CLANG) $(CRT_CFLAGS) -c $< -o $@
 
 $(B)/user/%.elf: $(B)/user/%.o $(URT) user/rt/prog.ld user/rt/prog_rwpi.ld
-	$(LLD) $(ULDFLAGS) -z stack-size=$(or $(STACK_$*),8192) --defsym=__heap_size=$(or $(HEAP_$*),0) -Map=$(B)/user/$*.map -o $@ $(URT) $<
+	$(LLD) $(ULDFLAGS) -z stack-size=$(or $(STACK_$*),$(STACK_DEFAULT_BOARD),8192) --defsym=__heap_size=$(or $(HEAP_$*),0) -Map=$(B)/user/$*.map -o $@ $(URT) $<
 
 $(B)/user/%: $(B)/user/%.elf
 	$(STRIP) --strip-all -o $@ $<
@@ -278,6 +278,17 @@ $(B)/hackos.hex: $(B)/hackos.elf
 
 $(B)/hackos.bin: $(B)/hackos.elf
 	$(OBJCOPY) -O binary $< $@
+
+# UF2 for the Adafruit nRF52 bootloader's drag-and-drop drive
+# (scripts/mkuf2.py; tests/nrf52/check_uf2.py checks the result).
+$(B)/hackos.uf2: $(B)/hackos.hex scripts/mkuf2.py
+	python3 -I scripts/mkuf2.py --family $(UF2_FAMILY) $< $@
+
+# The nRF52840 checks that need no board, the Renode run included
+# (tests/nrf52/run_all.sh).
+test-nrf52:
+	$(MAKE) BOARD=feather-nrf52840 ADDER=$(ADDER)
+	ADDER=$(ADDER) bash tests/nrf52/run_all.sh
 
 # The checks of the i.MX RT code that need no board (tests/imxrt/README).
 test-teensy:

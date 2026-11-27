@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- busy-wait delays on an nRF52 (Cortex-M4F, 64 MHz).
+# UNTESTED ON HARDWARE.
+#
+# Counted with the DWT cycle counter at 64 cycles per microsecond.  The
+# loop is also bounded by its own iteration count (each takes several
+# cycles), so a delay ends even where the cycle counter does not count (an
+# emulator, a debugger that holds DWT): then it is shorter, never endless.
+
+from kernel.cpu import mmio_read32, mmio_write32
+
+DEMCR: uint64 = 0xE000EDFC           # unchecked: ARMv7-M debug block, not in the device header
+DEMCR_TRCENA: uint32 = 0x01000000    # unchecked: ARMv7-M architecture
+DWT_CTRL: uint64 = 0xE0001000        # unchecked: ARMv7-M architecture
+DWT_CYCCNT: uint64 = 0xE0001004      # unchecked: ARMv7-M architecture
+CYCLES_PER_US: uint32 = 64           # unchecked: the nRF52840's fixed 64 MHz core clock (product specification)
+
+
+def delay_init():
+    mmio_write32(DEMCR, mmio_read32(DEMCR) | DEMCR_TRCENA)
+    mmio_write32(DWT_CTRL, mmio_read32(DWT_CTRL) | 1)       # CYCCNTENA
+
+
+def delay_us(us: uint32):
+    need: uint32 = us * CYCLES_PER_US
+    start: uint32 = mmio_read32(DWT_CYCCNT)
+    spins: uint32 = 0
+    while spins < need:
+        if mmio_read32(DWT_CYCCNT) - start >= need:
+            return
+        spins = spins + 1

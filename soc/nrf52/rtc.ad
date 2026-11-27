@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- a periodic tick from an nRF52 RTC (NRF_RTC_Type), the
+# scheduler's clock on this chip.  UNTESTED ON HARDWARE.
+#
+# Why not SysTick: SysTick counts the CPU clock, which the nRF52 stops while
+# the CPU sleeps in WFI (HackOS's idle thread), so the tick would stop with
+# it.  The RTC runs from LFCLK (32768 Hz) in sleep; Nordic's own and
+# Zephyr's system timers use RTC1 for the same reason.
+#
+# 32768 is not a multiple of 1000: compare event CC[0] is moved by 32 or 33
+# counts (32.768 on average, an exact remainder carried from tick to tick),
+# so `hz` ticks take exactly one second of LFCLK.  The handler delivers
+# every tick whose compare point has passed, so a late interrupt makes ticks
+# late, not lost; it never sets CC closer than 2 counts ahead of COUNTER
+# (the product specification: a CC of COUNTER or COUNTER+1 may not raise
+# COMPARE).  COUNTER is 24 bits; differences are taken modulo 2^24.
+
+from kernel.cpu import mmio_read32, mmio_write32
+
+RTC_TASKS_START: uint64 = 0x000          # hdr: NRF_RTC_Type.TASKS_START
+RTC_TASKS_STOP: uint64 = 0x004           # hdr: NRF_RTC_Type.TASKS_STOP
+RTC_TASKS_CLEAR: uint64 = 0x008          # hdr: NRF_RTC_Type.TASKS_CLEAR
+RTC_EVENTS_COMPARE0: uint64 = 0x140      # hdr: NRF_RTC_Type.EVENTS_COMPARE[0]
+RTC_INTENSET: uint64 = 0x304             # hdr: NRF_RTC_Type.INTENSET
+RTC_INTENCLR: uint64 = 0x308             # hdr: NRF_RTC_Type.INTENCLR
+RTC_EVTENCLR: uint64 = 0x348             # hdr: NRF_RTC_Type.EVTENCLR
+RTC_COUNTER: uint64 = 0x504              # hdr: NRF_RTC_Type.COUNTER
+RTC_PRESCALER: uint64 = 0x508            # hdr: NRF_RTC_Type.PRESCALER
+RTC_CC0: uint64 = 0x540                  # hdr: NRF_RTC_Type.CC[0]
+RTC_INT_COMPARE0: uint32 = 0x10000       # hdr: RTC_INTENSET_COMPARE0_Msk
+RTC_COUNTER_MASK: uint32 = 0xFFFFFF      # hdr: RTC_COUNTER_COUNTER_Msk
+LFCLK_HZ: uint32 = 32768                 # unchecked: LFCLK frequency (product specification)
+RTC_MAX_CATCHUP: uint32 = 1000           # unchecked: policy -- after a stall longer than this many ticks, the rest are dropped
+
+rtc_hz: uint32 = 1000
+rtc_next: uint32 = 0                     # COUNTER value of the next tick
+rtc_rem: uint32 = 0                      # carried remainder of 32768 / hz
+rtc_late: uint64 = 0                     # handler runs that delivered more than one tick
+rtc_dropped: uint64 = 0                  # ticks dropped after a stall
+
+
+def _advance():
+    rtc_rem = rtc_rem + LFCLK_HZ
+    step: uint32 = rtc_rem / rtc_hz
+    rtc_rem = rtc_rem - step * rtc_hz
+    rtc_next = (rtc_next + step) & RTC_COUNTER_MASK
+
+
+def rtc_tick_start(base: uint64, hz: uint32):
+    mmio_write32(base + RTC_TASKS_STOP, 1)
+    mmio_write32(base + RTC_INTENCLR, 0xFFFFFFFF)
+    mmio_write32(base + RTC_EVTENCLR, 0xFFFFFFFF)
+    mmio_write32(base + RTC_PRESCALER, 0)
+    mmio_write32(base + RTC_TASKS_CLEAR, 1)
+    rtc_hz = hz
+    rtc_rem = 0
+    rtc_next = 0
+    _advance()
+    mmio_write32(base + RTC_CC0, rtc_next)
+    mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
+    mmio_write32(base + RTC_INTENSET, RTC_INT_COMPARE0)
+    mmio_write32(base + RTC_TASKS_START, 1)
+
+
+# From the RTC's interrupt handler.  Returns how many ticks are due (the
+# caller runs the kernel's tick that many times) and sets the next compare.
+def rtc_tick_ack(base: uint64) -> uint32:
+    mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
+    mmio_read32(base + RTC_EVENTS_COMPARE0)          # the write has reached the peripheral
+    now: uint32 = mmio_read32(base + RTC_COUNTER) & RTC_COUNTER_MASK
+    n: uint32 = 0
+    # rtc_next <= now (modulo 2^24: the difference is less than half the range)
+    while ((now - rtc_next) & RTC_COUNTER_MASK) < 0x800000:
+        n = n + 1
+        _advance()
+        if n >= RTC_MAX_CATCHUP:
+            rtc_dropped = rtc_dropped + 1
+            rtc_next = now
+            _advance()
+            break
+    if n > 1:
+        rtc_late = rtc_late + 1
+    if ((rtc_next - now) & RTC_COUNTER_MASK) < 2:
+        mmio_write32(base + RTC_CC0, (now + 2) & RTC_COUNTER_MASK)
+    else:
+        mmio_write32(base + RTC_CC0, rtc_next)
+    return n

@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- Nordic nRF52840: addresses, interrupts, clocks, chip identity.
+# UNTESTED ON HARDWARE.
+#
+# Every upper-case constant here and in soc/nrf52/ carries either
+#   hdr: <name>      a name from Nordic's nrf52840.h / nrf52840_bitfields.h
+#                    (third_party/nordic-mdk-nrf52840/), which
+#                    tests/nrf52/check_regs.py evaluates and compares; for a
+#                    register offset, <TYPE>.<member path> of the header's
+#                    struct, whose offsets the checker computes from the
+#                    struct layout (and checks against the header's own
+#                    offset comments), or
+#   unchecked: <why> a fact that is not in the header (ARMv7-M registers,
+#                    driver policy, timeouts).
+
+from kernel.cpu import mmio_read32, mmio_write32, mmio_write8
+
+# ---- peripheral base addresses ----------------------------------------------
+CLOCK_BASE: uint64 = 0x40000000      # hdr: NRF_CLOCK_BASE
+POWER_BASE: uint64 = 0x40000000      # hdr: NRF_POWER_BASE
+UARTE0_BASE: uint64 = 0x40002000     # hdr: NRF_UARTE0_BASE
+RTC1_BASE: uint64 = 0x40011000       # hdr: NRF_RTC1_BASE
+NVMC_BASE: uint64 = 0x4001E000       # hdr: NRF_NVMC_BASE
+P0_BASE: uint64 = 0x50000000         # hdr: NRF_P0_BASE
+P1_BASE: uint64 = 0x50000300         # hdr: NRF_P1_BASE
+FICR_BASE: uint64 = 0x10000000       # hdr: NRF_FICR_BASE
+UICR_BASE: uint64 = 0x10001000       # hdr: NRF_UICR_BASE
+
+# ---- interrupt numbers ----------------------------------------------------------
+CLOCK_POWER_IRQ: uint32 = 0          # hdr: CLOCK_POWER_IRQn
+UARTE0_IRQ: uint32 = 2               # hdr: UART0_UARTE0_IRQn
+RTC1_IRQ: uint32 = 17                # hdr: RTC1_IRQn
+NUM_IRQS: uint32 = 48                # unchecked: SPIM3_IRQn (47) is the last; check_regs.py checks the vector count
+
+# ---- CLOCK (NRF_CLOCK_Type) ---------------------------------------------------
+CLOCK_TASKS_HFCLKSTART: uint64 = 0x000   # hdr: NRF_CLOCK_Type.TASKS_HFCLKSTART
+CLOCK_TASKS_LFCLKSTART: uint64 = 0x008   # hdr: NRF_CLOCK_Type.TASKS_LFCLKSTART
+CLOCK_TASKS_LFCLKSTOP: uint64 = 0x00C    # hdr: NRF_CLOCK_Type.TASKS_LFCLKSTOP
+CLOCK_EVENTS_HFCLKSTARTED: uint64 = 0x100   # hdr: NRF_CLOCK_Type.EVENTS_HFCLKSTARTED
+CLOCK_EVENTS_LFCLKSTARTED: uint64 = 0x104   # hdr: NRF_CLOCK_Type.EVENTS_LFCLKSTARTED
+CLOCK_INTENCLR: uint64 = 0x308           # hdr: NRF_CLOCK_Type.INTENCLR
+CLOCK_HFCLKSTAT: uint64 = 0x40C          # hdr: NRF_CLOCK_Type.HFCLKSTAT
+CLOCK_LFCLKSTAT: uint64 = 0x418          # hdr: NRF_CLOCK_Type.LFCLKSTAT
+CLOCK_LFCLKSRC: uint64 = 0x518           # hdr: NRF_CLOCK_Type.LFCLKSRC
+CLOCK_HFCLKSTAT_SRC_MSK: uint32 = 0x1        # hdr: CLOCK_HFCLKSTAT_SRC_Msk
+CLOCK_HFCLKSTAT_STATE_MSK: uint32 = 0x10000  # hdr: CLOCK_HFCLKSTAT_STATE_Msk
+CLOCK_LFCLKSTAT_SRC_MSK: uint32 = 0x3        # hdr: CLOCK_LFCLKSTAT_SRC_Msk
+CLOCK_LFCLKSTAT_STATE_MSK: uint32 = 0x10000  # hdr: CLOCK_LFCLKSTAT_STATE_Msk
+CLOCK_LFCLKSRC_SRC_RC: uint32 = 0            # hdr: CLOCK_LFCLKSRC_SRC_RC
+CLOCK_LFCLKSRC_SRC_XTAL: uint32 = 1          # hdr: CLOCK_LFCLKSRC_SRC_Xtal
+
+# ---- POWER (NRF_POWER_Type) ---------------------------------------------------
+POWER_RESETREAS: uint64 = 0x400          # hdr: NRF_POWER_Type.RESETREAS
+POWER_GPREGRET: uint64 = 0x51C           # hdr: NRF_POWER_Type.GPREGRET
+
+# ---- NVMC: the flash instruction cache --------------------------------------------
+NVMC_ICACHECNF: uint64 = 0x540           # hdr: NRF_NVMC_Type.ICACHECNF
+NVMC_ICACHECNF_CACHEEN_MSK: uint32 = 0x1     # hdr: NVMC_ICACHECNF_CACHEEN_Msk
+
+# ---- FICR: what the chip says it is -------------------------------------------------
+FICR_INFO_PART: uint64 = 0x100           # hdr: NRF_FICR_Type.INFO.PART
+FICR_INFO_VARIANT: uint64 = 0x104        # hdr: NRF_FICR_Type.INFO.VARIANT
+FICR_INFO_RAM: uint64 = 0x10C            # hdr: NRF_FICR_Type.INFO.RAM
+FICR_INFO_FLASH: uint64 = 0x110          # hdr: NRF_FICR_Type.INFO.FLASH
+FICR_DEVICEID0: uint64 = 0x060           # hdr: NRF_FICR_Type.DEVICEID[0]
+FICR_DEVICEID1: uint64 = 0x064           # hdr: NRF_FICR_Type.DEVICEID[1]
+
+# ---- ARMv7-M system registers -------------------------------------------------------
+NVIC_ISER0: uint64 = 0xE000E100      # unchecked: ARMv7-M architecture
+NVIC_ICER0: uint64 = 0xE000E180      # unchecked: ARMv7-M architecture
+NVIC_ICPR0: uint64 = 0xE000E280      # unchecked: ARMv7-M architecture
+NVIC_IPR0: uint64 = 0xE000E400       # unchecked: ARMv7-M architecture (byte per interrupt)
+SYST_CSR: uint64 = 0xE000E010        # unchecked: ARMv7-M architecture
+AIRCR: uint64 = 0xE000ED0C           # unchecked: ARMv7-M architecture
+AIRCR_SYSRESETREQ: uint32 = 0x05FA0004   # unchecked: ARMv7-M architecture (VECTKEY | SYSRESETREQ)
+
+WAIT_SPINS: uint32 = 2000000         # unchecked: policy -- a clock start polled this many times (>> 1 ms at 64 MHz)
+
+# What the clock start found (reported by the board at boot).
+hfxo_ok: uint32 = 0
+lfclk_ok: uint32 = 0
+
+
+def nvic_enable(irq: uint32, prio: uint32):
+    mmio_write8(NVIC_IPR0 + cast[uint64](irq), prio)
+    mmio_write32(NVIC_ICPR0 + cast[uint64](irq / 32) * 4, cast[uint32](1) << (irq % 32))
+    mmio_write32(NVIC_ISER0 + cast[uint64](irq / 32) * 4, cast[uint32](1) << (irq % 32))
+
+
+# The state the bootloader hands over (Adafruit's bootloader_app_start
+# already disables and un-pends NVIC interrupts 0..63, stops SysTick and
+# RTC1 and the LF clock; done again here so the image does not depend on
+# it): every interrupt off and un-pended, SysTick off, the flash
+# instruction cache on.
+def nrf52840_system_init():
+    mmio_write32(SYST_CSR, 0)
+    mmio_write32(NVIC_ICER0, 0xFFFFFFFF)
+    mmio_write32(NVIC_ICER0 + 4, 0xFFFFFFFF)
+    mmio_write32(NVIC_ICPR0, 0xFFFFFFFF)
+    mmio_write32(NVIC_ICPR0 + 4, 0xFFFFFFFF)
+    mmio_write32(CLOCK_BASE + CLOCK_INTENCLR, 0xFFFFFFFF)
+    mmio_write32(NVMC_BASE + NVMC_ICACHECNF, mmio_read32(NVMC_BASE + NVMC_ICACHECNF) | NVMC_ICACHECNF_CACHEEN_MSK)
+
+
+# HFCLK from the 32 MHz crystal (HFXO; the UART's baud rate is then
+# crystal-accurate instead of HFINT's +-1.5 %), LFCLK from the internal RC
+# oscillator (32.768 kHz, +-2 % uncalibrated: it only paces the scheduler
+# tick; RC rather than the Feather's 32 kHz crystal so that the same image
+# runs on a board without one, as Adafruit's bootloader does).  Each start
+# is polled with a bound: a dead crystal costs WAIT_SPINS polls and leaves
+# the chip on HFINT, reported at boot, not a hang.
+def nrf52840_clocks_start():
+    mmio_write32(CLOCK_BASE + CLOCK_EVENTS_HFCLKSTARTED, 0)
+    mmio_write32(CLOCK_BASE + CLOCK_TASKS_HFCLKSTART, 1)
+    n: uint32 = 0
+    while n < WAIT_SPINS and mmio_read32(CLOCK_BASE + CLOCK_EVENTS_HFCLKSTARTED) == 0:
+        n = n + 1
+    st: uint32 = mmio_read32(CLOCK_BASE + CLOCK_HFCLKSTAT)
+    hfxo_ok = 0
+    if (st & CLOCK_HFCLKSTAT_SRC_MSK) != 0 and (st & CLOCK_HFCLKSTAT_STATE_MSK) != 0:
+        hfxo_ok = 1
+    mmio_write32(CLOCK_BASE + CLOCK_TASKS_LFCLKSTOP, 1)
+    mmio_write32(CLOCK_BASE + CLOCK_LFCLKSRC, CLOCK_LFCLKSRC_SRC_RC)
+    mmio_write32(CLOCK_BASE + CLOCK_EVENTS_LFCLKSTARTED, 0)
+    mmio_write32(CLOCK_BASE + CLOCK_TASKS_LFCLKSTART, 1)
+    n = 0
+    while n < WAIT_SPINS and mmio_read32(CLOCK_BASE + CLOCK_EVENTS_LFCLKSTARTED) == 0:
+        n = n + 1
+    lst: uint32 = mmio_read32(CLOCK_BASE + CLOCK_LFCLKSTAT)
+    lfclk_ok = 0
+    if (lst & CLOCK_LFCLKSTAT_STATE_MSK) != 0:
+        lfclk_ok = 1
+
+
+def ficr(off: uint64) -> uint32:
+    return mmio_read32(FICR_BASE + off)
+
+
+def reset_reason() -> uint32:
+    return mmio_read32(POWER_BASE + POWER_RESETREAS)
+
+
+# RESETREAS bits are sticky until written 1: cleared so the next boot reports
+# only what happened then (Adafruit's bootloader leaves them to the
+# application, see its main.c).
+def reset_reason_clear(v: uint32):
+    mmio_write32(POWER_BASE + POWER_RESETREAS, v)
+
+
+def system_reset():
+    mmio_write32(AIRCR, AIRCR_SYSRESETREQ)
+    while 1 == 1:
+        n: uint32 = 0

@@ -1,0 +1,359 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS board support: Adafruit Feather nRF52840 Express (product 4062;
+# Nordic nRF52840, 64 MHz Cortex-M4F, 1 MB flash, 256 KB RAM, 2 MB QSPI
+# flash GD25Q16C, Adafruit's UF2 bootloader with SoftDevice S140 6.1.1).
+#
+# UNTESTED ON HARDWARE.  docs/boards/feather-nrf52840.md has the flashing,
+# the serial wiring, what the first power-up should show, and the bring-up
+# order.  Pins from Adafruit's Arduino variant (variants/
+# feather_nrf52840_express/variant.cpp) and bootloader (src/boards/
+# feather_nrf52840_express/board.h); tests/nrf52/check_pins.py compares.
+#
+#   console   UARTE0 on the TX (P0.25) and RX (P0.24) header pins, 115200
+#             8N1, 3.3 V; receive interrupt into the line discipline
+#   LED       red LED "D3" = P1.15 (Arduino PIN_LED1/LED_RED): on from
+#             board_init_early, 1 Hz blink once the scheduler runs, N
+#             flashes and a pause after a fatal error with code N.  The
+#             Feather nRF52840 Sense has its red LED on P1.09: chosen at run
+#             time from the board id in the bootloader's configuration
+#             (optional, see _led_pin)
+#   tick      RTC1 on LFCLK (soc/nrf52/rtc.ad: SysTick stops in WFI)
+#   clocks    HFXO 32 MHz started (64 MHz core), LFCLK from the RC oscillator
+#   /sd       none (no card socket; the QSPI flash is not used, see the doc)
+#   programs  /bin runs in place from flash (PROG_ABI=rwpi): the MPU window
+#             of the ROM table, board_mpu_xip_*
+
+from kernel.cpu import mmio_read32, mmio_write32
+from kernel.print import kputs, kput_u64, kput_hex32
+from kernel.sched.core import Thread, threads, thread_create, thread_sleep, systick_handler, proc_ustack_used, thread_kstack_used, reap_kstack_max, proc_ustack_max, proc_ustack_max_name, THREAD_MAX, T_UNUSED, TF_PROC
+from mm.slab import kheap
+from mm.parena import pa_peak, pa_n_fail
+from soc.nrf52840.soc import UARTE0_BASE, UARTE0_IRQ, RTC1_BASE, RTC1_IRQ, P0_BASE, P1_BASE, FICR_INFO_PART, FICR_INFO_VARIANT, FICR_INFO_RAM, FICR_INFO_FLASH, FICR_DEVICEID0, FICR_DEVICEID1, nvic_enable, nrf52840_system_init, nrf52840_clocks_start, hfxo_ok, lfclk_ok, ficr, reset_reason, reset_reason_clear
+from soc.nrf52.uarte import uarte_init, uarte_putc, uarte_flush, uarte_rx_irq_enable, uarte_rx_ready, uarte_getc, uarte_clear_errors, UARTE_BAUD_115200
+from soc.nrf52.gpio import gpio_output, gpio_input, gpio_set, gpio_clear, gpio_toggle, PULL_UP, DRIVE_S0S1
+from soc.nrf52.rtc import rtc_tick_start, rtc_tick_ack
+from soc.nrf52.delay import delay_init, delay_us
+
+extern def __xbss_start()
+extern def __xbss_end()
+extern def __romfs_start()
+extern def __romfs_end()
+extern def __prog_start()
+extern def __prog_end()
+
+PIN_TX: uint32 = 25                  # unchecked: P0.25 = Feather "TX" (D0); check_pins.py against Adafruit's variant
+PIN_RX: uint32 = 24                  # unchecked: P0.24 = Feather "RX" (D1); check_pins.py
+PIN_LED_EXPRESS: uint32 = 47         # unchecked: P1.15 = red LED D3 (Express); check_pins.py
+PIN_LED_SENSE: uint32 = 41           # unchecked: P1.09 = red LED D13 (Sense); check_pins.py
+BOOTCFG: uint64 = 0xFD800            # unchecked: Adafruit bootloader's CF2 block (linker/nrf52840.ld: 0xFE000 - 2K)
+CFG_MAGIC0: uint32 = 0x1E9E10F1      # unchecked: Adafruit bootloader src/usb/uf2/configkeys.h
+CFG_MAGIC1: uint32 = 0x20227A79      # unchecked: same
+CFG_BOARD_ID: uint32 = 208           # unchecked: CFG_BOOTLOADER_BOARD_ID, same
+ID_EXPRESS: uint32 = 0x239A0029      # unchecked: USB VID 0x239A, UF2 PID 0x0029 (board.h, Express)
+ID_SENSE: uint32 = 0x239A0087        # unchecked: UF2 PID 0x0087 (board.h, Sense)
+XIP_WINDOW: uint32 = 0x00080000      # unchecked: = __romfs_window in link.ld (asserted by check_image.py)
+
+led_pin: uint32 = 47
+board_id: uint32 = 0
+boot_reset_reason: uint32 = 0
+
+
+def board_name() -> Ptr[uint8]:
+    return "Adafruit Feather nRF52840 Express (Nordic nRF52840)"
+
+
+def board_cpu_hz() -> uint32:
+    return 64000000
+
+
+def _led_port() -> uint64:
+    if led_pin >= 32:
+        return P1_BASE
+    return P0_BASE
+
+
+# The board id Adafruit's bootloader carries in its configuration block (key
+# 208 = USB VID << 16 | PID).  0 when the block is not there (an older
+# bootloader): then the Express is assumed.
+def _bootloader_board_id() -> uint32:
+    p: Ptr[uint32] = cast[Ptr[uint32]](BOOTCFG)
+    if p[0] != CFG_MAGIC0 or p[1] != CFG_MAGIC1:
+        return 0
+    n: uint32 = p[2]
+    if n > 100:
+        return 0
+    i: uint32 = 0
+    while i < n:
+        if p[4 + 2 * i] == CFG_BOARD_ID:
+            return p[5 + 2 * i]
+        i = i + 1
+    return 0
+
+
+def _led_pin() -> uint32:
+    if board_id == ID_SENSE:
+        return PIN_LED_SENSE
+    return PIN_LED_EXPRESS
+
+
+# hackos_start, after .data and .bss: .xbss (the tmpfs table) cleared,
+# interrupts and SysTick off, the flash cache on; the red LED on: the first
+# sign of life, before the clocks and the console.
+def board_init_early():
+    p: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&__xbss_start))
+    n: uint64 = (cast[uint64](&__xbss_end) - cast[uint64](&__xbss_start)) >> 2
+    i: uint64 = 0
+    while i < n:
+        p[i] = 0
+        i = i + 1
+    nrf52840_system_init()
+    delay_init()
+    boot_reset_reason = reset_reason()
+    reset_reason_clear(boot_reset_reason)
+    board_id = _bootloader_board_id()
+    led_pin = _led_pin()
+    gpio_output(_led_port(), led_pin, 1, DRIVE_S0S1)
+
+
+# ---- console: UARTE0 on TX (P0.25) and RX (P0.24) ------------------------
+def board_console_init():
+    nrf52840_clocks_start()
+    gpio_output(P0_BASE, PIN_TX, 1, DRIVE_S0S1)         # idle high before ENABLE
+    gpio_input(P0_BASE, PIN_RX, PULL_UP)                 # a floating RX reads idle, not noise
+    uarte_init(UARTE0_BASE, PIN_TX, PIN_RX, UARTE_BAUD_115200)
+
+
+def board_console_putc(c: uint32):
+    uarte_putc(UARTE0_BASE, c)
+
+
+def board_console_rx_irq_enable():
+    uarte_rx_irq_enable(UARTE0_BASE)
+    nvic_enable(UARTE0_IRQ, 0x80)
+
+
+def board_console_rx_ready() -> uint32:
+    return uarte_rx_ready(UARTE0_BASE)
+
+
+def board_console_getc() -> uint32:
+    return uarte_getc(UARTE0_BASE) & 0xFF
+
+
+def board_console_rx_irq_ack():
+    uarte_clear_errors(UARTE0_BASE)
+
+
+# ---- scheduler tick: RTC1 ---------------------------------------------------
+def board_tick_start(hz: uint32):
+    rtc_tick_start(RTC1_BASE, hz)
+    nvic_enable(RTC1_IRQ, 0x80)
+
+
+# IRQ 17.  Runs the kernel's tick once per elapsed tick period.
+def board_rtc1_handler():
+    n: uint32 = rtc_tick_ack(RTC1_BASE)
+    while n > 0:
+        systick_handler()
+        n = n - 1
+
+
+# SysTick is not the tick here (it stops in WFI); kept for kernel/systick.ad.
+def board_systick_csr() -> uint32:
+    return 7
+
+
+def board_systick_reload(hz: uint32) -> uint32:
+    return 64000000 / hz - 1
+
+
+# ---- MPU plan (kernel/mpu.ad).  The M4 has 8 regions: 0..7 are all the
+# kernel's plan, so there is nothing for board_mpu_extra. -------------------
+def board_mpu_code_base() -> uint32:
+    return 0x00000000
+
+
+def board_mpu_code_size() -> uint32:
+    return 0x100000                     # all of flash, read-only
+
+
+def board_mpu_kram_base() -> uint32:
+    return 0x20000000
+
+
+def board_mpu_kram_size() -> uint32:
+    return 0x40000                      # all of RAM
+
+
+def board_mpu_xram_base() -> uint32:
+    return 0x20000000
+
+
+def board_mpu_xram_size() -> uint32:
+    return 0x40000                      # the same: one RAM
+
+
+def board_mpu_extra():
+    return
+
+
+# The /bin window: the ROM table at 0x80000 (link.ld), covered by the
+# smallest power-of-two region S aligned at 0x80000 with k of its eight
+# sub-regions enabled.  Read-only for everyone, executable, normal memory.
+def board_xip_lo() -> uint64:
+    return cast[uint64](&__romfs_start)
+
+
+def board_xip_hi() -> uint64:
+    return cast[uint64](&__romfs_end)
+
+
+def _xip_size() -> uint32:
+    size: uint32 = cast[uint32](board_xip_hi() - board_xip_lo())
+    s: uint32 = 256
+    while s < size:
+        s = s << 1
+    return s
+
+
+def board_mpu_xip_rbar() -> uint32:
+    return XIP_WINDOW | 0x14            # VALID | region 4
+
+
+def board_mpu_xip_rasr() -> uint32:
+    s: uint32 = _xip_size()
+    size: uint32 = cast[uint32](board_xip_hi() - board_xip_lo())
+    k: uint32 = (size + s / 8 - 1) / (s / 8)
+    srd: uint32 = (0xFF << k) & 0xFF
+    n: uint32 = 0
+    while (cast[uint32](1) << n) < s:
+        n = n + 1
+    return (6 << 24) | 0x00020000 | (srd << 8) | ((n - 1) << 1) | 1
+
+
+# ---- /sd: there is no card ------------------------------------------------
+def board_storage_init() -> int32:
+    return -1
+
+
+# Code is never written to RAM by the loader for /bin programs; for a copied
+# one the M4 has no cache to maintain.
+def board_code_loaded(base: uint64, size: uint64):
+    return
+
+
+# ---- after kernel_init: the boot report and the heartbeat -----------------
+def _led_main(arg: uint64) -> int64:
+    while 1 == 1:
+        gpio_toggle(_led_port(), led_pin)
+        thread_sleep(500)
+    return 0
+
+
+def board_late_init():
+    kputs("chip: part ")
+    kput_hex32(ficr(FICR_INFO_PART))
+    kputs(" variant ")
+    kput_hex32(ficr(FICR_INFO_VARIANT))
+    kputs(", ")
+    kput_u64(cast[uint64](ficr(FICR_INFO_RAM)))
+    kputs(" KB RAM, ")
+    kput_u64(cast[uint64](ficr(FICR_INFO_FLASH)))
+    kputs(" KB flash, device id ")
+    kput_hex32(ficr(FICR_DEVICEID1))
+    kputs(" ")
+    kput_hex32(ficr(FICR_DEVICEID0))
+    kputs("\nreset reason ")
+    kput_hex32(boot_reset_reason)
+    kputs(", bootloader board id ")
+    kput_hex32(board_id)
+    if board_id == ID_SENSE:
+        kputs(" (Feather nRF52840 Sense: red LED P1.09)\n")
+    elif board_id == ID_EXPRESS:
+        kputs(" (Feather nRF52840 Express: red LED P1.15)\n")
+    else:
+        kputs(" (unknown: assuming the Express, red LED P1.15)\n")
+    if hfxo_ok != 0:
+        kputs("clocks: HFCLK from the 32 MHz crystal")
+    else:
+        kputs("clocks: HFXO did NOT start, running on HFINT (UART baud +-1.5 %)")
+    if lfclk_ok != 0:
+        kputs(", LFCLK from the RC oscillator\n")
+    else:
+        kputs(", LFCLK did NOT start: no scheduler tick\n")
+    kputs("/bin in place at ")
+    kput_hex32(cast[uint32](board_xip_lo()))
+    kputs("..")
+    kput_hex32(cast[uint32](board_xip_hi()))
+    kputs(", MPU window ")
+    kput_u64(cast[uint64](_xip_size() / 1024))
+    kputs(" KB\n")
+    thread_create("led", cast[uint64](&_led_main), 0, 6, 1024, 0)
+    kputs("memory: kernel heap ")
+    kput_u64(cast[uint64](kheap.used_bytes))
+    kputs(" of ")
+    kput_u64(cast[uint64](kheap.end - kheap.base))
+    kputs(" bytes in use at boot; program arena ")
+    kput_hex32(cast[uint32](cast[uint64](&__prog_start)))
+    kputs("..")
+    kput_hex32(cast[uint32](cast[uint64](&__prog_end)))
+    kputs("\n")
+
+
+# Before the run ends: what memory the session needed (the high-water marks
+# tests/nrf52/renode_session.sh and docs/boards/feather-nrf52840.md quote).
+def _mem_report():
+    kputs("memory: kernel heap peak ")
+    kput_u64(cast[uint64](kheap.peak_bytes))
+    kputs(" of ")
+    kput_u64(cast[uint64](kheap.end - kheap.base))
+    kputs(", program arena peak ")
+    kput_u64(pa_peak)
+    kputs("\nmemory: failed allocations: kernel heap ")
+    kput_u64(cast[uint64](kheap.n_fail))
+    kputs(", program arena ")
+    kput_u64(cast[uint64](pa_n_fail))
+    kputs("\nmemory: largest kernel stack of an ended process ")
+    kput_u64(reap_kstack_max)
+    kputs(", largest user stack ")
+    kput_u64(proc_ustack_max)
+    kputs(" (")
+    kputs(&proc_ustack_max_name[0])
+    kputs(")\n")
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        t: Ptr[Thread] = &threads[i]
+        if t[0].state != T_UNUSED and (t[0].flags & TF_PROC) != 0 and t[0].mem_base != 0:
+            kputs("memory: running ")
+            kputs(&t[0].name[0])
+            kputs(": user stack ")
+            kput_u64(proc_ustack_used(t))
+            kputs(" of ")
+            kput_u64(cast[uint64](t[0].stack_top - t[0].mem_lo))
+            kputs(", kernel stack ")
+            kput_u64(thread_kstack_used(t))
+            kputs("\n")
+        i = i + 1
+
+
+# hackos_exit(code): code 0 resets (`halt`; the bootloader then starts
+# HackOS again).  Any other code: the report is on the console and the LED
+# repeats `code` short flashes (at most 9) and a pause, forever.
+def board_halt(code: uint32):
+    _mem_report()
+    uarte_flush(UARTE0_BASE)
+    if code == 0:
+        return
+    n: uint32 = code
+    if n > 9:
+        n = 9
+    while 1 == 1:
+        i: uint32 = 0
+        while i < n:
+            gpio_set(_led_port(), led_pin)
+            delay_us(150000)
+            gpio_clear(_led_port(), led_pin)
+            delay_us(250000)
+            i = i + 1
+        delay_us(1500000)

@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 David Hamner
+// Renode platform for tests/nrf52/: the nRF52840 parts HackOS touches, with
+// Renode's own nRF52840 peripheral models (the same models and addresses as
+// Renode's platforms/cpus/nrf52840.repl, without its SVD download).
+// Renode has no QSPI, USB or LED model; the LED pin is a GPIO output.
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic
+
+uart0: UART.NRF52840_UART @ sysbus 0x40002000
+    easyDMA: true
+    -> nvic@2
+
+rtc0: Timers.NRF52840_RTC @ sysbus 0x4000B000
+    numberOfEvents: 3
+    -> nvic@11
+
+rtc1: Timers.NRF52840_RTC @ sysbus 0x40011000
+    numberOfEvents: 3
+    -> nvic@17
+
+clock: Miscellaneous.NRF_CLOCK @ sysbus 0x40000000
+    -> nvic@0
+
+flash: Memory.MappedMemory @ sysbus 0x0
+    size: 0x100000
+
+ram: Memory.MappedMemory @ { sysbus 0x800000; sysbus 0x20000000 }
+    size: 0x40000
+
+gpio0: GPIOPort.NRF52840_GPIO @ sysbus 0x50000500
+
+gpio1: GPIOPort.NRF52840_GPIO @ sysbus 0x50000800
+
+ficr: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x1000

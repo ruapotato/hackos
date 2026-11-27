@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- nRF52 GPIO (NRF_GPIO_Type: P0, and P1 on the nRF52840).
+# UNTESTED ON HARDWARE.
+#
+# A pin is named by its number pin = 32 * port + n (P1.15 = 47), as Nordic's
+# and Adafruit's code do; `port_base` is that port's NRF_Px_BASE.  Outputs
+# change through OUTSET/OUTCLR, never read-modify-write of OUT, so an
+# interrupt that changes another pin of the port cannot be undone by a race.
+
+from kernel.cpu import mmio_read32, mmio_write32
+
+GPIO_OUT: uint64 = 0x504             # hdr: NRF_GPIO_Type.OUT
+GPIO_OUTSET: uint64 = 0x508          # hdr: NRF_GPIO_Type.OUTSET
+GPIO_OUTCLR: uint64 = 0x50C          # hdr: NRF_GPIO_Type.OUTCLR
+GPIO_IN: uint64 = 0x510              # hdr: NRF_GPIO_Type.IN
+GPIO_DIRSET: uint64 = 0x518          # hdr: NRF_GPIO_Type.DIRSET
+GPIO_DIRCLR: uint64 = 0x51C          # hdr: NRF_GPIO_Type.DIRCLR
+GPIO_PIN_CNF0: uint64 = 0x700        # hdr: NRF_GPIO_Type.PIN_CNF[0]
+
+CNF_DIR_OUTPUT: uint32 = 0x1         # hdr: GPIO_PIN_CNF_DIR_Msk
+CNF_INPUT_DISCONNECT: uint32 = 0x2   # hdr: GPIO_PIN_CNF_INPUT_Msk
+CNF_PULL_SHIFT: uint32 = 2           # hdr: GPIO_PIN_CNF_PULL_Pos
+CNF_DRIVE_SHIFT: uint32 = 8          # hdr: GPIO_PIN_CNF_DRIVE_Pos
+PULL_NONE: uint32 = 0                # hdr: GPIO_PIN_CNF_PULL_Disabled
+PULL_DOWN: uint32 = 1                # hdr: GPIO_PIN_CNF_PULL_Pulldown
+PULL_UP: uint32 = 3                  # hdr: GPIO_PIN_CNF_PULL_Pullup
+DRIVE_S0S1: uint32 = 0               # hdr: GPIO_PIN_CNF_DRIVE_S0S1
+DRIVE_H0H1: uint32 = 3               # hdr: GPIO_PIN_CNF_DRIVE_H0H1
+
+
+def _bit(pin: uint32) -> uint32:
+    return cast[uint32](1) << (pin & 31)
+
+
+# Output, standard drive (S0S1; DRIVE_H0H1 for an LED is allowed but not
+# needed at 3 mA), input buffer disconnected, no pull.  `level` first, so the
+# pin does not glitch to the other level when it becomes an output.
+def gpio_output(port_base: uint64, pin: uint32, level: uint32, drive: uint32):
+    if level != 0:
+        mmio_write32(port_base + GPIO_OUTSET, _bit(pin))
+    else:
+        mmio_write32(port_base + GPIO_OUTCLR, _bit(pin))
+    mmio_write32(port_base + GPIO_PIN_CNF0 + cast[uint64](pin & 31) * 4, CNF_DIR_OUTPUT | CNF_INPUT_DISCONNECT | (drive << CNF_DRIVE_SHIFT))
+
+
+# Input with the input buffer connected and the given pull.
+def gpio_input(port_base: uint64, pin: uint32, pull: uint32):
+    mmio_write32(port_base + GPIO_PIN_CNF0 + cast[uint64](pin & 31) * 4, pull << CNF_PULL_SHIFT)
+
+
+# Back to the reset state: input, buffer disconnected (what Adafruit's
+# bootloader leaves every pin in).
+def gpio_default(port_base: uint64, pin: uint32):
+    mmio_write32(port_base + GPIO_PIN_CNF0 + cast[uint64](pin & 31) * 4, CNF_INPUT_DISCONNECT)
+
+
+def gpio_set(port_base: uint64, pin: uint32):
+    mmio_write32(port_base + GPIO_OUTSET, _bit(pin))
+
+
+def gpio_clear(port_base: uint64, pin: uint32):
+    mmio_write32(port_base + GPIO_OUTCLR, _bit(pin))
+
+
+# Toggle: OUT is read, and the change written through OUTSET or OUTCLR (one
+# bit; other pins of the port are not written).
+def gpio_toggle(port_base: uint64, pin: uint32):
+    if (mmio_read32(port_base + GPIO_OUT) & _bit(pin)) != 0:
+        mmio_write32(port_base + GPIO_OUTCLR, _bit(pin))
+    else:
+        mmio_write32(port_base + GPIO_OUTSET, _bit(pin))
+
+
+def gpio_read(port_base: uint64, pin: uint32) -> uint32:
+    return (mmio_read32(port_base + GPIO_IN) >> (pin & 31)) & 1

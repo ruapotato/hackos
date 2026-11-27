@@ -1,0 +1,162 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- nRF52 UARTE (UART with EasyDMA, NRF_UARTE_Type).
+# UNTESTED ON HARDWARE.
+#
+# EasyDMA moves bytes between the UARTE and RAM; it cannot read flash, so
+# both directions go through one-byte buffers in .bss (Data RAM).
+#   transmit  polled: the byte is put in the TX buffer, STARTTX, then ENDTX
+#             is waited for (one character time, 87 us at 115200), with a
+#             limit: a UARTE that never finishes costs UARTE_TX_SPINS polls
+#             per character and then STOPTX, not a hang.
+#   receive   one byte per DMA transfer: STARTRX with MAXCNT 1; ENDRX
+#             interrupts; uarte_getc takes the byte and starts the next
+#             transfer.  Bytes that arrive in between wait in the UARTE's
+#             RX FIFO (product specification: "UARTE ... reception"), so a
+#             late interrupt loses nothing until that FIFO is full.
+#             ERROR is enabled as an interrupt too, so overrun, parity,
+#             framing and break are cleared (ERRORSRC is write-1-to-clear)
+#             instead of leaving the line pending.
+# Two instances at most (UARTE0, UARTE1); `base` is NRF_UARTEn_BASE.
+
+from kernel.cpu import mmio_read32, mmio_write32, cpu_irq_save, cpu_irq_restore
+
+UARTE_TASKS_STARTRX: uint64 = 0x000      # hdr: NRF_UARTE_Type.TASKS_STARTRX
+UARTE_TASKS_STOPRX: uint64 = 0x004       # hdr: NRF_UARTE_Type.TASKS_STOPRX
+UARTE_TASKS_STARTTX: uint64 = 0x008      # hdr: NRF_UARTE_Type.TASKS_STARTTX
+UARTE_TASKS_STOPTX: uint64 = 0x00C       # hdr: NRF_UARTE_Type.TASKS_STOPTX
+UARTE_EVENTS_ENDRX: uint64 = 0x110       # hdr: NRF_UARTE_Type.EVENTS_ENDRX
+UARTE_EVENTS_ENDTX: uint64 = 0x120       # hdr: NRF_UARTE_Type.EVENTS_ENDTX
+UARTE_EVENTS_ERROR: uint64 = 0x124       # hdr: NRF_UARTE_Type.EVENTS_ERROR
+UARTE_EVENTS_TXSTOPPED: uint64 = 0x158   # hdr: NRF_UARTE_Type.EVENTS_TXSTOPPED
+UARTE_SHORTS: uint64 = 0x200             # hdr: NRF_UARTE_Type.SHORTS
+UARTE_INTENSET: uint64 = 0x304           # hdr: NRF_UARTE_Type.INTENSET
+UARTE_INTENCLR: uint64 = 0x308           # hdr: NRF_UARTE_Type.INTENCLR
+UARTE_ERRORSRC: uint64 = 0x480           # hdr: NRF_UARTE_Type.ERRORSRC
+UARTE_ENABLE: uint64 = 0x500             # hdr: NRF_UARTE_Type.ENABLE
+UARTE_PSEL_RTS: uint64 = 0x508           # hdr: NRF_UARTE_Type.PSEL.RTS
+UARTE_PSEL_TXD: uint64 = 0x50C           # hdr: NRF_UARTE_Type.PSEL.TXD
+UARTE_PSEL_CTS: uint64 = 0x510           # hdr: NRF_UARTE_Type.PSEL.CTS
+UARTE_PSEL_RXD: uint64 = 0x514           # hdr: NRF_UARTE_Type.PSEL.RXD
+UARTE_BAUDRATE: uint64 = 0x524           # hdr: NRF_UARTE_Type.BAUDRATE
+UARTE_RXD_PTR: uint64 = 0x534            # hdr: NRF_UARTE_Type.RXD.PTR
+UARTE_RXD_MAXCNT: uint64 = 0x538         # hdr: NRF_UARTE_Type.RXD.MAXCNT
+UARTE_RXD_AMOUNT: uint64 = 0x53C         # hdr: NRF_UARTE_Type.RXD.AMOUNT
+UARTE_TXD_PTR: uint64 = 0x544            # hdr: NRF_UARTE_Type.TXD.PTR
+UARTE_TXD_MAXCNT: uint64 = 0x548         # hdr: NRF_UARTE_Type.TXD.MAXCNT
+UARTE_CONFIG: uint64 = 0x56C             # hdr: NRF_UARTE_Type.CONFIG
+
+UARTE_ENABLE_ENABLED: uint32 = 8         # hdr: UARTE_ENABLE_ENABLE_Enabled
+UARTE_ENABLE_DISABLED: uint32 = 0        # hdr: UARTE_ENABLE_ENABLE_Disabled
+UARTE_BAUD_115200: uint32 = 0x01D7E000   # hdr: UARTE_BAUDRATE_BAUDRATE_Baud115200
+UARTE_PSEL_DISCONNECTED: uint32 = 0xFFFFFFFF   # unchecked: CONNECT bit 31 = 1 (checked below) and the reset value
+UARTE_PSEL_CONNECT_MSK: uint32 = 0x80000000    # hdr: UARTE_PSEL_TXD_CONNECT_Msk
+UARTE_PSEL_PORT_SHIFT: uint32 = 5        # hdr: UARTE_PSEL_TXD_PORT_Pos
+UARTE_INT_ENDRX: uint32 = 0x10           # hdr: UARTE_INTENSET_ENDRX_Msk
+UARTE_INT_ERROR: uint32 = 0x200          # hdr: UARTE_INTENSET_ERROR_Msk
+UARTE_CONFIG_8N1: uint32 = 0             # unchecked: HWFC off, PARITY excluded, one stop bit: all fields 0 (UARTE_CONFIG_*_Disabled/Excluded/One are 0)
+UARTE_TX_SPINS: uint32 = 200000          # unchecked: policy -- polls of ENDTX per character (>> 87 us at 64 MHz)
+
+ua_tx: Array[2, uint32]                  # one-byte DMA buffers (word-sized slots), per instance
+ua_rx: Array[2, uint32]
+uarte_tx_timeouts: uint64 = 0            # characters given up on
+uarte_rx_errors: uint64 = 0              # ERROR events cleared
+uarte_last_errorsrc: uint32 = 0
+
+
+def _idx(base: uint64) -> uint32:
+    if base == 0x40002000:              # unchecked: = UARTE0_BASE (checked in soc/nrf52840/soc.ad)
+        return 0
+    return 1
+
+
+# PSEL value for pin 32 * port + n: PORT bit 5, PIN bits 4:0, CONNECT (bit
+# 31) 0 = connected.  The two fields are adjacent, so it is the pin number.
+def uarte_psel(pin: uint32) -> uint32:
+    return pin & 0x3F
+
+
+# 8N1 at `baud_reg` (UARTE_BAUD_115200), no flow control.  The pins must be
+# GPIO-configured by the caller: TXD an output driven high (idle), RXD an
+# input -- the product specification asks for that before ENABLE.
+def uarte_init(base: uint64, txd_pin: uint32, rxd_pin: uint32, baud_reg: uint32):
+    mmio_write32(base + UARTE_ENABLE, UARTE_ENABLE_DISABLED)
+    mmio_write32(base + UARTE_INTENCLR, 0xFFFFFFFF)
+    mmio_write32(base + UARTE_SHORTS, 0)
+    mmio_write32(base + UARTE_PSEL_RTS, UARTE_PSEL_DISCONNECTED)
+    mmio_write32(base + UARTE_PSEL_CTS, UARTE_PSEL_DISCONNECTED)
+    mmio_write32(base + UARTE_PSEL_TXD, uarte_psel(txd_pin))
+    mmio_write32(base + UARTE_PSEL_RXD, uarte_psel(rxd_pin))
+    mmio_write32(base + UARTE_BAUDRATE, baud_reg)
+    mmio_write32(base + UARTE_CONFIG, UARTE_CONFIG_8N1)
+    mmio_write32(base + UARTE_ERRORSRC, 0xFFFFFFFF)
+    mmio_write32(base + UARTE_EVENTS_ENDTX, 0)
+    mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+    mmio_write32(base + UARTE_EVENTS_ERROR, 0)
+    mmio_write32(base + UARTE_ENABLE, UARTE_ENABLE_ENABLED)
+
+
+# One byte, polled.  Interrupts are masked while the DMA buffer is in use, so
+# a handler that prints cannot overwrite it half-way.
+def uarte_putc(base: uint64, c: uint32):
+    i: uint32 = _idx(base)
+    irq: uint32 = cpu_irq_save()
+    ua_tx[i] = c & 0xFF
+    mmio_write32(base + UARTE_EVENTS_ENDTX, 0)
+    mmio_write32(base + UARTE_TXD_PTR, cast[uint32](cast[uint64](&ua_tx[i])))
+    mmio_write32(base + UARTE_TXD_MAXCNT, 1)
+    mmio_write32(base + UARTE_TASKS_STARTTX, 1)
+    n: uint32 = 0
+    while mmio_read32(base + UARTE_EVENTS_ENDTX) == 0:
+        n = n + 1
+        if n >= UARTE_TX_SPINS:
+            mmio_write32(base + UARTE_TASKS_STOPTX, 1)
+            uarte_tx_timeouts = uarte_tx_timeouts + 1
+            break
+    mmio_write32(base + UARTE_EVENTS_ENDTX, 0)
+    cpu_irq_restore(irq)
+
+
+# Every byte uarte_putc hands over has finished when it returns (ENDTX), so
+# there is nothing left to drain.
+def uarte_flush(base: uint64):
+    return
+
+
+def _rx_start(base: uint64, i: uint32):
+    mmio_write32(base + UARTE_RXD_PTR, cast[uint32](cast[uint64](&ua_rx[i])))
+    mmio_write32(base + UARTE_RXD_MAXCNT, 1)
+    mmio_write32(base + UARTE_TASKS_STARTRX, 1)
+
+
+def uarte_rx_irq_enable(base: uint64):
+    mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+    mmio_write32(base + UARTE_EVENTS_ERROR, 0)
+    mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX | UARTE_INT_ERROR)
+    _rx_start(base, _idx(base))
+
+
+def uarte_rx_ready(base: uint64) -> uint32:
+    if mmio_read32(base + UARTE_EVENTS_ENDRX) != 0:
+        return 1
+    return 0
+
+
+# The received byte; the next transfer is started.  A transfer that ended
+# with nothing in it (AMOUNT 0: STOPRX) gives 0x100, which the caller drops.
+def uarte_getc(base: uint64) -> uint32:
+    i: uint32 = _idx(base)
+    mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+    c: uint32 = 0x100
+    if mmio_read32(base + UARTE_RXD_AMOUNT) != 0:
+        c = ua_rx[i] & 0xFF
+    _rx_start(base, i)
+    return c
+
+
+def uarte_clear_errors(base: uint64):
+    if mmio_read32(base + UARTE_EVENTS_ERROR) != 0:
+        mmio_write32(base + UARTE_EVENTS_ERROR, 0)
+        uarte_last_errorsrc = mmio_read32(base + UARTE_ERRORSRC)
+        mmio_write32(base + UARTE_ERRORSRC, uarte_last_errorsrc)
+        uarte_rx_errors = uarte_rx_errors + 1

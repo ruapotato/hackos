@@ -1,0 +1,48 @@
+# The shell session of tests/imxrt/t41mem.sh (itself make test's, part 8),
+# without the FAT card (this board has no /sd), typed by uart_session.py.
+prompt hamsh$ 
+sh echo hello from hamsh
+sh ls /bin
+sh ls /bin | wc
+sh ls /bin | grep ha
+sh ls /bin | grep h | head -2 | wc
+sh echo builtin in a pipeline | wc
+sh echo first line > /tmp/note
+sh echo second line >> /tmp/note
+sh cat /tmp/note
+sh wc < /tmp/note
+sh cat /tmp/note | grep second > /tmp/found
+sh cat /tmp/found
+sh cp /tmp/note /tmp/copy
+sh mkdir /tmp/dir
+sh ls /tmp
+sh rm /tmp/note
+sh head -1 < /tmp/copy
+shn /bin/hello with two
+sh echo status was $status
+sh cat /bin/hello | wc
+sh cp /bin/hello /tmp/h
+shn /tmp/h from tmpfs
+sh echo copied program status $status
+sh no-such-command
+shn ptest peek 20000000
+sh echo after the fault $status
+shn ptest loop
+sleep 1
+raw 03
+sh echo interrupted $status
+sh ls /sd
+sh echo 'echo script started' > /tmp/s.hsh
+sh echo 'ls /bin | wc > /tmp/count' >> /tmp/s.hsh
+sh echo 'cat /tmp/count' >> /tmp/s.hsh
+sh echo 'n = 6 * 7' >> /tmp/s.hsh
+sh echo 'for w in ["alpha", "beta"] { echo script word $w }' >> /tmp/s.hsh
+sh echo 'if n == 42 { echo script n is $n }' >> /tmp/s.hsh
+sh echo 'echo script piped | wc' >> /tmp/s.hsh
+sh source /tmp/s.hsh
+shn hamsh /tmp/s.hsh
+sh echo second shell status $status
+sh for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] { echo loop $i | wc }
+sh ls /tmp | wc
+shn halt 0
+end exit status
