@@ -298,8 +298,9 @@ regex is limited to 64 nodes. Long or complex scripts can hit "arena
 exhausted". There is no /sd: the Feather has no card socket.
 
 **The 2 MB QSPI flash is not used.** It is not needed for the shell and
-coreutils, since code runs from the internal flash, which has about 370 KB
-free. What it would take, as read-only program storage or a small FAT:
+coreutils, since code runs from the internal flash, which has about
+236 KB free between the kernel (ending at 0x45098) and /bin (0x80000), and
+180 KB above the image (0xBD000..0xEA000). What it would take, as read-only program storage or a small FAT:
 a QSPI driver (`NRF_QSPI`: pins P0.19 SCK, P0.20 CS, P0.17/22/23/21 IO0-3
 per Adafruit's variant; GD25Q16C commands), a block device for
 `kernel/block/blk.ad`, and either (a) FAT on it, with programs loaded
