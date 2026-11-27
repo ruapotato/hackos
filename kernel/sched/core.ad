@@ -148,6 +148,12 @@ sched_next_tid: uint32 = 1
 reap_switches: uint64 = 0
 reap_cpu_ticks: uint64 = 0
 reap_stack_used: uint64 = 0
+# High-water marks over every process that has ended (a board's memory
+# report, docs/boards/*.md): the most kernel stack and the most user stack
+# one used, and which program that was.
+reap_kstack_max: uint64 = 0
+proc_ustack_max: uint64 = 0
+proc_ustack_max_name: Array[16, uint8]
 rq_head: Array[8, uint64]
 rq_tail: Array[8, uint64]
 timer_head: uint64 = 0
@@ -696,8 +702,25 @@ def thread_by_tid(tid: uint32) -> Ptr[Thread]:
 # A process gives up what it owns besides its table slot and kernel stack:
 # its memory block; its children become nobody's (the reaper collects them);
 # a parent waiting in rfork is let go.  Thread context.
+# How much of a process's stack has been used: its block was cleared at load
+# and the stack grows down from stack_top, so the lowest non-zero word is the
+# high-water mark (argv and the first frame included).
+def proc_ustack_used(t: Ptr[Thread]) -> uint64:
+    if t[0].mem_base == 0:
+        return 0
+    top: uint32 = t[0].stack_top
+    a: uint32 = t[0].mem_lo
+    while a < top and cast[Ptr[uint32]](cast[uint64](a))[0] == 0:
+        a = a + 4
+    return cast[uint64](top - a)
+
+
 def _proc_release(t: uint64):
     if thr(t)[0].mem_base != 0:
+        used: uint64 = proc_ustack_used(thr(t))
+        if used > proc_ustack_max:
+            proc_ustack_max = used
+            _copy_name(&proc_ustack_max_name[0], &thr(t)[0].name[0], 16)
         pfree(thr(t)[0].mem_base)
         thr(t)[0].mem_base = 0
     irq: uint32 = cpu_irq_save()
@@ -800,6 +823,8 @@ def _reap(t: Ptr[Thread]):
     reap_switches = t[0].switches
     reap_cpu_ticks = t[0].cpu_ticks
     reap_stack_used = thread_kstack_used(t)
+    if (t[0].flags & TF_PROC) != 0 and reap_stack_used > reap_kstack_max:
+        reap_kstack_max = reap_stack_used
     _free_stacks(cast[uint64](t))
     t[0].state = T_UNUSED
 

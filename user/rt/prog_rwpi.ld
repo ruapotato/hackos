@@ -24,20 +24,17 @@
  * The stack travels in PT_GNU_STACK as for a PIE (`-z stack-size=N`).     */
 ENTRY(hackos_crt_start)
 
-PHDRS
-{
-    text PT_LOAD FLAGS(5);
-    data PT_LOAD FLAGS(6);
-    stack PT_GNU_STACK FLAGS(6);
-}
-
+/* No PHDRS: lld then makes one PT_LOAD per address range (with
+ * --no-rosegment, code and constants share the first) and fills in
+ * PT_GNU_STACK from -z stack-size, which it does not for an explicit
+ * PT_GNU_STACK. */
 SECTIONS
 {
     . = 0;
-    .text : ALIGN(8) { *(.text.hackos_crt_start) *(.text .text.*) } :text
-    .rodata : ALIGN(8) { *(.rodata .rodata.*) } :text
+    .text : ALIGN(8) { *(.text.hackos_crt_start) *(.text .text.*) }
+    .rodata : ALIGN(8) { *(.rodata .rodata.*) }
     . = 0x40000000;
-    .data : ALIGN(8) { *(.data.rel.ro .data.rel.ro.*) *(.data .data.*) } :data
+    .data : ALIGN(8) { *(.data.rel.ro .data.rel.ro.*) *(.data .data.*) }
     .bss (NOLOAD) : ALIGN(8)
     {
         *(.bss .bss.*)
@@ -46,6 +43,6 @@ SECTIONS
         __heap_start = .;
         . = . + __heap_size;
         __heap_end = .;
-    } :data
+    }
     /DISCARD/ : { *(.ARM.exidx* .ARM.extab* .ARM.attributes .comment .note* .interp .got .got.plt .dynamic .dynsym .dynstr .hash .gnu.hash .rel.dyn) }
 }
