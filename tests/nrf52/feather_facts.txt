@@ -1,0 +1,46 @@
+# Facts extracted by tests/nrf52/extract_facts.py from Adafruit's sources (read as data).
+# Adafruit_nRF52_Bootloader commit 0ee83433a6b8ec23341629d2407cbf0fc62335f3
+# Adafruit_nRF52_Arduino commit eee83228ea8c5492d2c7e8084a435df46a07f8e1
+# sha256 29e16db4aee25df92480c59d2ccf038c2be1a0c35d2f6c63d7dd6158ae3b58ec bootloader:src/boards/feather_nrf52840_express/board.h
+# sha256 a67353291e56549e7bc29316f296b1f68ecd6a9feab0f2ee06366502b202c3c7 arduino:variants/feather_nrf52840_express/variant.cpp
+# sha256 3c09a94fd08ed56b5fa53eaf372a83c205246b8ee94f095e1f3d5501d4e54355 arduino:variants/feather_nrf52840_express/variant.h
+# sha256 75c8ede16efb4d1a80b336d9da777523a7447b530c6dafc1f3a1a3b41abd3606 bootloader:src/boards/feather_nrf52840_sense/board.h
+# sha256 c1fc72ef90dfd50ac54521623d76ef4bc5847dbce129bb72c27a6bba47b5dc2c arduino:variants/feather_nrf52840_sense/variant.cpp
+# sha256 ccfc8fa39f6c1f02ef4f597411b06cd019337e53d46f576422c15963dd0abf09 arduino:variants/feather_nrf52840_sense/variant.h
+# sha256 67cf3d63ce8fee39dd30395a92c3253ebe1475667eee872761e484134540b9a2 bootloader:src/usb/uf2/configkeys.h
+# sha256 416f140472fa641e03c4c2bfa737961facfb7f886c51506f91f02593e496624e bootloader:linker/nrf52840.ld
+# sha256 b80800a88b0c2d7e14c9608d2be8791d9572c02f85226092e4a10147fdffc08d bootloader:lib/sdk11/components/libraries/bootloader_dfu/dfu_types.h
+# sha256 d4a43e5c94c701883125d84cccd942ccdebc9bd5adc4089738eadec3e750c2da bootloader:CMakeLists.txt
+# sha256 64336b336ea231e2c00e7e75cb9594d6b8b153d6ceba5ece2f86300414f225b1 bootloader:lib/softdevice/s140_nrf52_6.1.1/s140_nrf52_6.1.1_API/include/nrf52/nrf_mbr.h
+# sha256 126ca3701a5f91df80cd141500da9339b2dd3689191a82b5569376b77af7633b bootloader:src/main.c
+# sha256 d41474a19e42834b021a1d95391669c5b8018dbd0109ca6f66ea3d4bbdc7b98b bootloader:cmake/softdevice.cmake
+# sha256 b7666763e1b909d746ad69d2b7296c677ca86fc32fba0c5291d0535cc36335f0 bootloader:lib/softdevice/s140_nrf52_6.1.1/s140_nrf52_6.1.1_softdevice.hex
+# sha256 5f460d35efcb4ab0f280e83cd15f804e979172a3646c5b66e86af6b7b2975ba6 bootloader:lib/softdevice/s140_nrf52_7.3.0/s140_nrf52_7.3.0_softdevice.hex
+# sha256 a4b77bc2b90de6b27a80228faf64368c5adfbcce0557af26644b82323ef62ca1 bootloader:README.md
+BL_LED_PRIMARY_EXPRESS 47  # bootloader src/boards/feather_nrf52840_express/board.h LED_PRIMARY_PIN
+BL_USB_VID_EXPRESS 0x239a  # bootloader src/boards/feather_nrf52840_express/board.h USB_DESC_VID
+BL_UF2_PID_EXPRESS 0x29  # bootloader src/boards/feather_nrf52840_express/board.h USB_DESC_UF2_PID
+BL_VOLUME_EXPRESS FTHR840BOOT  # bootloader src/boards/feather_nrf52840_express/board.h UF2_VOLUME_LABEL
+AR_SERIAL1_TX_EXPRESS 25  # Arduino variants/feather_nrf52840_express: g_ADigitalPinMap[PIN_SERIAL1_TX = 0]
+AR_SERIAL1_RX_EXPRESS 24  # Arduino variants/feather_nrf52840_express: g_ADigitalPinMap[PIN_SERIAL1_RX = 1]
+AR_LED_RED_EXPRESS 47  # Arduino variants/feather_nrf52840_express: g_ADigitalPinMap[PIN_LED1 = LED_RED = 3]
+BL_LED_PRIMARY_SENSE 41  # bootloader src/boards/feather_nrf52840_sense/board.h LED_PRIMARY_PIN
+BL_USB_VID_SENSE 0x239a  # bootloader src/boards/feather_nrf52840_sense/board.h USB_DESC_VID
+BL_UF2_PID_SENSE 0x87  # bootloader src/boards/feather_nrf52840_sense/board.h USB_DESC_UF2_PID
+BL_VOLUME_SENSE FTHRSNSBOOT  # bootloader src/boards/feather_nrf52840_sense/board.h UF2_VOLUME_LABEL
+AR_SERIAL1_TX_SENSE 25  # Arduino variants/feather_nrf52840_sense: g_ADigitalPinMap[PIN_SERIAL1_TX = 0]
+AR_SERIAL1_RX_SENSE 24  # Arduino variants/feather_nrf52840_sense: g_ADigitalPinMap[PIN_SERIAL1_RX = 1]
+AR_LED_RED_SENSE 41  # Arduino variants/feather_nrf52840_sense: g_ADigitalPinMap[PIN_LED1 = LED_RED = 13]
+BL_CFG_MAGIC0 0x1e9e10f1  # bootloader src/usb/uf2/configkeys.h
+BL_CFG_MAGIC1 0x20227a79  # bootloader src/usb/uf2/configkeys.h
+BL_CFG_BOOTLOADER_BOARD_ID 0xd0  # bootloader src/usb/uf2/configkeys.h
+BL_FLASH_ORIGIN 0xf4000  # bootloader linker/nrf52840.ld FLASH ORIGIN
+BL_CONFIG_ADDR 0xfd800  # bootloader linker/nrf52840.ld BOOTLOADER_CONFIG ORIGIN
+BL_REGION_START 0xf4000  # bootloader dfu_types.h BOOTLOADER_REGION_START (nRF52840)
+BL_APP_DATA_RESERVED 0xa000  # bootloader CMakeLists.txt DFU_APP_DATA_RESERVED (nrf52840)
+BL_MBR_SIZE 0x1000  # S140 6.1.1 API nrf_mbr.h MBR_SIZE
+BL_SINGLE_TAP_MAGIC 0x87eeb07c@0x200  # bootloader src/main.c APP_ASKS_FOR_SINGLE_TAP_RESET
+BL_SD_DEFAULT_NRF52840 6.1.1  # bootloader cmake/softdevice.cmake (non-nrf52833 default)
+SD_S140_6_1_1_APP_START 0x26000  # lib/softdevice/s140_nrf52_6.1.1/s140_nrf52_6.1.1_softdevice.hex: SD_SIZE_GET(MBR_SIZE), the word at 0x3008
+SD_S140_7_3_0_APP_START 0x27000  # lib/softdevice/s140_nrf52_7.3.0/s140_nrf52_7.3.0_softdevice.hex: SD_SIZE_GET(MBR_SIZE), the word at 0x3008
+BL_UF2_FAMILY_NRF52840 0xada52840  # bootloader README.md

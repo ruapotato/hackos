@@ -40,6 +40,14 @@ sh echo 'for w in ["alpha", "beta"] { echo script word $w }' >> /tmp/s.hsh
 sh echo 'if n == 42 { echo script n is $n }' >> /tmp/s.hsh
 sh echo 'echo script piped | wc' >> /tmp/s.hsh
 sh source /tmp/s.hsh
+sh x = 7.5 / 2.5 + 0.25
+sh echo f1 $x
+sh y = 1.0 / 3.0
+sh echo f2 $y
+sh z = 2.5 * 4.0 - 0.1
+sh echo f3 $z
+sh w = 10.0 / 4
+sh echo f5 $w
 shn hamsh /tmp/s.hsh
 sh echo second shell status $status
 sh for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] { echo loop $i | wc }

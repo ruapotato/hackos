@@ -1,0 +1,27 @@
+Nordic Semiconductor nRF52840 device headers (MDK) -- third-party, unmodified.
+
+Upstream:   https://github.com/NordicSemiconductor/nrfx, bsp/stable/mdk/nrf52/nrf52840/
+Commit:     5822caf07442042310103c391dd91cbcaaaa1beb (2026-11-10, branch master)
+Fetched:    2026-11-27, git clone --depth 1 (read-only, its own directory)
+Licence:    BSD-3-Clause.  Each file carries "Copyright (c) 2010 - 2026, Nordic
+            Semiconductor ASA All rights reserved.  SPDX-License-Identifier:
+            BSD-3-Clause" and the three-clause text (checked: three clauses;
+            NOT the Nordic-5-Clause licence some Nordic SDK files use, which
+            restricts use to Nordic devices and would need a separate
+            look).  LICENSE is nrfx's top-level LICENSE, the same
+            three-clause BSD text.  BSD-3-Clause code may be combined with
+            an AGPL-3.0-or-later work if its notices are kept.  The usual
+            reading, not legal advice.
+
+How HackOS uses them: as DATA.  Nothing here is compiled or linked.  The
+drivers are Adder (soc/nrf52/, soc/nrf52840/, boards/feather_nrf52840/);
+tests/nrf52/check_regs.py reads these headers and checks every register
+address, offset (computed from the struct layouts, which it checks against
+the headers' own size comments), bit position, mask, value and interrupt
+number the Adder code names.
+
+Files taken, byte for byte (sha256; tests/nrf52/run_all.sh verifies them):
+55e466145d9fbe1ded026036d65abf9c610483cf9042d8689aebe3553984178e  LICENSE
+98a5831f4fb7d4bfe74a6c27bacc8bd9533678848ffc24f57a7b95e3424297c9  nrf52840.h
+da5cb59f4e5dfb875a90b9abd719de75ab8e6ed3db21086db55788409fb14d51  nrf52840_bitfields.h
+22abe1b3c823bf8eef170c5bea67fa0c3ba16aeb5c9d51e05977713b9a015db7  nrf52840_peripherals.h

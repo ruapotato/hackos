@@ -71,8 +71,15 @@ expect "Ctrl-C ends a looping program (UARTE receive interrupt)" $S '^interrupte
 expect "no /sd on this board" $S 'ls: .*/sd'
 expect "script by source: started" $S '^script started$'
 expect "script: for loop" $S '^script word beta$'
-expect "script: arithmetic and if (soft double precision)" $S '^script n is 42$'
+expect "script: arithmetic and if" $S '^script n is 42$'
 expect "script: built-in into a pipe" $S '^1 2 13$'
+# float64 in the shell: here compiler-rt's soft double precision; the
+# expected strings are what the same shell prints on QEMU's Cortex-M7
+# (hardware double precision), and what the arithmetic says.
+expect "soft double: 7.5 / 2.5 + 0.25" $S '^f1 3\.25$'
+expect "soft double: 1.0 / 3.0 (rounding of the last digits)" $S '^f2 0\.333333333333$'
+expect "soft double: 2.5 * 4.0 - 0.1" $S '^f3 9\.9$'
+expect "soft double: 10.0 / 4 (int to double)" $S '^f5 2\.5$'
 if grep -q '^second shell status 0$' $S; then bad "a second shell started: the arena should not hold two"
 else ok "a second shell does not fit and fails cleanly: $(grep -m1 '^second shell status' $S)"; fi
 n12="$(grep -cE '^1 2 [78]$' $S)"
