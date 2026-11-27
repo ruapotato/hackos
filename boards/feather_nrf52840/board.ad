@@ -28,6 +28,7 @@ from kernel.cpu import mmio_read32, mmio_write32
 from kernel.print import kputs, kput_u64, kput_hex32
 from kernel.sched.core import Thread, threads, thread_create, thread_sleep, systick_handler, proc_ustack_used, thread_kstack_used, reap_kstack_max, proc_ustack_max, proc_ustack_max_name, THREAD_MAX, T_UNUSED, TF_PROC
 from mm.slab import kheap
+from mm.heap import heap_last_fail_size
 from mm.parena import pa_peak, pa_n_fail
 from soc.nrf52840.soc import UARTE0_BASE, UARTE0_IRQ, RTC1_BASE, RTC1_IRQ, P0_BASE, P1_BASE, FICR_INFO_PART, FICR_INFO_VARIANT, FICR_INFO_RAM, FICR_INFO_FLASH, FICR_DEVICEID0, FICR_DEVICEID1, nvic_enable, nrf52840_system_init, nrf52840_clocks_start, hfxo_ok, lfclk_ok, ficr, reset_reason, reset_reason_clear
 from soc.nrf52.uarte import uarte_init, uarte_putc, uarte_flush, uarte_rx_irq_enable, uarte_rx_ready, uarte_getc, uarte_clear_errors, UARTE_BAUD_115200
@@ -312,6 +313,9 @@ def _mem_report():
     kput_u64(pa_peak)
     kputs("\nmemory: failed allocations: kernel heap ")
     kput_u64(cast[uint64](kheap.n_fail))
+    kputs(" (the last of ")
+    kput_u64(cast[uint64](heap_last_fail_size))
+    kputs(" bytes)")
     kputs(", program arena ")
     kput_u64(cast[uint64](pa_n_fail))
     kputs("\nmemory: largest kernel stack of an ended process ")

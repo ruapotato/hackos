@@ -137,6 +137,11 @@ def _take(h: Ptr[Heap], b: uint32, need: uint32, req: uint32):
 
 # Allocate `size` bytes whose address is a multiple of `align` (a power of two,
 # at least 16).  Returns 0 when no block fits.
+# The size of the last request that could not be met (any heap): what a
+# board's memory report quotes.
+heap_last_fail_size: uint32 = 0
+
+
 def heap_alloc_aligned(h: Ptr[Heap], size: uint64, align: uint64) -> uint64:
     if size == 0:
         size = 1
@@ -176,6 +181,7 @@ def heap_alloc_aligned(h: Ptr[Heap], size: uint64, align: uint64) -> uint64:
             return cast[uint64](nb + HEAP_HDR)
         b = _hw(b, 16)
     h[0].n_fail = h[0].n_fail + 1
+    heap_last_fail_size = cast[uint32](size)
     cpu_irq_restore(irq)
     return 0
 

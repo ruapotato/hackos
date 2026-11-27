@@ -7,6 +7,8 @@ sh ls /bin | wc
 sh ls /bin | grep ha
 sh ls /bin | grep h | head -2 | wc
 sh echo builtin in a pipeline | wc
+sh ls /bin | cat | cat | cat | wc
+sh ls /bin | cat | cat | cat | cat | wc
 sh echo first line > /tmp/note
 sh echo second line >> /tmp/note
 sh cat /tmp/note

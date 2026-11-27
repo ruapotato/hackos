@@ -56,6 +56,9 @@ expect "ls /bin" $S '^hamsh$'
 expect "ls | wc counts the $NPROG programs" $S "^$NPROG $NPROG [0-9]+\$"
 expect "ls | grep" $S '^halt$'
 expect "a four-stage pipeline (four children beside the shell)" $S '^2 2 [0-9]+$'
+n5="$(grep -cE "^$NPROG $NPROG [0-9]+\$" $S)"
+[ "$n5" -ge 2 ] && ok "a pipeline of five programs beside the shell (ls | cat | cat | cat | wc)" || bad "the five-program pipeline did not count the programs ($n5)"
+expect "a sixth program in a pipeline does not fit (kernel heap: its kernel stack) and fails cleanly" $S '^hamsh: command not found: cat$'
 expect "a built-in as the first stage of a pipeline" $S '^1 4 22$'
 expect "> and >> to a file, read back" $S '^second line$'
 expect "< from a file" $S '^2 4 23$'
