@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- GPIO (i.MX RT1060 and RT1170 families).  UNTESTED ON HARDWARE.
+# Hamnix Micro -- GPIO (i.MX RT1060 and RT1170 families).  UNTESTED ON HARDWARE.
 #
 # Output through the set/clear/toggle registers (one write, no
 # read-modify-write of DR, so an interrupt between two pin changes cannot

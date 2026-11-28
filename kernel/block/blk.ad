@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- block devices under the names Hamnix's file systems expect.
+# Hamnix Micro -- block devices under the names Hamnix's file systems expect.
 #
 # Hamnix's kernel/block/blk.ad is a registry of block devices with a buffer
-# cache and I/O statistics.  The FAT code HackOS carries (fs/fat.ad, copied
+# cache and I/O statistics.  The FAT code Hamnix Micro carries (fs/fat.ad, copied
 # unmodified) needs four things from it: the sector size, a device by name,
 # and synchronous reads and writes of whole sectors.  This module supplies
 # those names over a small table of devices, each with a pair of functions.

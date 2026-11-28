@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- sleep SECONDS[.FRACTION]: wait, with the processor asleep.
+# Hamnix Micro -- sleep SECONDS[.FRACTION]: wait, with the processor asleep.
 # (Hamnix's own sleep polls the clock and yields in a loop, which would keep
 # a microcontroller awake for the whole time; this one blocks in the kernel.)
 

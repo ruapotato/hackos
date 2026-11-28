@@ -1,4 +1,4 @@
-# HackOS: copied from Hamnix user/ps.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# Hamnix Micro: copied from Hamnix user/ps.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
 # (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
 # see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
 # user/ps.ad

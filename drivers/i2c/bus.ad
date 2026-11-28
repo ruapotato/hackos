@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- I2C bus, software side.
+# Hamnix Micro -- I2C bus, software side.
 #
 # One interface for everything that talks I2C, on every board:
 #     i2c_write(addr, data, n)      write n bytes to the device at addr

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- context switch, system-call entry and exit (ARMv7-M, Cortex-M7).
+/* Hamnix Micro -- context switch, system-call entry and exit (ARMv7-M, Cortex-M7).
  *
  * This is the kernel's exception entry/exit code; everything it calls is
  * Adder.  Offsets into `class Thread` (kernel/sched/core.ad):               */
@@ -22,7 +22,7 @@
         .equ    FPCCR,        0xE000EF34
 
         .syntax unified
-#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+#ifdef HMICRO_CPU_M4                    /* Cortex-M4F: single-precision FPU */
         .cpu cortex-m4
         .fpu fpv4-sp-d16
 #else
@@ -186,7 +186,7 @@ fp_dirty:
 /* SVCall                                                              */
 /* ------------------------------------------------------------------ */
 /* svc #0  system call.   The caller used the Adder calling convention for
- *         hackos_syscall(nr, a0, a1, ...): nr in r0:r1, a0 in r2:r3, a1...
+ *         hmicro_syscall(nr, a0, a1, ...): nr in r0:r1, a0 in r2:r3, a1...
  *         in 8-byte slots on its stack.  All of that is in, or just above,
  *         the exception frame the core pushed on the caller's stack.
  * svc #1  return from a system call (issued by syscall_trampoline only).
@@ -322,7 +322,7 @@ svc_sysret:
 
 svc_bad:
         movs    r0, #11
-        b       hackos_fault_entry
+        b       hmicro_fault_entry
         .ltorg
         .size   svc_handler, . - svc_handler
 
@@ -359,12 +359,12 @@ svc_bad:
 /* ------------------------------------------------------------------ */
 /* User side                                                           */
 /* ------------------------------------------------------------------ */
-/* hackos_syscall(nr, a0, a1, a2, a3, a4, a5) -> int64
+/* hmicro_syscall(nr, a0, a1, a2, a3, a4, a5) -> int64
  * The arguments are already where the handler looks for them.          */
-        func    hackos_syscall
+        func    hmicro_syscall
         svc     #0
         bx      lr
-        .size   hackos_syscall, . - hackos_syscall
+        .size   hmicro_syscall, . - hmicro_syscall
 
 /* Return address of a user thread's entry function: exit(result).      */
         func    uthread_exit_stub

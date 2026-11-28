@@ -1,4 +1,4 @@
-# HackOS: copied from Hamnix fs/tmpfs.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# Hamnix Micro: copied from Hamnix fs/tmpfs.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
 # (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header
 # plus fs/tmpfs.ad.patch (table and chunk sizes).  See fs/HAMNIX_ORIGIN.
 # fs/tmpfs.ad
@@ -230,10 +230,10 @@ def tmpfs_perm_check(name: Ptr[char], want: int32) -> int32:
     return -1
 
 
-TMPFS_MAX_FILES:  uint64 = 1024               # HackOS: was 8192
-TMPFS_CHUNK_SIZE: uint64 = 4096               # HackOS: 4 KiB per storage chunk (was 65536)
-TMPFS_CHUNK_ORDER: int32 = 0                  # HackOS: 2^0 pages = 4 KiB (was 4)
-TMPFS_MAX_CHUNKS: uint64 = 512                # HackOS: max chunks per file (was 8192)
+TMPFS_MAX_FILES:  uint64 = 1024               # Hamnix Micro: was 8192
+TMPFS_CHUNK_SIZE: uint64 = 4096               # Hamnix Micro: 4 KiB per storage chunk (was 65536)
+TMPFS_CHUNK_ORDER: int32 = 0                  # Hamnix Micro: 2^0 pages = 4 KiB (was 4)
+TMPFS_MAX_CHUNKS: uint64 = 512                # Hamnix Micro: max chunks per file (was 8192)
 # BACKED-STORAGE cap: the highest file offset that can hold a real chunk
 # (= CHUNK_SIZE * MAX_CHUNKS = 512 MiB). Was 64 MiB, was 16 MiB. This bounds
 # the per-file chunk-pointer table (TMPFS_MAX_CHUNKS * 8 bytes = 64 KiB,
@@ -253,7 +253,7 @@ TMPFS_MAX_CHUNKS: uint64 = 512                # HackOS: max chunks per file (was
 # inside its 512 MiB pool (its CSD subsurface pool stays at low offsets, which
 # masked the bug). Backing the whole 512 MiB pool keeps every buffer foot can
 # allocate on the coherent DIRECT path → the content renders instead of black.
-TMPFS_FILE_CAP:   uint64 = 2097152            # HackOS: = CHUNK_SIZE * MAX_CHUNKS (2 MiB; was 536870912)
+TMPFS_FILE_CAP:   uint64 = 2097152            # Hamnix Micro: = CHUNK_SIZE * MAX_CHUNKS (2 MiB; was 536870912)
 # LOGICAL-SIZE cap: the largest size ftruncate(2) may set and the largest
 # mmap offset range a SPARSE file may span. DECOUPLED from the backed cap
 # above because real wl_shm clients (foot) ftruncate their shm buffer POOL
@@ -267,7 +267,7 @@ TMPFS_FILE_CAP:   uint64 = 2097152            # HackOS: = CHUNK_SIZE * MAX_CHUNK
 # ftruncates beyond a 512 MiB pool but never writes there.
 # Without this cap, ftruncate(pool, 512 MiB) EINVAL'd and foot abort()ed
 # before committing a single frame. 1 GiB covers any realistic wl_shm pool.
-TMPFS_LOGICAL_CAP: uint64 = 2097152           # HackOS: no sparse band above FILE_CAP (was 1073741824)
+TMPFS_LOGICAL_CAP: uint64 = 2097152           # Hamnix Micro: no sparse band above FILE_CAP (was 1073741824)
 TMPFS_NAME_LEN:   uint64 = 256                # NUL-terminated path COMPONENT
                                               # (Linux NAME_MAX 255 + NUL).
                                               # Was 32 — too small for real

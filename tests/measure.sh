@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS: measure what Adder's 64-bit value model costs on Cortex-M7.
+# Hamnix Micro: measure what Adder's 64-bit value model costs on Cortex-M7.
 # Compiles tests/measure/cost.ad (Adder, LLVM lane) and tests/measure/cost.c
 # (C) with the same clang, same flags, and prints per-function code size and
 # instruction count, plus the image size.  `make measure`.
@@ -42,16 +42,16 @@ done
 echo "sizeof(Item {uint32 key; Item *next; uint8 *data}):"
 echo "  Adder: $(awk '/^define .*@sizeof_item\(/{f=1} f&&/ret i64/{print $3} /^}/{f=0}' <($CLANG $CF -O2 -S -emit-llvm $B/cost_ad.ll -o -)) bytes   C: $(awk '/<sizeof_item>:/{f=1;next} f&&/movs/{print strtonum(substr($4,2)); exit}' $B/cost_c-O2.dis) bytes"
 echo
-if [ -f build/hackos.elf ] && [ -f build/romfs.o ] && [ -d build/root ]; then
+if [ -f build/hmicro.elf ] && [ -f build/romfs.o ] && [ -d build/root ]; then
     rom="$($SIZE -A build/romfs.o | awk '$1==".rodata.romfs"{print $2}')"
-    echo "System image (kernel, init, and the programs under /bin as ROM files), -O2:"; $SIZE build/hackos.elf
-    echo "  of that text, $rom bytes are the ROM files; the kernel itself is $(( $($SIZE build/hackos.elf | awk 'NR==2{print $1}') - rom )) bytes"
+    echo "System image (kernel, init, and the programs under /bin as ROM files), -O2:"; $SIZE build/hmicro.elf
+    echo "  of that text, $rom bytes are the ROM files; the kernel itself is $(( $($SIZE build/hmicro.elf | awk 'NR==2{print $1}') - rom )) bytes"
     # the same kernel with the size attribute (the ROM files unchanged)
-    kc --llvm-optsize init/main.ad $MB/hackos_os.ll >/dev/null
-    $CLANG $CF -Os -ffunction-sections -fdata-sections -c $B/hackos_os.ll -o $B/hackos_os.o
-    ld.lld -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static -o $B/hackos_os.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/romfs.o $B/hackos_os.o
-    echo "The same with the kernel built --llvm-optsize and clang -Os:"; $SIZE $B/hackos_os.elf
-    echo "  kernel alone: $(( $($SIZE $B/hackos_os.elf | awk 'NR==2{print $1}') - rom )) bytes"
+    kc --llvm-optsize init/main.ad $MB/hmicro_os.ll >/dev/null
+    $CLANG $CF -Os -ffunction-sections -fdata-sections -c $B/hmicro_os.ll -o $B/hmicro_os.o
+    ld.lld -T boards/mps2_an500/link.ld --gc-sections -nostdlib -static -o $B/hmicro_os.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/romfs.o $B/hmicro_os.o
+    echo "The same with the kernel built --llvm-optsize and clang -Os:"; $SIZE $B/hmicro_os.elf
+    echo "  kernel alone: $(( $($SIZE $B/hmicro_os.elf | awk 'NR==2{print $1}') - rom )) bytes"
     echo
     echo "Programs (position-independent, stripped): file size at -O2, and built --llvm-optsize / -Os"
     printf '%-8s | %9s | %9s | %s\n' program "-O2" "-Os" "memory block when running (-O2: stack + image, rounded to eighths of an MPU region)"

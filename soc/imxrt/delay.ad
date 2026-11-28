@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- busy-wait delays for the i.MX RT drivers.
+# Hamnix Micro -- busy-wait delays for the i.MX RT drivers.
 #
 # Driver code waits for hardware with a time limit, and a few sequences need
-# a minimum delay (an SD card wants 1 ms after power-up).  HackOS does not
+# a minimum delay (an SD card wants 1 ms after power-up).  Hamnix Micro does not
 # set the core clock (it runs on whatever the boot ROM left), so a delay is
 # counted in core cycles at the HIGHEST frequency the part allows: if the
 # core is slower, every delay is longer than asked, never shorter.

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- a periodic tick from an nRF52 RTC (NRF_RTC_Type), the
+# Hamnix Micro -- a periodic tick from an nRF52 RTC (NRF_RTC_Type), the
 # scheduler's clock on this chip.  UNTESTED ON HARDWARE.
 #
 # Why not SysTick: SysTick counts the CPU clock, which the nRF52 stops while
-# the CPU sleeps in WFI (HackOS's idle thread), so the tick would stop with
+# the CPU sleeps in WFI (Hamnix Micro's idle thread), so the tick would stop with
 # it.  The RTC runs from LFCLK (32768 Hz) in sleep; Nordic's own and
 # Zephyr's system timers use RTC1 for the same reason.
 #

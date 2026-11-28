@@ -1,4 +1,4 @@
-HackOS teensy41 size patch to user/hamnix/sort.ad (build/teensy41/root only).
+Hamnix Micro teensy41 size patch to user/hamnix/sort.ad (build/teensy41/root only).
 
 Reason: sort keeps its whole input and a 256-byte slot per line in static
 data, 336 KiB as written.

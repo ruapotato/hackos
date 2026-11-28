@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS test runner (called by `make test` after the images are built).
+# Hamnix Micro test runner (called by `make test` after the images are built).
 #   1. compiler-side checks from the Adder tree (IR / disassembly, no emulator)
 #   2. the Hamnix copies and the third-party C code are unmodified; C and
 #      Adder only meet through extern "C" (tests/check_c_link.sh)
@@ -24,12 +24,12 @@ OBJCOPY="${OBJCOPY:-llvm-objcopy}"
 # The same runner serves a second QEMU board (tests/m4/run_all.sh sets
 # these): the build directory, the machine, the first two hex digits of the
 # 16 MB RAM (where the arenas are), and which sections to run.
-B="${HACKOS_B:-build}"
-MACHINE="${HACKOS_MACHINE:-mps2-an500}"
-XP="${HACKOS_XP:-60}"
-ONLY="${HACKOS_ONLY:-1 2 3 4 5 6 7 8}"
+B="${HMICRO_B:-build}"
+MACHINE="${HMICRO_MACHINE:-mps2-an500}"
+XP="${HMICRO_XP:-60}"
+ONLY="${HMICRO_ONLY:-1 2 3 4 5 6 7 8}"
 want() { case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
-# An image ends its run by printing "[hackos] exit status N" and requesting a
+# An image ends its run by printing "[hmicro] exit status N" and requesting a
 # system reset; -no-reboot turns the reset into the end of the emulator run.
 # No semihosting: the guest has no channel to the host except its UART.
 QFLAGS="-M $MACHINE -nographic -monitor none -serial stdio -no-reboot"
@@ -48,10 +48,10 @@ expect() {  # expect <description> <file> <extended regex>
 }
 
 # Status of a finished run: 124 if QEMU had to be killed, otherwise the N of
-# the image's last "[hackos] exit status N" line, 125 if it printed none.
+# the image's last "[hmicro] exit status N" line, 125 if it printed none.
 run_status() {  # run_status <logfile> <exit status of timeout/qemu>
     [ "$2" -eq 124 ] && return 124
-    local n; n="$(tr -d '\r' < "$1" | sed -n 's/^\[hackos\] exit status \([0-9]*\)$/\1/p' | tail -1)"
+    local n; n="$(tr -d '\r' < "$1" | sed -n 's/^\[hmicro\] exit status \([0-9]*\)$/\1/p' | tail -1)"
     [ -n "$n" ] || return 125
     return "$n"
 }
@@ -97,7 +97,7 @@ ncopies=0; npatched=0
 while read -r sum path; do
     case "$sum" in \#*|"") continue;; esac
     ncopies=$((ncopies+1))
-    head -1 "$path" | grep -q '^# HackOS: copied from Hamnix' || { bad "$path has no origin header"; continue; }
+    head -1 "$path" | grep -q '^# Hamnix Micro: copied from Hamnix' || { bad "$path has no origin header"; continue; }
     if [ -f "$path.patch" ]; then
         # the copy minus its header, with the recorded patch taken out again,
         # must be the Hamnix original
@@ -142,7 +142,7 @@ rm -f $B/*.bin
 fi
 if want 3; then
 echo "[test] === 3. static checks on the images"
-for img in hackos monitor ktest selftest; do
+for img in hmicro monitor ktest selftest; do
     undef="$("$NM" -u $B/$img.elf | wc -l)"
     [ "$undef" = 0 ] && ok "$img: no undefined symbols" || bad "$img: $undef undefined symbols"
 done
@@ -151,27 +151,27 @@ word() {  # word <img> <address>: little-endian word of the flash image at that 
     [ -f $B/$1.bin ] || "$OBJCOPY" -O binary -j .boot -j .text $B/$1.elf $B/$1.bin
     od -An -tx4 -j $(($2)) -N 4 $B/$1.bin | tr -d ' '
 }
-[ "$(sym hackos hackos_boot_vectors)" = "00000000" ] && ok "boot vectors at 0x00000000" || bad "boot vectors at $(sym hackos hackos_boot_vectors)"
-[ "$(sym hackos hackos_vectors)" = "00001000" ] && ok "vector table at 0x00001000, behind the null guard" || bad "vector table at $(sym hackos hackos_vectors)"
-[ "$(word hackos 0)" = "$(sym hackos __stack_top)" ] && ok "word 0 is the initial stack pointer (0x$(word hackos 0))" || bad "word 0 is $(word hackos 0)"
-[ "$((0x$(word hackos 4)))" = "$((0x$(sym hackos Reset_Handler) + 1))" ] && ok "word 4 is Reset_Handler with the Thumb bit" || bad "word 4 is $(word hackos 4)"
-[ "$(word hackos 0x20)" = "00000000" ] && [ "$(word hackos 0xffc)" = "00000000" ] && ok "nothing else lives in the first 4 KB" || bad "the null-guard area is not empty"
+[ "$(sym hmicro hmicro_boot_vectors)" = "00000000" ] && ok "boot vectors at 0x00000000" || bad "boot vectors at $(sym hmicro hmicro_boot_vectors)"
+[ "$(sym hmicro hmicro_vectors)" = "00001000" ] && ok "vector table at 0x00001000, behind the null guard" || bad "vector table at $(sym hmicro hmicro_vectors)"
+[ "$(word hmicro 0)" = "$(sym hmicro __stack_top)" ] && ok "word 0 is the initial stack pointer (0x$(word hmicro 0))" || bad "word 0 is $(word hmicro 0)"
+[ "$((0x$(word hmicro 4)))" = "$((0x$(sym hmicro Reset_Handler) + 1))" ] && ok "word 4 is Reset_Handler with the Thumb bit" || bad "word 4 is $(word hmicro 4)"
+[ "$(word hmicro 0x20)" = "00000000" ] && [ "$(word hmicro 0xffc)" = "00000000" ] && ok "nothing else lives in the first 4 KB" || bad "the null-guard area is not empty"
 for v in "11:svc_handler" "14:pendsv_handler" "15:systick_handler" "16:uart0_rx_handler"; do
     n="${v%%:*}"; s="${v#*:}"
-    [ "$((0x$(word hackos $((0x1000 + n*4)))))" = "$((0x$(sym hackos $s) + 1))" ] && ok "vector $n is $s" || bad "vector $n is $(word hackos $((0x1000 + n*4))), $s is $(sym hackos $s)"
+    [ "$((0x$(word hmicro $((0x1000 + n*4)))))" = "$((0x$(sym hmicro $s) + 1))" ] && ok "vector $n is $s" || bad "vector $n is $(word hmicro $((0x1000 + n*4))), $s is $(sym hmicro $s)"
 done
 fp="$(grep -cE 'v(mul|div|add|sub)\.f64' $B/selftest.lst)"
 [ "$fp" -gt 20 ] && ok "self-test uses double-precision FPU instructions ($fp)" || bad "only $fp f64 FPU instructions"
-soft="$(cat $B/hackos.lst $B/ktest.lst $B/selftest.lst | grep -cE '__aeabi_d(add|sub|mul|div)|__adddf3|__muldf3')"
+soft="$(cat $B/hmicro.lst $B/ktest.lst $B/selftest.lst | grep -cE '__aeabi_d(add|sub|mul|div)|__adddf3|__muldf3')"
 [ "$soft" = 0 ] && ok "no soft-float arithmetic calls" || bad "$soft soft-float calls"
 vol="$(awk '/^define .*@test_volatile_mmio\(/{f=1} f&&/(load|store) volatile i32/{n++} /^}/{f=0} END{print n+0}' $B/selftest.ll)"
 [ "$vol" = 7 ] && ok "test_volatile_mmio: 5 volatile loads + 2 volatile stores of CTRL in the IR" || bad "test_volatile_mmio has $vol volatile accesses, want 7"
-dsz="$("$SIZE" -A $B/hackos.elf | awk '$1==".data"{print $2}')"
-nstr="$(grep -c '^@\.Lstr.* = internal constant' $B/hackos.ll)"; nstrw="$(grep -c '^@\.Lstr.* = internal global' $B/hackos.ll)"
+dsz="$("$SIZE" -A $B/hmicro.elf | awk '$1==".data"{print $2}')"
+nstr="$(grep -c '^@\.Lstr.* = internal constant' $B/hmicro.ll)"; nstrw="$(grep -c '^@\.Lstr.* = internal global' $B/hmicro.ll)"
 [ "$nstrw" = 0 ] && [ "$nstr" -gt 100 ] && [ "$dsz" -lt 4096 ] && ok "string literals are constants ($nstr of them; .data is $dsz bytes)" || bad "string literals: $nstr constant, $nstrw writable, .data $dsz bytes"
-tb="$("$SIZE" -A $B/hackos.elf | awk '$1==".xbss"{print $3}')"
+tb="$("$SIZE" -A $B/hmicro.elf | awk '$1==".xbss"{print $3}')"
 [ "$((tb))" = "$((0x60000000))" ] && ok "the large file-system table is placed in the 16 MB region" || bad ".xbss at $tb"
-nv="$(grep -c '^define void @' $B/hackos.ll)"
+nv="$(grep -c '^define void @' $B/hmicro.ll)"
 [ "$nv" -gt 50 ] && ok "result-less functions are emitted as void ($nv of them)" || bad "only $nv void functions"
 
 fi
@@ -269,7 +269,7 @@ expect "display: the 2-bit frame holds all four grey levels" $P '^#0 F 2 0 0 400
 expect "display: the partial refresh of a 30-pixel change was a 40 x 10 window at x = 8" $P '^#[0-9]+ P 1 8 40 40 10 sum ok$'
 expect "display: the panel was put to sleep last" $P '^#[0-9]+ S 1 0 0 0 0 sum ok$'
 txt() { awk '/^text:$/{f=1; next} f' $P | sed -n "$1p"; }
-[ "$(txt 1)" = "HackOS display test" ] && [ "$(txt 2)" = "0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ" ] \
+[ "$(txt 1)" = "Hamnix Micro display test" ] && [ "$(txt 2)" = "0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ" ] \
     && [ "$(txt 3)" = 'abcdefghijklmnopqrstuvwxyz !"#$%&'"'"'()*+,-./:;<=>?@[]^_`{|}~' ] \
     && ok "display: the last frame's pixels read back as the text that was written (95 printable characters)" \
     || bad "display: text read back from the last frame: '$(txt 1)' / '$(txt 2)' / '$(txt 3)'"
@@ -283,14 +283,14 @@ qemu_start $B/monitor.elf $B/monitor.out
 p=0
 cmd() {  # send one command line and wait for the next prompt
     p=$((p+1))
-    wait_for "hackos> " $p || { bad "no prompt #$p from the monitor"; return 1; }
+    wait_for "hmicro> " $p || { bad "no prompt #$p from the monitor"; return 1; }
     say "$1\\r"
 }
 cmd 'help'
 cmd 'ps'
 cmd 'heap'
 cmd 'mkdir /tmp/d'
-cmd 'write /tmp/d/hello.txt Hello,  HackOS!'
+cmd 'write /tmp/d/hello.txt Hello,  Hamnix Micro!'
 cmd 'append /tmp/d/hello.txt second lime\x7f\x7f\x7fine'
 cmd 'ls /'
 cmd 'ls /tmp/d'
@@ -320,19 +320,19 @@ tr -d '\r' < $B/monitor.out > $B/monitor.txt
 cat $B/monitor.txt
 M=$B/monitor.txt
 [ $rc -eq 0 ] && ok "monitor: 'halt 0' ended the run with status 0" || bad "monitor: exit status $rc"
-expect "monitor: banner" $M '^HackOS 0\.2 \(milestone 2\)'
-expect "monitor: 29 prompts" $M 'hackos> halt 0'
+expect "monitor: banner" $M '^Hamnix Micro 0\.2 \(milestone 2\)'
+expect "monitor: 29 prompts" $M 'hmicro> halt 0'
 expect "monitor: help lists the commands" $M '^  ps +threads: state'
 expect "monitor: ps lists the idle thread" $M '^ +1 idle +ready +7 kern +[0-9]+/ +[0-9]+ +- +[0-9]+ +[0-9]+$'
 expect "monitor: ps shows itself running with its stack high-water mark" $M '^ +3 monitor +running +2 kern +[0-9]+/ 15360 '
 expect "monitor: heap statistics, consistent" $M '^kernel heap: total [0-9]+  used [0-9]+  peak [0-9]+  free [0-9]+ in [0-9]+ block'
 expect "monitor: heap consistency check is 0" $M 'requested bytes live [0-9]+  consistency 0$'
-expect "monitor: write reports the byte count" $M '^wrote 16 bytes to /tmp/d/hello.txt$'
+expect "monitor: write reports the byte count" $M '^wrote 22 bytes to /tmp/d/hello.txt$'
 expect "monitor: ls / shows dev, tmp and etc" $M '^dev$'
 expect "monitor: ls shows the new file" $M '^hello.txt$'
-expect "monitor: cat prints the first line" $M '^Hello,  HackOS!$'
+expect "monitor: cat prints the first line" $M '^Hello,  Hamnix Micro!$'
 expect "monitor: cat prints the appended line, edited with DEL on the way in" $M '^second line$'
-expect "monitor: stat" $M '^/tmp/d/hello.txt: file, 28 bytes, mode 1a4, mtime [0-9]+$'
+expect "monitor: stat" $M '^/tmp/d/hello.txt: file, 34 bytes, mode 1a4, mtime [0-9]+$'
 expect "monitor: pwd after cd" $M '^/tmp/d$'
 expect "monitor: mv with relative paths" $M '^moved.txt$'
 expect "monitor: error with the kernel's error string" $M '^cat: error -2 \(file does not exist\)$'
@@ -352,7 +352,7 @@ echo "[test] === 7. fatal-fault report under QEMU (undefined instruction before 
 run_qemu $B/faulttest.elf $B/faulttest.out; rc=$?
 cat $B/faulttest.out
 [ $rc -eq 3 ] && ok "exit status 3 (fault handler ended the run)" || bad "exit status $rc, want 3"
-expect "reported as UsageFault" $B/faulttest.out 'HackOS FAULT: UsageFault \(exception 6\)'
+expect "reported as UsageFault" $B/faulttest.out 'Hamnix Micro FAULT: UsageFault \(exception 6\)'
 expect "CFSR = 0x00010000 (UFSR.UNDEFINSTR)" $B/faulttest.out 'CFSR  = 0x00010000'
 expect "UNDEFINSTR decoded" $B/faulttest.out 'UFSR.UNDEFINSTR'
 udf="$(awk '/\tudf\t/{sub(":","",$1); print $1; exit}' $B/faulttest.lst)"
@@ -370,7 +370,7 @@ echo "[test] === 8. the shell: Hamnix's hamsh as a process on the UART console, 
 # "0 0 0" is never part of what was typed, and the harness waits for the n-th
 # one before it types the next command.
 rm -rf $B/panel-shell $B/panel-shell.bin; mkdir -p $B/panel-shell
-qemu_start $B/hackos.elf $B/shell.out "$SDCARD -serial file:$B/panel-shell.bin"
+qemu_start $B/hmicro.elf $B/shell.out "$SDCARD -serial file:$B/panel-shell.bin"
 m=0
 sh() {  # type one command line, then the marker command; wait for the marker
     m=$((m+1))
@@ -546,7 +546,7 @@ cat $B/shell.txt
 S=$B/shell.txt
 NPROG="$(echo $(grep -c . <<< "$(ls $B/user | grep -v '\.')"))"
 [ $rc -eq 0 ] && ok "shell: 'halt 0' ended the run with status 0" || bad "shell: exit status $rc"
-expect "shell: banner of the system image" $S '^HackOS 0\.[0-9]+ \(milestone [0-9]+\)'
+expect "shell: banner of the system image" $S '^Hamnix Micro 0\.[0-9]+ \(milestone [0-9]+\)'
 expect "shell: hamsh's own banner (it is running as a process)" $S "^hamsh . Hamnix shell"
 expect "shell: a built-in" $S '^hello from hamsh$'
 expect "shell: ls /bin lists the programs (an external command found through PATH)" $S '^hamsh$'
@@ -578,7 +578,7 @@ expect "shell: script: exit status" $S '^script status 5$'
 expect "shell: Ctrl-C ends a looping foreground program (status 130)" $S '^interrupted 130$'
 expect "shell: Ctrl-C ends a program that waits for console input" $S '^again 130$'
 expect "shell: ls /sd shows the files of the FAT volume" $S '^PATTERN\.BIN$'
-expect "shell: cat a file from the card" $S '^HackOS reads it through Hamnix fs/fat.ad\.$'
+expect "shell: cat a file from the card" $S '^Hamnix Micro reads it with Hamnix fat\.ad\.$'
 n40k="$(grep -c '^157 627 40000$' $S)"
 [ "$n40k" = 2 ] && ok "shell: cp card -> tmpfs -> card, 40000 bytes each way" || bad "shell: the 40000-byte copies were counted $n40k times, expected 2"
 expect "shell: a program run from the card" $S '^from the card 2$'

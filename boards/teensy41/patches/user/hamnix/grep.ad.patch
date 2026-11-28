@@ -1,4 +1,4 @@
-HackOS teensy41 size patch to user/hamnix/grep.ad (build/teensy41/root only).
+Hamnix Micro teensy41 size patch to user/hamnix/grep.ad (build/teensy41/root only).
 
 Reason: the line buffer is 64 KiB of static data in a 704 KiB program
 arena.  Lines are now cut at 8 KiB (LINE_BUF bounds every use).

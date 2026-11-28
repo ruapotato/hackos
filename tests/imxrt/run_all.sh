@@ -7,7 +7,7 @@
 #   1. third_party/nxp-mcux-rt1062 is byte-identical to the recorded upstream
 #   2. register constants against MIMXRT1062.h / fsl_clock.h   (check_regs.py)
 #   3. pin mux and pad settings against fsl_iomuxc.h and PJRC's pin table
-#   4. the boot header of build/teensy41/hackos.{elf,bin,hex}    (check_boot.py)
+#   4. the boot header of build/teensy41/hmicro.{elf,bin,hex}    (check_boot.py)
 #   5. the uSDHC + SD card driver against QEMU's models          (usdhc_qemu.sh)
 #   6. LPUART, LPI2C, LPSPI, GPIO, clock arithmetic against register models
 #      in a QEMU mps2-an500 image                                (drvtest.sh)
@@ -45,7 +45,7 @@ else echo "[imxrt] note: PJRC_CORES not set: the FCB and pin table are not compa
 step third_party hashes
 step regs python3 -I tests/imxrt/check_regs.py $NXP
 step pins python3 -I tests/imxrt/check_pins.py $NXP $PJ_PINS
-step boot python3 -I tests/imxrt/check_boot.py $B/hackos.elf $B/hackos.bin $B/hackos.hex $NXP $PJ_BOOT
+step boot python3 -I tests/imxrt/check_boot.py $B/hmicro.elf $B/hmicro.bin $B/hmicro.hex $NXP $PJ_BOOT
 step usdhc_qemu bash tests/imxrt/usdhc_qemu.sh
 [ -f tests/imxrt/drvtest.sh ] && step drvtest bash tests/imxrt/drvtest.sh
 [ -f tests/imxrt/t41mem.sh ] && step t41mem bash tests/imxrt/t41mem.sh

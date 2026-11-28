@@ -64,13 +64,13 @@ facts() {
 
 uf2conv() {
     if [ -z "${UF2CONV:-}" ]; then echo "no UF2CONV= (Microsoft's utils/uf2conv.py) given"; return 77; fi
-    python3 -I "$UF2CONV" -c -f 0xADA52840 -o $L/uf2conv.uf2 $B/hackos.hex || return 1
-    cmp $L/uf2conv.uf2 $B/hackos.uf2 && echo "ok: scripts/mkuf2.py's file is byte-identical to Microsoft's uf2conv.py output"
+    python3 -I "$UF2CONV" -c -f 0xADA52840 -o $L/uf2conv.uf2 $B/hmicro.hex || return 1
+    cmp $L/uf2conv.uf2 $B/hmicro.uf2 && echo "ok: scripts/mkuf2.py's file is byte-identical to Microsoft's uf2conv.py output"
 }
 
 code() {
     local bad=0
-    for f in $B/hackos.elf $B/user/*.elf; do
+    for f in $B/hmicro.elf $B/user/*.elf; do
         n=$(llvm-objdump -d --mcpu=cortex-m4 --no-show-raw-insn $f | grep -cE '\bv(add|sub|mul|div|sqrt|cmp|cmpe|cvt|fma|fms|nmul|neg|abs|mla|mls)[a-z]*\.f64\b|\.f64\.' )
         [ "$n" = 0 ] || { echo "FAIL: $f has $n double-precision FPU instructions (undefined on the M4F)"; bad=1; }
     done
@@ -94,7 +94,7 @@ code() {
     return $bad
 }
 
-[ -f $B/hackos.uf2 ] || { echo "[nrf52] FAIL: $B/hackos.uf2 missing (make BOARD=feather-nrf52840)"; exit 1; }
+[ -f $B/hmicro.uf2 ] || { echo "[nrf52] FAIL: $B/hmicro.uf2 missing (make BOARD=feather-nrf52840)"; exit 1; }
 step third_party third_party
 step regs regs
 step facts facts

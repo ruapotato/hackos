@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- build and test.
+# Hamnix Micro -- build and test.
 #
 #   make                    build the default board's image (BOARD=qemu-mps2)
 #   make test               build everything for QEMU from source and run every
@@ -8,7 +8,7 @@
 #   make run                run the system in QEMU with the UART on the terminal
 #   make size               text/data/bss of the image
 #   make measure            cost of the i64 value model vs. C (tests/measure.sh)
-#   make BOARD=teensy41     the Teensy 4.1 image: build/teensy41/hackos.hex
+#   make BOARD=teensy41     the Teensy 4.1 image: build/teensy41/hmicro.hex
 #                           (docs/boards/teensy41.md)
 #   make test-m4            the kernel tests and the shell session once more,
 #                           on QEMU's Cortex-M4F machine (BOARD=qemu-m4)
@@ -65,7 +65,7 @@ endif
 #                 in place from flash and copy only its data (docs/porting.md).
 #   PROGS_SKIP    programs not built for this board.
 LINK_LD       := boards/$(BOARD_DIR)/link.ld
-IMAGES        := hackos
+IMAGES        := hmicro
 BOARD_PATCHES :=
 PROG_AFLAGS   :=
 CPU           := cortex-m7
@@ -78,7 +78,7 @@ include boards/$(BOARD_DIR)/board.mk
 
 CPUFLAGS := --target=$(TRIPLE) -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=hard -mthumb
 ifeq ($(CPU),cortex-m4)
-CPUFLAGS += -DHACKOS_CPU_M4
+CPUFLAGS += -DHMICRO_CPU_M4
 endif
 OPT     ?= -O2
 # -ffunction-sections/-fdata-sections + --gc-sections: only what is reachable
@@ -88,10 +88,10 @@ ASFLAGS := $(CPUFLAGS) -ffreestanding -Iboards/$(BOARD_DIR)
 LDFLAGS := -T $(LINK_LD) --gc-sections -nostdlib -static $(LDFLAGS_BOARD)
 
 # C code (third-party drivers and their tests): natural C ABI, no C library
-# except lib/cshim, whose functions carry hackos_c_ names (the forced include
-# renames the usual ones; see lib/cshim/include/hackos_libc_rename.h).
+# except lib/cshim, whose functions carry hmicro_c_ names (the forced include
+# renames the usual ones; see lib/cshim/include/hmicro_libc_rename.h).
 CFLAGS  := $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fno-pic -ffunction-sections -fdata-sections \
-           -Wall -Wextra -isystem lib/cshim/include -include lib/cshim/include/hackos_libc_rename.h
+           -Wall -Wextra -isystem lib/cshim/include -include lib/cshim/include/hmicro_libc_rename.h
 C_SHT4X := third_party/sensirion-sht4x
 COBJS_ktest := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common.o $(B)/c/interop.o $(B)/c/libc.o
 # C objects every image of a board links (BOARD_COBJS in board.mk): the
@@ -105,7 +105,7 @@ SRC_AD := $(wildcard drivers/display/*.c kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.
 # linked with the user run-time (user/rt/) into a PIE that the kernel loads
 # from /bin.  $(B)/user/NAME.elf keeps its symbols; $(B)/user/NAME is the
 # stripped file that goes into the image's ROM file table.
-#   user/progs/NAME.ad    HackOS's own (tests, examples)
+#   user/progs/NAME.ad    Hamnix Micro's own (tests, examples)
 #   user/hamnix/NAME.ad   copied from Hamnix (fs/HAMNIX_ORIGIN)
 # Per program: STACK_NAME (bytes of stack, default 8192) and HEAP_NAME
 # (bytes of heap for sys_mmap, default 0).
@@ -118,7 +118,7 @@ PROG_BINS    := $(PROGS:%=$(B)/user/%)
 SRC_USER     := $(wildcard user/progs/*.ad user/hamnix/*.ad user/rt/*.ad lib/*.ad lib/*/*.ad kernel/rt.ad)
 ifeq ($(PROG_ABI),rwpi)
 UPIC    := -fropi -frwpi
-UAFLAGS := $(CPUFLAGS) -ffreestanding -DHACKOS_RWPI
+UAFLAGS := $(CPUFLAGS) -ffreestanding -DHMICRO_RWPI
 ULDFLAGS := -static -T user/rt/prog_rwpi.ld --gc-sections -nostdlib -z max-page-size=16 --no-rosegment
 else
 UPIC    := -fPIE
@@ -168,11 +168,11 @@ $(B)/%.ll: $(SRC_AD) $(HOST_AC) $(SRCROOT) | $(B)
 	cd $(B)/root && $(HOST_AC_ABS) --backend=llvm --target=$(TRIPLE) $(ROOT_$*) $(abspath $@)
 	@grep '^; ADDER_STAT' $@
 
-ROOT_hackos := init/main.ad
+ROOT_hmicro := init/main.ad
 ROOT_monitor := init/monitor_main.ad
 KOBJS_monitor := $(B)/switch.o
 ROOT_selftest := demo/main.ad
-KOBJS_hackos := $(B)/switch.o
+KOBJS_hmicro := $(B)/switch.o
 ROOT_ktest := tests/ktest_main.ad
 KOBJS_ktest := $(B)/switch.o $(B)/fptest.o
 ROOT_faulttest := tests/fault_main.ad
@@ -281,7 +281,7 @@ $(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/r
 SD_ADDR := 0x20200000
 $(B)/sd.img: tests/sd/readme.txt $(B)/user/hello | $(B)
 	rm -f $@ && truncate -s 2M $@
-	mformat -i $@ -F -c 1 -v HACKOS ::
+	mformat -i $@ -F -c 1 -v HMICRO ::
 	mcopy -i $@ tests/sd/readme.txt ::README.TXT
 	mcopy -i $@ tests/sd/readme.txt "::A long file name.text"
 	mmd -i $@ ::DOCS
@@ -291,15 +291,15 @@ $(B)/sd.img: tests/sd/readme.txt $(B)/user/hello | $(B)
 
 # Flash image for the Teensy loader (Intel HEX at the flash addresses) and
 # the raw image from 0x60000000 (what tests/imxrt/check_boot.py reads).
-$(B)/hackos.hex: $(B)/hackos.elf
+$(B)/hmicro.hex: $(B)/hmicro.elf
 	$(OBJCOPY) -O ihex $< $@
 
-$(B)/hackos.bin: $(B)/hackos.elf
+$(B)/hmicro.bin: $(B)/hmicro.elf
 	$(OBJCOPY) -O binary $< $@
 
 # UF2 for the Adafruit nRF52 bootloader's drag-and-drop drive
 # (scripts/mkuf2.py; tests/nrf52/check_uf2.py checks the result).
-$(B)/hackos.uf2: $(B)/hackos.hex scripts/mkuf2.py
+$(B)/hmicro.uf2: $(B)/hmicro.hex scripts/mkuf2.py
 	python3 -I scripts/mkuf2.py --family $(UF2_FAMILY) $< $@
 
 # The nRF52840 checks that need no board, the Renode run included
@@ -311,7 +311,7 @@ test-nrf52:
 # The kernel tests and the shell session on QEMU's Cortex-M4F machine
 # (tests/m4/run_all.sh).
 test-m4:
-	$(MAKE) BOARD=qemu-m4 ADDER=$(ADDER) build/qemu-m4/hackos.elf build/qemu-m4/ktest.elf build/qemu-m4/sd.img
+	$(MAKE) BOARD=qemu-m4 ADDER=$(ADDER) build/qemu-m4/hmicro.elf build/qemu-m4/ktest.elf build/qemu-m4/sd.img
 	ADDER=$(ADDER) bash tests/m4/run_all.sh
 
 # The checks of the i.MX RT code that need no board (tests/imxrt/README).
@@ -319,13 +319,13 @@ test-teensy:
 	$(MAKE) BOARD=teensy41 ADDER=$(ADDER)
 	ADDER=$(ADDER) bash tests/imxrt/run_all.sh
 
-run: $(B)/hackos.elf $(B)/sd.img
+run: $(B)/hmicro.elf $(B)/sd.img
 	$(QEMU) -M mps2-an500 -nographic -no-reboot -device loader,file=$(B)/sd.img,addr=$(SD_ADDR) -kernel $<
 
-size: $(B)/hackos.elf
+size: $(B)/hmicro.elf
 	$(SIZE) $<
 
-test: $(B)/hackos.elf $(B)/monitor.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf $(B)/sd.img
+test: $(B)/hmicro.elf $(B)/monitor.elf $(B)/ktest.elf $(B)/selftest.elf $(B)/faulttest.elf $(B)/sd.img
 	ADDER=$(ADDER) bash tests/run_all.sh
 
 measure: $(HOST_AC)

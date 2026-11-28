@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS milestone 1 demo / self-test for QEMU `mps2-an500` (Cortex-M7).
+# Hamnix Micro milestone 1 demo / self-test for QEMU `mps2-an500` (Cortex-M7).
 #
 # Every check prints "PASS <name>" or "FAIL <name>"; main() returns the number
 # of failed checks, which becomes the QEMU exit status (0 = all passed).
@@ -12,8 +12,8 @@
 # optimiser cannot fold the checks away at compile time: the arithmetic below
 # really executes on the (emulated) Cortex-M7.
 
-from kernel.start import hackos_start
-from kernel.fault import hackos_fault
+from kernel.start import hmicro_start
+from kernel.fault import hmicro_fault
 from kernel.print import kputs, kputc, kput_u64, kput_i64, kput_hex, kput_hex32, kput_f64
 from kernel.cpu import cpu_irq_disable, cpu_irq_enable, cpu_wait_for_interrupt, cpu_primask, cpu_ipsr, cpu_control, cpu_set_basepri, cpu_basepri, mmio_read32, mmio_write32
 from kernel.systick import systick_start, systick_stop, systick_ticks, systick_seen_ipsr, systick_handler
@@ -337,7 +337,7 @@ def test_runtime():
 
 
 def main() -> int32:
-    kputs("\nHackOS 0.1 (milestone 1) -- Adder on ARM Cortex-M7, QEMU mps2-an500\n")
+    kputs("\nHamnix Micro 0.1 (milestone 1) -- Adder on ARM Cortex-M7, QEMU mps2-an500\n")
     kputs("CONTROL=")
     kput_hex32(cpu_control())
     kputs(" CPACR=")

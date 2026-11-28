@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- NXP i.MX RT1062 specifics: addresses, interrupt numbers, clock
+# Hamnix Micro -- NXP i.MX RT1062 specifics: addresses, interrupt numbers, clock
 # gates and roots (CCM, CCM_ANALOG), FlexRAM, watchdogs, caches, NVIC reset.
 #
 # UNTESTED ON HARDWARE.  Every address, offset, mask and gate below is
@@ -9,7 +9,7 @@
 # tested with register values whose frequencies are known (the reset values,
 # PJRC's 600 MHz set-up) in the driver test image.
 #
-# Clocks: HackOS does NOT set the core clock or the PLLs.  It runs on what
+# Clocks: Hamnix Micro does NOT set the core clock or the PLLs.  It runs on what
 # the boot ROM left, and every peripheral it uses takes a root it chooses:
 # LPUART and LPI2C from the 24 MHz oscillator (independent of the PLLs),
 # SysTick from its 100 kHz reference.  Only the uSDHC (PLL2 PFD0, set to
@@ -341,7 +341,7 @@ def clk_read():
     clk_compute(&clk_regs[0], &clk_freq[0])
 
 
-# ---- clock roots HackOS sets ----------------------------------------------
+# ---- clock roots Hamnix Micro sets ----------------------------------------------
 # Each returns the root's frequency as computed from the registers afterwards.
 
 # LPUART: osc_clk / 1 = 24 MHz.
@@ -372,7 +372,7 @@ def clk_lpspi_root_pll2() -> uint32:
 
 # uSDHC1: PLL2 PFD0 set to 528 * 18 / 24 = 396 MHz, divided by 2 = 198 MHz
 # (the set-up SdFat uses on the Teensy 4.1).  The PFD is gated while its
-# fraction changes; nothing else of HackOS uses PFD0.
+# fraction changes; nothing else of Hamnix Micro uses PFD0.
 def clk_usdhc1_root() -> uint32:
     ccm_gate_off(CCM_GATE_USDHC1)
     a: uint64 = CCM_ANALOG_BASE
@@ -388,7 +388,7 @@ def clk_usdhc1_root() -> uint32:
 
 
 # ---- system set-up --------------------------------------------------------
-# What NXP's SystemInit (system_MIMXRT1062.c) does that HackOS needs, in its
+# What NXP's SystemInit (system_MIMXRT1062.c) does that Hamnix Micro needs, in its
 # order: watchdog power-down counters off (WDOG1/2 would otherwise assert
 # WDOG_B 16 s after reset), the three watchdogs disabled, SysTick stopped
 # (the ROM may leave it running), and the instruction cache on.  Also: every

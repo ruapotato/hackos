@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# Porting HackOS to a new board
+# Porting Hamnix Micro to a new board
 
-HackOS runs on four boards so far: QEMU `mps2-an500` (Cortex-M7, the test
+Hamnix Micro runs on four boards so far: QEMU `mps2-an500` (Cortex-M7, the test
 machine) and `mps2-an386` (Cortex-M4F, `BOARD=qemu-m4`), the Teensy 4.1 (i.MX RT1062, Cortex-M7) and the Adafruit
 Feather nRF52840 (Cortex-M4F). This note says what a new one needs, in
 the order to write it. The last two are UNTESTED ON HARDWARE; their docs
@@ -21,7 +21,7 @@ A board directory holds five files:
 | File | What |
 |--|--|
 | `board.mk` | `CPU`, `FPU`, `SOFT_DOUBLE`, `PROG_ABI`, `PROGS_SKIP`, `IMAGES`, `BOARD_ALL` (extra outputs: .hex, .uf2), `PROG_AFLAGS`, `BOARD_PATCHES`, `STACK_<prog>` / `STACK_DEFAULT_BOARD`, `LDFLAGS_BOARD` |
-| `vectors.S` | `hackos_vectors` (16 + the chip's interrupt count, aligned to the power of two above its size) and whatever the boot path needs before it: Teensy the FlexSPI boot header, QEMU the reset-only table at 0. Included by `arch/armv7m/startup.S`. Optional `board_reset_early` (define `BOARD_RESET_EARLY`) for work before a stack exists |
+| `vectors.S` | `hmicro_vectors` (16 + the chip's interrupt count, aligned to the power of two above its size) and whatever the boot path needs before it: Teensy the FlexSPI boot header, QEMU the reset-only table at 0. Included by `arch/armv7m/startup.S`. Optional `board_reset_early` (define `BOARD_RESET_EARLY`) for work before a stack exists |
 | `link.ld` | The memory map, with the section and symbol names of `boards/mps2_an500/link.ld` (`__vectors_start`, `__text_end`, `__data_load/start/end`, `__xbss_*`, `__bss_*`, `__stack_top`, `__fault_stack_top`, `__heap_start/end`, `__prog_start/end`, `__user_start/end`, `__ramdisk_*`) |
 | `board.ad` | The board functions below |
 | `patches/` | Per-board size patches of copied or kernel code (`<path>.patch`, a `diff -u` against the committed file, with a header saying why) |
@@ -49,7 +49,7 @@ A board directory holds five files:
 | `board_suspend(ms, sources, res)` | suspend; return 0 when not supported |
 | `board_display_start()`, `board_input_start()` (in `devices.ad`, imported as `board.devices` by the system image) | put the console on a display / attach a keyboard (docs/display-input.md); return -1 without one |
 
-## 3. A new board on a chip family HackOS knows
+## 3. A new board on a chip family Hamnix Micro knows
 
 Example: another i.MX RT1062 board, or another nRF52840 board.
 
@@ -86,7 +86,7 @@ Example: another i.MX RT1062 board, or another nRF52840 board.
 2. **CPU and FPU** in `board.mk`. The Adder target is
    `thumbv7em-none-eabihf` for both the M7 and the M4F; only clang's
    `-mcpu`/`-mfpu` change. The `.S` files pick `.cpu`/`.fpu` by
-   `HACKOS_CPU_M4`. A third CPU there needs one more `#ifdef`.
+   `HMICRO_CPU_M4`. A third CPU there needs one more `#ifdef`.
 3. **No double-precision FPU** (M4F: fpv4-sp-d16): `SOFT_DOUBLE := 1`
    links compiler-rt's `__aeabi_d*` into the kernel and every program. The
    hard-float calling convention stays: doubles are still passed in d0-d7,
@@ -193,7 +193,7 @@ switch and system-call entry, special registers, EABI shims, the user's
   with BASEPRI 0x40 in `switch.S` and `cpu_irq_save`; use PRIMASK), no
   `stmdb`/`ldmia` with high registers (save r8-r11 through r4-r7), no
   `it` blocks, no `cbz` beyond the encodable range, no FP context. The
-  PendSV/SVC design carries over. `hackos_fault_entry` changes (no
+  PendSV/SVC design carries over. `hmicro_fault_entry` changes (no
   CFSR/MMFAR: the M0+ reports only HardFault).
 - MPU: the RP2040's M0+ has the optional **8-region PMSAv6** MPU, close to
   PMSAv7 (power-of-two regions, sub-regions from 256 bytes). `kernel/mpu.ad`

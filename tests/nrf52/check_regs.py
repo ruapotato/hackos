@@ -156,7 +156,7 @@ print(f"check_regs: {total} constants: {nchecked['define']} defines (addresses, 
 # The vector table: 16 + (highest IRQn + 1) entries.
 nirq = max(v for v in irqs.values()) + 1
 vs = open('boards/feather_nrf52840/vectors.S').read()
-body = vs[vs.index('hackos_vectors:'):vs.index('.size hackos_vectors')]
+body = vs[vs.index('hmicro_vectors:'):vs.index('.size hmicro_vectors')]
 words = len(re.findall(r'^\s*\.word\s+\w+\s*(?:/\*.*)?$', body, re.M)) + 4 * len(re.findall(r'\.word\s+0, 0, 0, 0', body))
 words += sum(int(r) for r in re.findall(r'\.rept\s+(\d+)', body)) - len(re.findall(r'\.rept', body))
 if words != 16 + nirq:

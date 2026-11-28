@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- stand-in for Hamnix's lib/hamui.ad (the hamui GUI toolkit).
+# Hamnix Micro -- stand-in for Hamnix's lib/hamui.ad (the hamui GUI toolkit).
 #
 # Hamnix's shell imports the hamui GUI toolkit for its `hamui` and `pygame` built-ins.
-# HackOS has no window system and no frame buffer, and the real libraries
+# Hamnix Micro has no window system and no frame buffer, and the real libraries
 # would add 10.8 MB of static tables to the shell.  This module supplies the
 # names the shell imports, with Hamnix's signatures, so that user/hamnix/
 # hamsh.ad needs no change for it: every call fails or does nothing, and the

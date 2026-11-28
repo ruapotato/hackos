@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- keypress [-n] TEXT...: type TEXT on the emulated keyboard.
+# Hamnix Micro -- keypress [-n] TEXT...: type TEXT on the emulated keyboard.
 #
 # The words are joined with spaces (-n adds Enter) and written to
 # /proc/keys: on a board whose keyboard chip is the register model, every

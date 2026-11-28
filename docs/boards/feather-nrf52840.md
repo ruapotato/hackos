@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS on the Adafruit Feather nRF52840 Express
+# Hamnix Micro on the Adafruit Feather nRF52840 Express
 
-`make BOARD=feather-nrf52840` builds HackOS for the Adafruit Feather nRF52840
+`make BOARD=feather-nrf52840` builds Hamnix Micro for the Adafruit Feather nRF52840
 Express (product 4062: Nordic nRF52840, 64 MHz Cortex-M4F with a
 single-precision FPU and an 8-region MPU, 1 MB flash, 256 KB RAM, 2 MB QSPI
 flash, Adafruit's UF2 bootloader).
@@ -14,7 +14,7 @@ check available without the board. It is not proof that the board behaves the sa
 
 The Feather nRF52840 **Sense** has the same chip, the same TX/RX pins and
 the same bootloader layout, but its red LED is on P1.09 and it has no
-32 kHz crystal. HackOS reads the board id from the bootloader's
+32 kHz crystal. Hamnix Micro reads the board id from the bootloader's
 configuration block and picks the LED pin from that, and it runs the low-frequency clock
 from the internal RC oscillator on both boards. Sense support is optional
 and is even less tested than the Express.
@@ -22,7 +22,7 @@ and is even less tested than the Express.
 ## 1. What you need
 
 - The Feather nRF52840 Express and a USB cable. USB only powers the board
-  and talks to the bootloader. HackOS has no USB driver, so its console is
+  and talks to the bootloader. Hamnix Micro has no USB driver, so its console is
   the TX/RX header pins, not the USB port.
 - A 3.3 V USB-to-serial adapter, the main console method (section 2). A
   Raspberry Pi 3 can stand in for it.
@@ -73,8 +73,8 @@ The console is UARTE0 at **115200 baud, 8N1**, 3.3 V logic, no flow control:
 
 | Feather pin | nRF52840 | direction |
 |--|--|--|
-| **TX** | P0.25 | HackOS sends |
-| **RX** | P0.24 | HackOS receives (pulled up inside, so an open input reads idle) |
+| **TX** | P0.25 | Hamnix Micro sends |
+| **RX** | P0.24 | Hamnix Micro receives (pulled up inside, so an open input reads idle) |
 | **GND** | | common ground |
 
 (Adafruit's Arduino variant: Serial1 TX = D0 = P0.25, RX = D1 = P0.24;
@@ -100,7 +100,7 @@ The console is UARTE0 at **115200 baud, 8N1**, 3.3 V logic, no flow control:
    ```
 
    The adapter may appear as `/dev/ttyACM0` instead (`ls /dev/tty{USB,ACM}*`
-   before and after plugging it in). Ctrl-C reaches HackOS through both
+   before and after plugging it in). Ctrl-C reaches Hamnix Micro through both
    programs.
 
 ### 2b. With a Raspberry Pi 3 (alternative)
@@ -135,7 +135,7 @@ Feather from USB. On the Pi:
 
 ## 3. Flashing (UF2 drag and drop)
 
-`make BOARD=feather-nrf52840` writes `build/feather-nrf52840/hackos.uf2`
+`make BOARD=feather-nrf52840` writes `build/feather-nrf52840/hmicro.uf2`
 (and `.hex`, `.bin`, `.elf`).
 
 1. Plug the Feather into USB and **double-tap its reset button** (two
@@ -152,10 +152,10 @@ Feather from USB. On the Pi:
 3. Copy the file and flush:
 
    ```sh
-   cp build/feather-nrf52840/hackos.uf2 /media/$USER/FTHR840BOOT/ && sync
+   cp build/feather-nrf52840/hmicro.uf2 /media/$USER/FTHR840BOOT/ && sync
    ```
 
-   The drive disappears and the board restarts into HackOS. An error from
+   The drive disappears and the board restarts into Hamnix Micro. An error from
    the file manager at that moment is normal.
 
 What the UF2 file touches: only 0x26000 up to the end of the image (about
@@ -165,20 +165,20 @@ settings stay as they were (`tests/nrf52/check_image.py` checks every
 block's address). To go back to Arduino or CircuitPython, double-tap reset
 and copy their UF2 in the same way.
 
-Each later flash needs a double-tap. A single tap of reset restarts HackOS.
+Each later flash needs a double-tap. A single tap of reset restarts Hamnix Micro.
 The `halt` program (`halt 0` at the prompt) also restarts it, through the
 bootloader.
 
 ## 4. What should happen at the first power-up
 
 1. **The red LED (D3, P1.15) lights at once.** That is
-   the very first thing HackOS does after setting up memory. If it stays
-   dark, HackOS never ran (section 5, step 1).
+   the very first thing Hamnix Micro does after setting up memory. If it stays
+   dark, Hamnix Micro never ran (section 5, step 1).
 2. Within a fraction of a second the console shows this (the Renode
    run's transcript, `build/nrf52/renode/console.txt`, shortened):
 
    ```
-   HackOS 0.3 (milestone 3) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express (Nordic nRF52840)
+   Hamnix Micro 0.3 (milestone 3) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express (Nordic nRF52840)
    chip: part 0x00000000 variant 0x00000000, 0 KB RAM, 0 KB flash, device id 0x00000000 0x00000000
    reset reason 0x00000000, bootloader board id 0x00000000 (unknown: assuming the Express, red LED P1.15)
    clocks: HFCLK from the 32 MHz crystal, LFCLK from the RC oscillator
@@ -223,7 +223,7 @@ bootloader.
    then **Ctrl-C** on `ptest loop`, then **a fault** (`ptest peek 20000000`
    must end with status 139: the MPU, on the real M4).
 6. **Timing.** `sleep`-like waits use the RTC1 tick, 1000 Hz on average, from
-   the RC oscillator, which HackOS does not calibrate: expect an error of
+   the RC oscillator, which Hamnix Micro does not calibrate: expect an error of
    up to a few per cent against a wall clock (the product specification's
    LFRC tolerance).
 
@@ -273,17 +273,17 @@ firmware (MIT; github.com/raspberrypi/debugprobe):
    openocd -f interface/cmsis-dap.cfg -c "transport select swd" -f target/nrf52.cfg
    # flash the HEX this way instead of UF2 (it covers only 0x26000..):
    openocd -f interface/cmsis-dap.cfg -c "transport select swd" -f target/nrf52.cfg \
-           -c "program build/feather-nrf52840/hackos.hex verify reset exit"
+           -c "program build/feather-nrf52840/hmicro.hex verify reset exit"
    ```
 
-   Then `gdb-multiarch build/feather-nrf52840/hackos.elf` with `target extended-remote :3333`.
+   Then `gdb-multiarch build/feather-nrf52840/hmicro.elf` with `target extended-remote :3333`.
 
 **The QT Py RP2040** has no ready-made debugprobe build. It would need its own
 board header (as `include/board_example_config.h`) naming two of its pads
 as SWCLK and SWDIO, built with the Pico SDK. Not tried; use the Pico.
 
 **APPROTECT.** nRF52840s from build code F on close the debug port at each
-reset unless the running firmware opens it. HackOS does what Nordic's
+reset unless the running firmware opens it. Hamnix Micro does what Nordic's
 start-up does: it copies `UICR.APPROTECT` into `APPROTECT.DISABLE`, so a
 chip whose UICR holds 0x5A ("hardware disabled") stays open. What the UICR
 of a given Feather holds is not known here (Adafruit's bootloader source

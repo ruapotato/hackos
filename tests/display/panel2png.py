@@ -3,7 +3,7 @@
 # Copyright (C) 2026 David Hamner
 """panel2png.py STREAM OUTDIR [--font font8x8_basic.h] [--yscale N] [--keep N]
 
-The host side of HackOS's fake e-paper panel (drivers/display/fakepanel.ad).
+The host side of Hamnix Micro's fake e-paper panel (drivers/display/fakepanel.ad).
 STREAM is what the panel's byte sink received (QEMU: the second UART,
 written to a file).  The records are replayed into the image a panel would
 hold, and after every refresh that image is written to OUTDIR as

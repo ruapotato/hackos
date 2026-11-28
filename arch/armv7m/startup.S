@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- ARMv7-M (Cortex-M7) start-up and ABI glue.
+/* Hamnix Micro -- ARMv7-M (Cortex-M7) start-up and ABI glue.
  *
  * This file holds ONLY what cannot be written in Adder:
  *   1. the vector table (a data table at a fixed section; per board, included),
@@ -24,7 +24,7 @@
  *   A pointer passed TO Adder must have its high word zero.
  */
         .syntax unified
-#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+#ifdef HMICRO_CPU_M4                    /* Cortex-M4F: single-precision FPU */
         .cpu cortex-m4
         .fpu fpv4-sp-d16
 #else
@@ -37,7 +37,7 @@
 /* 1. Vector tables                                                   */
 /* ------------------------------------------------------------------ */
 /* Board specific: boards/<board>/vectors.S, found through -Iboards/<board>.
- * It defines hackos_vectors (the table VTOR is pointed at) and whatever the
+ * It defines hmicro_vectors (the table VTOR is pointed at) and whatever the
  * board's boot path needs before it (mps2-an500: the reset-only table at
  * address 0; teensy41: the FlexSPI boot header).  A board that must run code
  * before the stack pointer is usable defines BOARD_RESET_EARLY and a leaf
@@ -57,7 +57,7 @@
         .type   \name, %function
 \name:
         movs    r0, #\kind
-        b       hackos_fault_entry
+        b       hmicro_fault_entry
         .size   \name, . - \name
         .endm
 
@@ -91,8 +91,8 @@ Reset_Handler:
         dsb
         isb
         /* Everything else (VTOR, .data copy, .bss clear, main) is Adder.  */
-        bl      hackos_start
-1:      wfi                             /* hackos_start does not return    */
+        bl      hmicro_start
+1:      wfi                             /* hmicro_start does not return    */
         b       1b
         .size   Reset_Handler, . - Reset_Handler
         .ltorg
@@ -100,7 +100,7 @@ Reset_Handler:
 /* ------------------------------------------------------------------ */
 /* 3. Fault entry                                                     */
 /* ------------------------------------------------------------------ */
-/* hackos_fault(kind: uint64, frame: uint64, exc_return: uint64)       */
+/* hmicro_fault(kind: uint64, frame: uint64, exc_return: uint64)       */
         .macro  fault_handler name, kind
         .section .text.\name, "ax", %progbits
         .global \name
@@ -108,7 +108,7 @@ Reset_Handler:
         .type   \name, %function
 \name:
         movs    r0, #\kind
-        b       hackos_fault_entry
+        b       hmicro_fault_entry
         .size   \name, . - \name
         .endm
 
@@ -117,28 +117,28 @@ Reset_Handler:
         fault_handler BusFault_Handler, 5
         fault_handler UsageFault_Handler, 6
 
-/* A kernel may define hackos_thread_fault(kind, frame, exc_return) -> uint64
+/* A kernel may define hmicro_thread_fault(kind, frame, exc_return) -> uint64
  * in Adder.  It is offered every fault that was taken from THREAD mode on the
  * PROCESS stack: the handler stack is intact in that case, so the kernel can
  * end the offending thread and carry on.  Returning 0 means "handled, return
  * from the exception" (the kernel has made another thread runnable and pended
  * PendSV); anything else falls through to the fatal report.  Without a kernel
  * the weak default below declines everything.                              */
-        .section .text.hackos_thread_fault, "ax", %progbits
-        .weak   hackos_thread_fault
+        .section .text.hmicro_thread_fault, "ax", %progbits
+        .weak   hmicro_thread_fault
         .thumb_func
-        .type   hackos_thread_fault, %function
-hackos_thread_fault:
+        .type   hmicro_thread_fault, %function
+hmicro_thread_fault:
         movs    r0, #1
         movs    r1, #0
         bx      lr
-        .size   hackos_thread_fault, . - hackos_thread_fault
+        .size   hmicro_thread_fault, . - hmicro_thread_fault
 
-        .section .text.hackos_fault_entry, "ax", %progbits
-        .global hackos_fault_entry
+        .section .text.hmicro_fault_entry, "ax", %progbits
+        .global hmicro_fault_entry
         .thumb_func
-        .type   hackos_fault_entry, %function
-hackos_fault_entry:
+        .type   hmicro_fault_entry, %function
+hmicro_fault_entry:
         and     r1, lr, #0xC            /* EXC_RETURN: thread mode + PSP?  */
         cmp     r1, #0xC
         bne     2f
@@ -150,7 +150,7 @@ hackos_fault_entry:
         sub     sp, #8
         str     r12, [sp]               /* arg2 = EXC_RETURN (stack, 64b)  */
         str     r3, [sp, #4]
-        bl      hackos_thread_fault
+        bl      hmicro_thread_fault
         add     sp, #8
         cmp     r0, #0
         pop     {r0, lr}
@@ -170,9 +170,9 @@ hackos_fault_entry:
         sub     sp, #8
         str     r12, [sp]               /* arg2 = EXC_RETURN (stack, 64b)  */
         str     r3, [sp, #4]
-        bl      hackos_fault
+        bl      hmicro_fault
 1:      b       1b
-        .size   hackos_fault_entry, . - hackos_fault_entry
+        .size   hmicro_fault_entry, . - hmicro_fault_entry
         .ltorg
 
 /* 4. The EABI run-time helper shims are in aeabi.S: programs need them too. */

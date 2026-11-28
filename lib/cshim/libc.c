@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS: the few C library functions third-party C code may call, with the C
- * calling convention, under hackos_c_* names (hackos_libc_rename.h explains).
+/* Hamnix Micro: the few C library functions third-party C code may call, with the C
+ * calling convention, under hmicro_c_* names (hmicro_libc_rename.h explains).
  * Plain loops: the image is built -ffreestanding, so the compiler does not
  * turn them back into library calls.                                       */
 #include <stddef.h>

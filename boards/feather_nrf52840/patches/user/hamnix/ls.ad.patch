@@ -1,4 +1,4 @@
-HackOS feather-nrf52840 size patch to user/hamnix/ls.ad (the committed file plus the teensy41 patch's changes, which it repeats).
+Hamnix Micro feather-nrf52840 size patch to user/hamnix/ls.ad (the committed file plus the teensy41 patch's changes, which it repeats).
 Applied by scripts/mkroot.sh in build/feather-nrf52840/root only; the
 committed file is unchanged.
 

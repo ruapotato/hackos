@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- processes: program loading, spawn, exec, rfork, wait.
+# Hamnix Micro -- processes: program loading, spawn, exec, rfork, wait.
 #
 # A process is a thread with TF_PROC (kernel/sched/core.ad) that runs a
 # program loaded from the file system into one block of the program arena.

@@ -16,8 +16,8 @@
 #
 # Output: "PASS name" / "FAIL name" per check, then the exit status line.
 
-from kernel.start import hackos_start
-from kernel.fault import hackos_fault
+from kernel.start import hmicro_start
+from kernel.fault import hmicro_fault
 from kernel.print import kputs, kputc, kput_u64, kput_hex32
 from soc.imxrt.reg import m_iomuxc, m_ccm, m_analog, m_unmodelled, m_unmodelled_addr
 from soc.imxrt.delay import model_time_us
@@ -228,7 +228,7 @@ def test_clocks():
     clk_compute(&regs[0], &fq[0])
     check(cast[uint32](fq[F_PLL2] == 540000000 and fq[F_PLL1] == 24000000), "clocks: PLL2 with NUM/DENOM = 1/2 is 22.5 x 24 MHz; a bypassed PLL1 is 24 MHz")
     check(cast[uint32](clk_pfd(528000000, 0x80, 0) == 0 and clk_pfd(528000000, 0x18, 0) == 396000000 and clk_pfd(480000000, 0x0C000000, 3) == 720000000), "clocks: PFD = PLL x 18 / frac; a gated PFD gives 0")
-    # the roots HackOS sets, on a ROM-like state (registers as plain memory)
+    # the roots Hamnix Micro sets, on a ROM-like state (registers as plain memory)
     snap_pjrc600()
     i: uint32 = 0
     while i < 64:
@@ -398,7 +398,7 @@ def test_lpspi():
 
 
 def main() -> int32:
-    kputs("\nHackOS i.MX RT driver test (register models, QEMU mps2-an500)\n")
+    kputs("\nHamnix Micro i.MX RT driver test (register models, QEMU mps2-an500)\n")
     test_lpuart()
     test_gpio()
     test_clocks()

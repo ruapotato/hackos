@@ -6,7 +6,7 @@
 # a shell session, not only through Renode's nRF52840 (`make test-m4`).
 # Differences from qemu-mps2: the CPU, and the 16 MB RAM at 0x21000000
 # instead of 0x60000000.  Programs are PIEs copied into RAM, as on qemu-mps2.
-IMAGES := hackos ktest
+IMAGES := hmicro ktest
 CPU := cortex-m4
 FPU := fpv4-sp-d16
 SOFT_DOUBLE := 1

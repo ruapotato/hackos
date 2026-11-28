@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- a C program as a process, and the loader's relocation test.
+/* Hamnix Micro -- a C program as a process, and the loader's relocation test.
  *
  * Adder programs address everything PC-relative and need no load-time
  * relocation.  C code with statically initialised pointers does: every

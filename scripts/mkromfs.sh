@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- generate the assembly source of the ROM file table: the programs
+# Hamnix Micro -- generate the assembly source of the ROM file table: the programs
 # that are part of the kernel image and appear, read-only, under /bin
 # (fs/hvfs.ad reads the table).
 #   mkromfs.sh OUT.S FILE...      each FILE becomes /bin/<basename of FILE>

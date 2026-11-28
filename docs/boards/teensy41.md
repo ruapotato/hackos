@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS on the Teensy 4.1
+# Hamnix Micro on the Teensy 4.1
 
 **Status: UNTESTED ON HARDWARE.** Nothing in this port has run on a Teensy.
 It builds, it links at the right addresses, and every piece that could be
@@ -10,7 +10,7 @@ the first real test; section 5 is the order in which to find out what works.
 | | |
 |--|--|
 | Board | PJRC Teensy 4.1: NXP i.MX RT1062 (Cortex-M7, up to 600 MHz), 8 MiB QSPI flash (W25Q64JV), 1 MiB on-chip RAM, microSD socket, optional PSRAM pads (not used) |
-| Build | `make BOARD=teensy41 ADDER=../adder` → `build/teensy41/hackos.hex` (and `.elf`, `.bin`) |
+| Build | `make BOARD=teensy41 ADDER=../adder` → `build/teensy41/hmicro.hex` (and `.elf`, `.bin`) |
 | Checks | `make test-teensy ADDER=../adder` (optionally `PJRC_CORES=<checkout of PaulStoffregen/cores>`) |
 | Console | LPUART6 = the Teensy's `Serial1`: pin 1 TX, pin 0 RX, 115200 8N1, 3.3 V |
 | LED | pin 13 (the orange LED) |
@@ -20,7 +20,7 @@ the first real test; section 5 is the order in which to find out what works.
 
 - A Teensy 4.1 and a USB cable (power and programming).
 - A **3.3 V** USB-to-serial adapter (FTDI, CP2102, CH340 ...) for the
-  console. The Teensy 4.1's pins are not 5 V tolerant. HackOS has no USB
+  console. The Teensy 4.1's pins are not 5 V tolerant. Hamnix Micro has no USB
   driver: the USB port only powers the board and talks to PJRC's bootloader.
 - PJRC's Teensy Loader (part of Teensyduino) or `teensy_loader_cli`.
 - Optional: a microSD card formatted FAT32 (SDHC; FAT12/16 are not
@@ -41,13 +41,13 @@ powered over USB. Then, for example: `picocom -b 115200 /dev/ttyUSB0`.
 
 ```sh
 make BOARD=teensy41 ADDER=../adder
-teensy_loader_cli --mcu=TEENSY41 -w -v build/teensy41/hackos.hex
+teensy_loader_cli --mcu=TEENSY41 -w -v build/teensy41/hmicro.hex
 ```
 
 then press the **program button** on the Teensy (PJRC: "Pressing the button
 puts Teensy into programming mode. It is not a 'reset button'"). `-w` waits
 for the bootloader to appear. `-s` (soft reboot) does not work: it needs USB
-code in the running firmware, which HackOS does not have. The Teensy Loader
+code in the running firmware, which Hamnix Micro does not have. The Teensy Loader
 GUI works the same way: open the `.hex`, press the button. After
 programming, the loader restarts the board. The Teensy 4.1 has no reset
 signal; to restart, power-cycle it.
@@ -58,7 +58,7 @@ flash for EEPROM emulation and the restore program).
 
 **Recovery:** holding the program button for 13 to 17 seconds makes the
 Teensy erase its flash and restore PJRC's LED-blink program (PJRC's Teensy
-4.1 page). Nothing HackOS does can prevent that; a bad image cannot brick
+4.1 page). Nothing Hamnix Micro does can prevent that; a bad image cannot brick
 the board.
 
 ## 4. What should happen at the first power-up
@@ -70,7 +70,7 @@ In this order. Each step tells you how far the boot got:
    before anything else. **If it never lights**, the boot ROM did not start
    the image: the boot header, the flash contents, or the image's entry.
 2. **The banner on the console:**
-   `HackOS 0.3 (milestone 3) -- ARM Cortex-M7, Teensy 4.1 (NXP i.MX RT1062)`.
+   `Hamnix Micro 0.3 (milestone 3) -- ARM Cortex-M7, Teensy 4.1 (NXP i.MX RT1062)`.
    **If the LED is on but nothing arrives**, the code runs but the console does
    not: wiring, baud rate, the LPUART6 clock root or the pin mux. The kernel
    carries on regardless (a character that cannot be sent is dropped after
@@ -99,7 +99,7 @@ In this order. Each step tells you how far the boot got:
 
 **A fatal error** prints the fault report on the console and then, instead of
 resetting, the LED repeats N short flashes and a pause, N being the exit
-code (3 for a fault before the scheduler, the code of `hackos_exit`
+code (3 for a fault before the scheduler, the code of `hmicro_exit`
 otherwise). `halt` resets the board (exit status 0).
 
 ## 5. Bring-up checklist (UNTESTED items, in the order to check them)

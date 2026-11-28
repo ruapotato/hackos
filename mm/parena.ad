@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the program arena: one block per process, each aligned to the
+# Hamnix Micro -- the program arena: one block per process, each aligned to the
 # power-of-two MPU region that covers it (kernel/proc.ad, kernel/mpu.ad).
 #
 # The bookkeeping is a table in kernel memory, not headers in the arena.

@@ -3,7 +3,7 @@
 # Copyright (C) 2026 David Hamner
 # uart_session.py HOST:PORT SCRIPT OUT
 #
-# Types a shell session at HackOS's console through a TCP socket (Renode's
+# Types a shell session at Hamnix Micro's console through a TCP socket (Renode's
 # server socket terminal on the emulated UARTE0) and records everything the
 # console prints, as tests/imxrt/t41mem.sh does with QEMU's stdio.
 # SCRIPT lines:

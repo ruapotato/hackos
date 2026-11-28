@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- SD memory card protocol (SD Physical Layer Simplified
+# Hamnix Micro -- SD memory card protocol (SD Physical Layer Simplified
 # Specification 3.01: card identification, data transfer in SD mode) over the
 # uSDHC host controller (soc/imxrt/usdhc.ad).  One card, one host.
 #

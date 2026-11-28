@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- Nordic nRF52840: addresses, interrupts, clocks, chip identity.
+# Hamnix Micro -- Nordic nRF52840: addresses, interrupts, clocks, chip identity.
 # UNTESTED ON HARDWARE.
 #
 # Every upper-case constant here and in soc/nrf52/ carries either

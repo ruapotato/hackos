@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS board support: PJRC Teensy 4.1 (NXP i.MX RT1062, 600 MHz Cortex-M7,
+# Hamnix Micro board support: PJRC Teensy 4.1 (NXP i.MX RT1062, 600 MHz Cortex-M7,
 # 8 MiB QSPI flash W25Q64JV, 1 MiB on-chip RAM, microSD socket on uSDHC1).
 #
 # UNTESTED ON HARDWARE.  docs/boards/teensy41.md has the wiring, what the
@@ -69,7 +69,7 @@ def board_cpu_hz() -> uint32:
     return 600000000
 
 
-# hackos_start, after .data and .bss: the tables in .xbss are not cleared
+# hmicro_start, after .data and .bss: the tables in .xbss are not cleared
 # there (QEMU's RAM starts as zeros; DTCM does not), so here; then watchdogs,
 # SysTick, NVIC, caches (soc.ad), and the clock gates of what the console
 # and the LED use.
@@ -335,7 +335,7 @@ def board_late_init():
     thread_create("led", cast[uint64](&_led_main), 0, 6, 2048, 0)
 
 
-# hackos_exit(code): code 0 resets (the `halt` program ends a session that
+# hmicro_exit(code): code 0 resets (the `halt` program ends a session that
 # way, and the board comes back up).  Any other code is a fatal error: the
 # report is on the console, and the LED repeats `code` short flashes
 # (at most 9) and a pause, forever, without resetting.

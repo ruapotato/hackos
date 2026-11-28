@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- checking addresses that arrive in a system call.
+# Hamnix Micro -- checking addresses that arrive in a system call.
 #
 # A pointer from an unprivileged caller is checked against what the MPU lets
 # that caller touch before the kernel uses it:

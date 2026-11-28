@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# The Feather nRF52840 image, unchanged (build/feather-nrf52840/hackos.elf),
+# The Feather nRF52840 image, unchanged (build/feather-nrf52840/hmicro.elf),
 # in Renode's nRF52840 machine (tests/nrf52/feather_nrf52840.repl: Renode's
 # own models of the Cortex-M4F with its NVIC and MPU, UARTE0, RTC1, CLOCK,
 # GPIO, 1 MB flash and 256 KB RAM), started the way Adafruit's bootloader
@@ -14,7 +14,7 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 RENODE="${RENODE:-/var/tmp/hackerslide-agent/tools/dl-renode-1.17.1/renode_1.17.1-portable/renode}"
-E=build/feather-nrf52840/hackos.elf
+E=build/feather-nrf52840/hmicro.elf
 B=build/nrf52/renode; mkdir -p $B
 fails=0
 ok()  { echo "[renode] ok: $1"; }
@@ -47,7 +47,7 @@ S=$B/console.txt
 sed 's/^/    /' $S
 [ "$drc" = 0 ] && ok "every command was answered" || bad "$drc waits failed (driver.log)"
 NPROG=$(ls build/feather-nrf52840/user | grep -cv '\.')
-expect "boot banner names the board and the M4F" $S '^HackOS 0\.[0-9]+ \(milestone [0-9]+\) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express'
+expect "boot banner names the board and the M4F" $S '^Hamnix Micro 0\.[0-9]+ \(milestone [0-9]+\) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express'
 expect "the clocks report" $S '^clocks: HFCLK from the 32 MHz crystal, LFCLK from the RC oscillator$'
 expect "/bin runs in place from its flash window" $S '^/bin in place at 0x00060000\.\.'
 expect "hamsh runs as a process (its banner)" $S "^hamsh . Hamnix shell"
@@ -114,7 +114,7 @@ expect "suspend 2 -n (UARTE receiver off, crystal released), ended by RTC1 after
 expect "a pasted block of 40 command lines (1.4 KB in one write): every line ran, in order" $S '^40 120 600$'
 expect "... with the sender held off while the shell worked, and nothing dropped" $S '^console: [0-9]+ bytes in, input ring peak [0-9]+, sender held off [1-9][0-9]* times, dropped 0, UART overruns 0, other UART errors 0, DMA guard intact$'
 grep '^console:' $S | sed 's/^/[renode]   /'
-expect "'halt 0' ends the run with status 0" $S '^\[hackos\] exit status 0$'
+expect "'halt 0' ends the run with status 0" $S '^\[hmicro\] exit status 0$'
 expect "memory report" $S '^memory: kernel heap peak [0-9]+ of [0-9]+, program arena peak [0-9]+$'
 grep '^memory:' $S | sed 's/^/[renode]   /'
 grep -c 'fault\|FAULT' $S >/dev/null

@@ -1,7 +1,7 @@
 LLVM compiler-rt builtins: software double precision -- third-party, unmodified.
 
 Upstream:   https://github.com/llvm/llvm-project, compiler-rt/lib/builtins/
-Tag:        llvmorg-19.1.7 (the clang version HackOS is built with)
+Tag:        llvmorg-19.1.7 (the clang version Hamnix Micro is built with)
 Fetched:    2026-11-27, single files from raw.githubusercontent.com
 Licence:    Apache-2.0 WITH LLVM-exception (LICENSE, the project's
             LICENSE.TXT; every file carries the SPDX line).  Apache-2.0 code
@@ -17,7 +17,7 @@ These files provide them.  Built only when a board sets SOFT_DOUBLE=1
 (BOARD=feather-nrf52840), with -DCOMPILER_RT_ARMHF_TARGET (hard-float ABI:
 the __aeabi_* entry points take doubles in core registers, the __*df3
 functions in d-registers, as compiler-rt's own armhf build does).  The
-64-bit integer <-> double helpers stay HackOS's own (arch/armv7m/aeabi.S,
+64-bit integer <-> double helpers stay Hamnix Micro's own (arch/armv7m/aeabi.S,
 kernel/rt.ad).  Not every file below is compiled; the headers and .inc
 files are what the compiled ones include.
 

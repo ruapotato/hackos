@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the built-in kernel monitor: a small command loop on the console.
+# Hamnix Micro -- the built-in kernel monitor: a small command loop on the console.
 # It is a privileged kernel thread and calls kernel services directly.  It is
 # not a shell (Hamnix's hamsh comes with program loading); it exists to look
 # at the kernel and to exercise it by hand.
@@ -12,7 +12,7 @@ from mm.heap import Heap, heap_total, heap_free_bytes, heap_free_blocks, heap_la
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_chdir, vfs_getcwd, vfs_open_stdio, vfs_open_count, OREAD, OWRITE, OTRUNC, OCREATE, OAPPEND
 from kernel.syscall import sys_count
 from kernel.trap import trap_count
-from kernel.exit import hackos_exit
+from kernel.exit import hmicro_exit
 from user.faults import fault_stack_overflow, fault_read, fault_write, fault_jump, fault_udf
 from drivers.tty.console import con_rx_bytes
 
@@ -254,7 +254,7 @@ def mon_exec() -> uint32:
                 code = code * 10 + cast[uint32](d[k]) - 48
                 k = k + 1
         printk1("halt %d\n", cast[uint64](code))
-        hackos_exit(code)
+        hmicro_exit(code)
     else:
         printk1("unknown or incomplete command: %s (try help)\n", cast[uint64](c))
     return 0
@@ -262,9 +262,9 @@ def mon_exec() -> uint32:
 
 def monitor_main(arg: uint64) -> int64:
     vfs_open_stdio()
-    printk0("HackOS monitor.  Type help.\n")
+    printk0("Hamnix Micro monitor.  Type help.\n")
     while 1 == 1:
-        printk0("hackos> ")
+        printk0("hmicro> ")
         n: int64 = vfs_read(0, &mon_line[0], 255, 0)
         if n <= 0:
             printk0("\n[end of input]\n")

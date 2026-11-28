@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- nRF52 UARTE (UART with EasyDMA, NRF_UARTE_Type).
+# Hamnix Micro -- nRF52 UARTE (UART with EasyDMA, NRF_UARTE_Type).
 # UNTESTED ON HARDWARE.
 #
 # EasyDMA moves bytes between the UARTE and RAM; it cannot read flash, so

@@ -1,4 +1,4 @@
-HackOS teensy41 size patch to user/hamnix/vi.ad (build/teensy41/root only).
+Hamnix Micro teensy41 size patch to user/hamnix/vi.ad (build/teensy41/root only).
 
 Reason: the editor's line store is 4096 lines of 1024 bytes, 4 MiB of static
 data, sized for a PC.  The Teensy has 1 MiB of RAM for everything.

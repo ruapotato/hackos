@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- Cortex-M7 special-register access, callable from Adder.
+/* Hamnix Micro -- Cortex-M7 special-register access, callable from Adder.
  *
  * Adder's inline assembly has no operands, so a value can only leave an
  * `asm_volatile` body through a global.  That is not re-entrant: an interrupt
@@ -12,7 +12,7 @@
  * from any context, including nested interrupts.
  */
         .syntax unified
-#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+#ifdef HMICRO_CPU_M4                    /* Cortex-M4F: single-precision FPU */
         .cpu cortex-m4
         .fpu fpv4-sp-d16
 #else

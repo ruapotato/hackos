@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS test helper: hold a known pattern in every FPU register while the
+/* Hamnix Micro test helper: hold a known pattern in every FPU register while the
  * thread is being preempted, and count how often a register did not hold.
  *
  * fp_hold(seed: uint64, loops: uint64) -> uint64   (Adder convention)
@@ -11,7 +11,7 @@
  * d8-d15 are callee-saved: the PendSV handler must save them.  Touches no
  * memory except its own stack, so it also runs unprivileged.               */
         .syntax unified
-#ifdef HACKOS_CPU_M4                    /* d0-d15 exist as register pairs */
+#ifdef HMICRO_CPU_M4                    /* d0-d15 exist as register pairs */
         .cpu cortex-m4
         .fpu fpv4-sp-d16
 #else

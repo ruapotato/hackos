@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- formatted kernel output under Hamnix's names (printk0..printk4).
+# Hamnix Micro -- formatted kernel output under Hamnix's names (printk0..printk4).
 #
 # Same directives as Hamnix's kernel/printk/printk.ad: %d %u (decimal), %x
 # (hex, no prefix), %p (0x + 8 hex digits here: addresses are 32 bits), %s, %c,
-# %%.  HackOS adds a zero-padded width for %x and %d ("%08x", "%3d").  A whole
+# %%.  Hamnix Micro adds a zero-padded width for %x and %d ("%08x", "%3d").  A whole
 # message is formatted into a buffer and written in one piece, so lines from
 # different threads do not interleave.
 
@@ -12,7 +12,7 @@ from drivers.tty.console import console_write
 
 PRINTK_BUF: uint32 = 256
 
-# Hamnix code sets a console log level around noisy sections.  HackOS has one
+# Hamnix code sets a console log level around noisy sections.  Hamnix Micro has one
 # level: everything is printed.  The call is accepted and remembered.
 PRINTK_LEVEL_EMERG: int32 = 0
 printk_level: int32 = 7

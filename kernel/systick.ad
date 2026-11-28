@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- SysTick timer (ARMv7-M system timer, 24-bit down-counter).
+# Hamnix Micro -- SysTick timer (ARMv7-M system timer, 24-bit down-counter).
 #   0xE000E010 SYST_CSR  bit0 ENABLE, bit1 TICKINT, bit2 CLKSOURCE (1 = CPU clock)
 #   0xE000E014 SYST_RVR  reload value (period - 1)
 #   0xE000E018 SYST_CVR  current value (any write clears it)

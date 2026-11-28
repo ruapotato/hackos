@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- default fault / unexpected-exception report.
+# Hamnix Micro -- default fault / unexpected-exception report.
 #
-# Entered from hackos_fault_entry (arch/armv7m/startup.S) on a private stack
+# Entered from hmicro_fault_entry (arch/armv7m/startup.S) on a private stack
 # with interrupts masked.  Prints the exception, the fault status registers
 # and the stacked frame over the console, then halts (test builds: ends the
 # emulator run with status 3).
 
 from kernel.cpu import mmio_read32
 from kernel.print import kputs, kput_hex32, kput_u64, kputc
-from kernel.exit import hackos_exit
+from kernel.exit import hmicro_exit
 
 
 def fault_name(kind: uint64) -> Ptr[uint8]:
@@ -51,14 +51,14 @@ def fault_bit(v: uint32, bit: uint32, name: Ptr[uint8]):
 
 # kind: exception number.  frame: address of the stacked
 # {r0,r1,r2,r3,r12,lr,pc,xpsr}.  exc_return: the EXC_RETURN value.
-def hackos_fault(kind: uint64, frame: uint64, exc_return: uint64):
+def hmicro_fault(kind: uint64, frame: uint64, exc_return: uint64):
     cfsr: uint32 = mmio_read32(0xE000ED28)
     hfsr: uint32 = mmio_read32(0xE000ED2C)
     mmfar: uint32 = mmio_read32(0xE000ED34)
     bfar: uint32 = mmio_read32(0xE000ED38)
     icsr: uint32 = mmio_read32(0xE000ED04)
     f: Ptr[uint32] = cast[Ptr[uint32]](frame)
-    kputs("\n*** HackOS FAULT: ")
+    kputs("\n*** Hamnix Micro FAULT: ")
     kputs(fault_name(kind))
     kputs(" (exception ")
     kput_u64(cast[uint64](icsr & 0x1FF))
@@ -97,4 +97,4 @@ def hackos_fault(kind: uint64, frame: uint64, exc_return: uint64):
     fault_reg("pc   ", f[6])
     fault_reg("xpsr ", f[7])
     kputs("*** halted ***\n")
-    hackos_exit(3)
+    hmicro_exit(3)

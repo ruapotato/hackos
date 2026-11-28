@@ -21,7 +21,7 @@ a73ce005b82b47142b50e2076376c1c6dd57315c1d518aafb5c1322f7f02ad78  sensirion_comm
 76a6211089ac94f9b5f54f401f8e329fae2a25c5d8e5eb079c4abad75cfc4dbd  sensirion_config.h
 a086c8c9d6e59baf2584d827476084fa8048d79efd997807b2471aa95f0df65d  sensirion_i2c_hal.h
 
-Not taken: sensirion_i2c_hal.c (the empty porting template -- HackOS
+Not taken: sensirion_i2c_hal.c (the empty porting template -- Hamnix Micro
 implements that interface in Adder, drivers/i2c/sensirion_hal.ad), the example
 program, the sample implementations for other platforms, and the test files.
 

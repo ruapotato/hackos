@@ -20,7 +20,7 @@ tr -d '\r' < $B/drvtest.out > $B/drvtest.txt
 cat $B/drvtest.txt
 want="$(grep -cE '^ +check\(' tests/imxrt/drvtest_main.ad)"
 npass="$(grep -c '^PASS ' $B/drvtest.txt)"; nfail="$(grep -c '^FAIL ' $B/drvtest.txt)"
-st="$(sed -n 's/^\[hackos\] exit status \([0-9]*\)$/\1/p' $B/drvtest.txt | tail -1)"
+st="$(sed -n 's/^\[hmicro\] exit status \([0-9]*\)$/\1/p' $B/drvtest.txt | tail -1)"
 rc=0
 [ "$nfail" = 0 ] && echo "ok: no FAIL lines" || { echo "FAIL: $nfail checks failed"; rc=1; }
 [ "$npass" = "$want" ] && echo "ok: $npass PASS lines, all $want checks ran" || { echo "FAIL: $npass PASS lines, $want checks in the source"; rc=1; }

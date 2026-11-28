@@ -1,4 +1,4 @@
-HackOS feather-nrf52840 size patch to user/hamnix/sort.ad (build/feather-nrf52840/root only).
+Hamnix Micro feather-nrf52840 size patch to user/hamnix/sort.ad (build/feather-nrf52840/root only).
 
 Reason: 256 KiB of RAM for everything; beside the shell a program gets at
 most 32 KiB.  sort keeps its input and a 256-byte slot per line in static

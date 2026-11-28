@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- nRF52 GPIO (NRF_GPIO_Type: P0, and P1 on the nRF52840).
+# Hamnix Micro -- nRF52 GPIO (NRF_GPIO_Type: P0, and P1 on the nRF52840).
 # UNTESTED ON HARDWARE.
 #
 # A pin is named by its number pin = 32 * port + n (P1.15 = 47), as Nordic's

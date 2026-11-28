@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- vector table for the Adafruit Feather nRF52840 Express
+/* Hamnix Micro -- vector table for the Adafruit Feather nRF52840 Express
  * (Nordic nRF52840); included by arch/armv7m/startup.S.
  * UNTESTED ON HARDWARE.
  *
@@ -10,7 +10,7 @@
  * and word 1 (reset) from there (bootloader_util.c); it also accepts the
  * image as valid only if word 0 is in RAM and word 1 a Thumb address inside
  * the application area (bootloader.c, bootloader_app_is_valid).  The MBR's
- * and SoftDevice's interrupt forwarding is not used: hackos_start sets VTOR
+ * and SoftDevice's interrupt forwarding is not used: hmicro_start sets VTOR
  * to this table, so exceptions come here directly.
  *
  * 16 system entries + 48 interrupts (nrf52840.h: the last IRQn is
@@ -18,9 +18,9 @@
  * size).                                                                */
         .section .vectors, "a", %progbits
         .balign 256
-        .global hackos_vectors
-        .type hackos_vectors, %object
-hackos_vectors:
+        .global hmicro_vectors
+        .type hmicro_vectors, %object
+hmicro_vectors:
         .word   __stack_top             /*  0 initial MSP                 */
         .word   Reset_Handler           /*  1 reset                       */
         .word   nmi_handler             /*  2 NMI                         */
@@ -44,4 +44,4 @@ hackos_vectors:
         .rept   30                      /* IRQ 18..47                     */
         .word   irq_default_handler
         .endr
-        .size hackos_vectors, . - hackos_vectors
+        .size hmicro_vectors, . - hmicro_vectors

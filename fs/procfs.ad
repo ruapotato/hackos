@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- /proc: the kernel's state as text files.
+# Hamnix Micro -- /proc: the kernel's state as text files.
 #
 # Hamnix's ps, free, df, date and its shell's `kill` are written against
-# files under /proc.  HackOS serves the ones they use, with its own content
+# files under /proc.  Hamnix Micro serves the ones they use, with its own content
 # (this file is new; Hamnix's procfs is a 9P server over its task table):
 #
 #   /proc/version       one line: system, board
@@ -22,7 +22,7 @@
 #   /proc/screen        the text on the display's character cells, or "no display"
 #   /proc/<pid>/note    write-only: "kill", "interrupt", "hangup" or "term"
 #                       ends process <pid> with exit code 137, 130, 129 or 143
-#                       (Plan 9's notes as far as HackOS has them: nothing
+#                       (Plan 9's notes as far as Hamnix Micro has them: nothing
 #                       can be caught)
 #
 # A read is a snapshot: the text is rendered into a buffer when the file is
@@ -314,7 +314,7 @@ def proc_render(which: uint32, buf: Ptr[uint8], cap: uint64) -> uint64:
     pb.cap = cap
     b: Ptr[PBuf] = &pb
     if which == PROC_VERSION:
-        pb_s(b, "HackOS 0.4 (")
+        pb_s(b, "Hamnix Micro 0.4 (")
         pb_s(b, board_name())
         pb_s(b, ")\n")
     elif which == PROC_UPTIME:
@@ -372,7 +372,7 @@ def _has(msg: Ptr[uint8], n: uint64, word: Ptr[uint8]) -> uint32:
 
 
 # A note written to /proc/<pid>/note.  0, -3 (no such process), -22 (a note
-# HackOS does not know).
+# Hamnix Micro does not know).
 def proc_note(pid: uint32, msg: Ptr[uint8], n: uint64) -> int32:
     code: uint32 = 0
     if _has(msg, n, "kill") != 0:

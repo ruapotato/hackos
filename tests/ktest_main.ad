@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS milestone 2 kernel test image for QEMU `mps2-an500`.
+# Hamnix Micro milestone 2 kernel test image for QEMU `mps2-an500`.
 #
 # A privileged "runner" thread executes the groups below in order.  Every
 # check prints "PASS <name>" or "FAIL <name>"; each check() call site runs
@@ -12,7 +12,7 @@
 
 from kernel.init import kernel_init
 from kernel.cpu import cpu_control, cpu_ipsr, cpu_irq_save, cpu_irq_restore, mmio_read32, mmio_write32
-from kernel.exit import hackos_exit
+from kernel.exit import hmicro_exit
 from kernel.print import kputs
 from kernel.printk.printk import printk0, printk1, printk2, printk3, printk4
 from kernel.mpu import mpu_regions
@@ -778,7 +778,7 @@ def fs_pattern(i: uint64) -> uint8:
 
 
 def test_fs():
-    printk0("-- 8. file system (Hamnix tmpfs through the HackOS file layer)\n")
+    printk0("-- 8. file system (Hamnix tmpfs through the Hamnix Micro file layer)\n")
     open0: uint32 = vfs_open_count()
     # a file larger than three 64 KiB tmpfs chunks, written in odd-sized pieces
     fd: int32 = vfs_open("/tmp/big.bin", OWRITE | OTRUNC | OCREATE)
@@ -1556,7 +1556,7 @@ def test_display():
     # ---- the text screen
     fb_clear(&tfb, 0)
     tcr: int32 = textcon_init(&tfb, 2)
-    tc_puts("HackOS display test\r\n")
+    tc_puts("Hamnix Micro display test\r\n")
     tc_puts("0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n")
     tc_puts("abcdefghijklmnopqrstuvwxyz !\"#$%&'()*+,-./:;<=>?@[]^_`{|}~\r\n")
     tc_puts("\x1b[6;11Hplaced at row 6, column 11")
@@ -1564,7 +1564,7 @@ def test_display():
     tc_puts("\x1b[10;1Hto be erased\x1b[10;7H\x1b[K")
     tc_puts("\x1b[12;1Habc\x08\x08X\x1b[2C!\x1b[1A^\x1b[2Bv")
     tc_puts("\x1b[14;1Htab\tstop")
-    check(cast[uint32](tcr == 0 and tc_cols == 100 and tc_rows == 30 and screen_row_is(0, "HackOS display test") != 0 and screen_row_is(5, "          placed at row 6, column 11") != 0 and screen_row_is(7, "plain inverse plain") != 0 and screen_row_is(9, "to be") != 0), "textcon: 100 x 30 cells; text, cursor addressing, inverse, erase to end of line")
+    check(cast[uint32](tcr == 0 and tc_cols == 100 and tc_rows == 30 and screen_row_is(0, "Hamnix Micro display test") != 0 and screen_row_is(5, "          placed at row 6, column 11") != 0 and screen_row_is(7, "plain inverse plain") != 0 and screen_row_is(9, "to be") != 0), "textcon: 100 x 30 cells; text, cursor addressing, inverse, erase to end of line")
     check(cast[uint32](screen_row_is(11, "aXc !") != 0 and screen_row_is(10, "     ^") != 0 and screen_row_is(12, "      v") != 0 and screen_row_is(13, "tab     stop") != 0), "textcon: backspace, cursor right, up and down, tab stops")
     textcon_show_cursor()
     t1: int32 = display_flush(tp, &tfb)
@@ -1595,7 +1595,7 @@ def test_display():
         ln = ln + 1
     check(cast[uint32](screen_row_is(0, "line 11") != 0 and screen_row_is(28, "line 39") != 0 and screen_row_is(29, "") != 0), "textcon: 40 lines on 30 rows scroll; the last 29 and an empty line remain")
     # the frame the host will read back
-    tc_puts("\x1b[2J\x1b[1;1HHackOS display test\r\n")
+    tc_puts("\x1b[2J\x1b[1;1HHamnix Micro display test\r\n")
     tc_puts("0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n")
     tc_puts("abcdefghijklmnopqrstuvwxyz !\"#$%&'()*+,-./:;<=>?@[]^_`{|}~\r\n")
     tc_puts("\x1b[6;11Hplaced at row 6, column 11")
@@ -1748,12 +1748,12 @@ def runner(arg: uint64) -> int64:
         printk0("RESULT: PASS (all checks passed)\n")
     else:
         printk1("RESULT: FAIL (%d checks failed)\n", cast[uint64](failures))
-    hackos_exit(failures)
+    hmicro_exit(failures)
     return 0
 
 
 def main() -> int32:
-    kputs("\nHackOS 0.2 kernel test (milestone 2) -- QEMU mps2-an500\n")
+    kputs("\nHamnix Micro 0.2 kernel test (milestone 2) -- QEMU mps2-an500\n")
     kernel_init()
     thread_create("runner", cast[uint64](&runner), 0, 2, 16384, 0)
     sched_start()

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the process test program.  The kernel test image runs it from
+# Hamnix Micro -- the process test program.  The kernel test image runs it from
 # /bin with a sub-command in argv[1]; the exit code carries the result (a
 # bit per sub-check where there are several).
 
@@ -31,9 +31,9 @@ extern def sys_fdslot_kind(pid: int32, fdnum: int32) -> int32
 extern def sys_fdslot_arg(pid: int32, fdnum: int32) -> int32
 extern def sys_openchan(path: Ptr[uint8], mode: int32) -> int32
 extern def sys_dup2(oldfd: int32, newfd: int32) -> int32
-extern def hackos_test_dirty_fp()
-extern def hackos_test_exec_dirty(path: Ptr[uint8], argv: Ptr[uint64]) -> int64
-extern def hackos_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64
+extern def hmicro_test_dirty_fp()
+extern def hmicro_test_exec_dirty(path: Ptr[uint8], argv: Ptr[uint64]) -> int64
+extern def hmicro_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64
 
 counter: uint64 = 1000              # initialised data
 zeroed: Array[64, uint32]           # bss
@@ -541,16 +541,16 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         # exec a program with every register this one can reach left dirty
         child_argv[0] = cast[uint64]("/bin/regprobe")
         child_argv[1] = 0
-        hackos_test_exec_dirty("/bin/regprobe", &child_argv[0])
+        hmicro_test_exec_dirty("/bin/regprobe", &child_argv[0])
         return 99
     if seq(cmd, "regspawn") != 0:
         # start a program right after using the FPU: the registers still
         # hold this process's values when the new one first runs
         child_argv[0] = cast[uint64]("/bin/regprobe")
         child_argv[1] = 0
-        hackos_test_dirty_fp()
+        hmicro_test_dirty_fp()
         rp: int32 = sys_spawn("/bin/regprobe", &child_argv[0])
-        hackos_test_dirty_fp()
+        hmicro_test_dirty_fp()
         if rp <= 0:
             return 98
         return cast[int32](sys_waitpid(rp)) + 16
@@ -558,7 +558,7 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         # keep the FP registers dirty across many context switches
         fs: uint64 = 0
         while fs < 300:
-            hackos_test_dirty_fp()
+            hmicro_test_dirty_fp()
             sys_yield()
             fs = fs + 1
         return 0
@@ -670,7 +670,7 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             return 5
         return 1
     if seq(cmd, "thread") != 0:
-        if hackos_syscall(512, 0, 0, 0, 4096, 0, 0) == -38:
+        if hmicro_syscall(512, 0, 0, 0, 4096, 0, 0) == -38:
             return 38
         return 1
     if seq(cmd, "spin") != 0:

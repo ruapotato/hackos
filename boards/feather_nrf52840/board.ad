@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS board support: Adafruit Feather nRF52840 Express (product 4062;
+# Hamnix Micro board support: Adafruit Feather nRF52840 Express (product 4062;
 # Nordic nRF52840, 64 MHz Cortex-M4F, 1 MB flash, 256 KB RAM, 2 MB QSPI
 # flash GD25Q16C, Adafruit's UF2 bootloader with SoftDevice S140 6.1.1).
 #
@@ -65,7 +65,7 @@ XIP_WINDOW: uint32 = 0x00060000      # unchecked: = __romfs_window in link.ld (a
 #   RTS        off by default (CONSOLE_RTS_PIN = 0xFF).  Set it to a free
 #              pin (for example 6 = P0.06, the Feather's D11) and wire that
 #              pin to the adapter's CTS: the UARTE then stops the sender in
-#              hardware while HackOS is not taking bytes, and nothing can be
+#              hardware while Hamnix Micro is not taking bytes, and nothing can be
 #              lost.  UNTESTED ON HARDWARE.
 CONSOLE_XONXOFF: uint32 = 1          # unchecked: policy
 CONSOLE_RTS_PIN: uint32 = 0xFF       # unchecked: policy -- no RTS line by default
@@ -117,7 +117,7 @@ def _led_pin() -> uint32:
     return PIN_LED_EXPRESS
 
 
-# hackos_start, after .data and .bss: .xbss (the tmpfs table) cleared,
+# hmicro_start, after .data and .bss: .xbss (the tmpfs table) cleared,
 # interrupts and SysTick off, the flash cache on; the red LED on: the first
 # sign of life, before the clocks and the console.
 def board_init_early():
@@ -456,8 +456,8 @@ def _mem_report():
         i = i + 1
 
 
-# hackos_exit(code): code 0 resets (`halt`; the bootloader then starts
-# HackOS again).  Any other code: the report is on the console and the LED
+# hmicro_exit(code): code 0 resets (`halt`; the bootloader then starts
+# Hamnix Micro again).  Any other code: the report is on the console and the LED
 # repeats `code` short flashes (at most 9) and a pause, forever.
 def board_halt(code: uint32):
     _mem_report()

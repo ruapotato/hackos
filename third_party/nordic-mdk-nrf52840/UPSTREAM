@@ -13,7 +13,7 @@ Licence:    BSD-3-Clause.  Each file carries "Copyright (c) 2010 - 2026, Nordic
             an AGPL-3.0-or-later work if its notices are kept.  The usual
             reading, not legal advice.
 
-How HackOS uses them: as DATA.  Nothing here is compiled or linked.  The
+How Hamnix Micro uses them: as DATA.  Nothing here is compiled or linked.  The
 drivers are Adder (soc/nrf52/, soc/nrf52840/, boards/feather_nrf52840/);
 tests/nrf52/check_regs.py reads these headers and checks every register
 address, offset (computed from the struct layouts, which it checks against

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the platform layer Sensirion's embedded I2C drivers ask for
+# Hamnix Micro -- the platform layer Sensirion's embedded I2C drivers ask for
 # (third_party/sensirion-sht4x/sensirion_i2c_hal.h), written in Adder.
 #
 # These are `extern "C"` definitions: the vendor's C code calls them with the

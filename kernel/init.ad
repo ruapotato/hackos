@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- kernel bring-up, shared by the interactive image and the tests.
+# Hamnix Micro -- kernel bring-up, shared by the interactive image and the tests.
 
-from kernel.start import hackos_start
-from kernel.fault import hackos_fault
-from kernel.trap import hackos_thread_fault, trap_init
+from kernel.start import hmicro_start
+from kernel.fault import hmicro_fault
+from kernel.trap import hmicro_thread_fault, trap_init
 from kernel.syscall import syscall_dispatch, syscall_init
 from kernel.sched.core import sched_init, sched_start, sched_pick, systick_handler
 from kernel.mpu import mpu_init

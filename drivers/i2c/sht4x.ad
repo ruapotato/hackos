@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- Sensirion SHT4x humidity and temperature sensor: Adder
+# Hamnix Micro -- Sensirion SHT4x humidity and temperature sensor: Adder
 # declarations for the vendor's C driver (third_party/sensirion-sht4x,
 # sht4x_i2c.h).  Calling one of these is a direct call into C.
 #

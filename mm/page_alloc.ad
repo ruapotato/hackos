@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- page-granular allocations under the names Hamnix code expects.
+# Hamnix Micro -- page-granular allocations under the names Hamnix code expects.
 #
 # Hamnix's mm/page_alloc.ad is a buddy allocator over physical pages; its
-# callers in the files HackOS carries (fs/tmpfs.ad) need "2^order pages" and
+# callers in the files Hamnix Micro carries (fs/tmpfs.ad) need "2^order pages" and
 # the matching free.  The pages are NOT page aligned here: Hamnix aligns
 # tmpfs data chunks so that a shared mmap can map them into a process
-# (tmpfs_page_phys), and HackOS has no MMU and no such mmap (nothing calls
+# (tmpfs_page_phys), and Hamnix Micro has no MMU and no such mmap (nothing calls
 # tmpfs_page_phys).  An aligned 4 KiB allocation could leave up to 4 KiB of
 # unusable gap in front of every chunk; measured on the Teensy 4.1's 172 KiB
 # kernel heap, a 40 KB file left the largest free block at 4064 bytes and no

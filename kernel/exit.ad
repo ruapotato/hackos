@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- what happens when main() returns, the kernel gives up, or someone
+# Hamnix Micro -- what happens when main() returns, the kernel gives up, or someone
 # asks for a halt: report a status on the console and reset the system.
 #
 # The status line is the whole protocol between an image and the test harness:
 #
-#     [hackos] exit status N
+#     [hmicro] exit status N
 #
 # followed by a system reset request (AIRCR.SYSRESETREQ), which is what a
 # real board does to restart.  The harness starts QEMU with `-no-reboot`, so
@@ -18,9 +18,9 @@ from kernel.print import kputs, kput_u64
 from board.board import board_halt
 
 
-def hackos_exit(code: uint32):
+def hmicro_exit(code: uint32):
     cpu_irq_disable()
-    kputs("\n[hackos] exit status ")
+    kputs("\n[hmicro] exit status ")
     kput_u64(cast[uint64](code))
     kputs("\n")
     board_halt(code)

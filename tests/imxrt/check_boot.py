@@ -130,7 +130,7 @@ def main(argv):
     syms = nm(elf)
     hdr = devheader.DeviceHeader(os.path.join(nxp, 'MIMXRT1062.h'))
     check(hdr.macros.get('FlexSPI_AMBA_BASE') == FLASH, 'FlexSPI_AMBA_BASE is 0x60000000 (MIMXRT1062.h)')
-    check(syms.get('hackos_fcb') == FLASH and img[:4] == struct.pack('<I', 0x42464346), 'the binary starts at 0x60000000 with the FCB')
+    check(syms.get('hmicro_fcb') == FLASH and img[:4] == struct.pack('<I', 0x42464346), 'the binary starts at 0x60000000 with the FCB')
 
     # ---- structure definitions
     cfg_text = open(os.path.join(nxp, 'evkmimxrt1060_flexspi_nor_config.h'), encoding='latin-1').read()
@@ -203,10 +203,10 @@ def main(argv):
     check(iv('entry') == (rh | 1), 'IVT entry = Reset_Handler 0x%08X with the Thumb bit' % rh)
     end = syms['__flash_end']
     check(FLASH + 0x2000 <= iv('entry') < end, 'IVT entry inside the image')
-    check(iv('self') == FLASH + IVT and syms.get('hackos_ivt') == FLASH + IVT, 'IVT self = 0x60001000')
+    check(iv('self') == FLASH + IVT and syms.get('hmicro_ivt') == FLASH + IVT, 'IVT self = 0x60001000')
     check(iv('dcd') == 0 and iv('csf') == 0 and iv('reserved1') == 0 and iv('reserved2') == 0, 'no DCD, no CSF, reserved words 0')
     bda = iv('boot_data')
-    check(bda == syms.get('hackos_boot_data') and FLASH <= bda < FLASH + 0x2000, 'IVT boot_data points at the boot data (0x%08X)' % bda)
+    check(bda == syms.get('hmicro_boot_data') and FLASH <= bda < FLASH + 0x2000, 'IVT boot_data points at the boot data (0x%08X)' % bda)
     bo = bda - FLASH
     def bf(name):
         return field(img, bo, bd, name)
@@ -217,7 +217,7 @@ def main(argv):
 
     # ---- vector table
     nvec = hdr.macros['NUMBER_OF_INT_VECTORS']
-    vt = syms['hackos_vectors']
+    vt = syms['hmicro_vectors']
     align = 1
     while align < nvec * 4:
         align *= 2

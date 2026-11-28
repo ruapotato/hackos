@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- suspend [SECONDS] [-n]: put the whole system to sleep.
+# Hamnix Micro -- suspend [SECONDS] [-n]: put the whole system to sleep.
 #   suspend         until a key is pressed (a byte arrives at the console)
 #   suspend 30      until a key is pressed, at most 30 seconds
 #   suspend 30 -n   for 30 seconds; the console does NOT wake it (on the

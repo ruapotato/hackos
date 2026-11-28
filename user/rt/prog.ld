@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- layout of a user program (position-independent executable).
+/* Hamnix Micro -- layout of a user program (position-independent executable).
  *
  * Linked at address 0 with `ld.lld -pie --omagic`; the kernel's loader
  * (kernel/proc.ad) copies the image to wherever its block of the program
@@ -15,12 +15,12 @@
  * user/rt/rt.ad's sys_mmap.  The link must define it (--defsym=__heap_size=N;
  * the Makefile passes 0 unless HEAP_<program> is set).
  */
-ENTRY(hackos_crt_start)
+ENTRY(hmicro_crt_start)
 
 SECTIONS
 {
     . = 0;
-    .text : { *(.text.hackos_crt_start) *(.text .text.*) }
+    .text : { *(.text.hmicro_crt_start) *(.text .text.*) }
     .rodata : { *(.rodata .rodata.*) }
     .dynsym : { *(.dynsym) }
     .dynstr : { *(.dynstr) }

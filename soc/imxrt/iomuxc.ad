@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- pin multiplexing (IOMUXC), i.MX RT1060 and RT1170 families.
+# Hamnix Micro -- pin multiplexing (IOMUXC), i.MX RT1060 and RT1170 families.
 # UNTESTED ON HARDWARE.
 #
 # NXP describes each pad function by five numbers (fsl_iomuxc.h:

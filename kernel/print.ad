@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- console output formatting (no allocation, no varargs).
+# Hamnix Micro -- console output formatting (no allocation, no varargs).
 
 from board.board import board_console_putc
 

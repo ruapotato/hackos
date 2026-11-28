@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- power management, the board-independent part.
+# Hamnix Micro -- power management, the board-independent part.
 #
 # Three levels, cheapest first:
 #

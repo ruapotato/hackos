@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the display driver model, shaped by e-paper.
+# Hamnix Micro -- the display driver model, shaped by e-paper.
 #
 # An e-paper panel is not a frame buffer that is simply written to:
 #   * A refresh takes a long time (a third of a second to seconds) and the

@@ -1,15 +1,15 @@
-Third-party source code linked into HackOS.  One directory per package, each
+Third-party source code linked into Hamnix Micro.  One directory per package, each
 with the upstream LICENSE and an UPSTREAM file (where it came from, the exact
 commit, the files taken and their hashes).  Nothing in here is edited; a local
 change would have to be a recorded patch.
 
-HackOS itself is AGPL-3.0-or-later.  Only code under licences that can be
+Hamnix Micro itself is AGPL-3.0-or-later.  Only code under licences that can be
 combined with it belongs here (BSD, MIT, Apache-2.0, ...).
 
 C code never calls Adder-convention functions and Adder never calls C except
 through `extern "C"` declarations; tests/check_c_link.sh enforces that at every
 `make test`.  C library functions for this code come from lib/cshim, under
-prefixed names (see lib/cshim/include/hackos_libc_rename.h for why).
+prefixed names (see lib/cshim/include/hmicro_libc_rename.h for why).
 
 nordic-mdk-nrf52840/ is read as data only (tests/nrf52/check_regs.py), as
 nxp-mcux-rt1062/ is.  llvm-compiler-rt-builtins/ is compiled for boards

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- LPI2C master (i.MX RT1060 and RT1170 families).
+# Hamnix Micro -- LPI2C master (i.MX RT1060 and RT1170 families).
 #
 # UNTESTED ON HARDWARE.  Registers and masks are checked against the device
 # header (tests/imxrt/check_regs.py); the command sequences are tested

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- memory protection unit (ARMv7-M PMSAv7; 16 regions on Cortex-M7).
+# Hamnix Micro -- memory protection unit (ARMv7-M PMSAv7; 16 regions on Cortex-M7).
 #
 # A region is a power-of-two block aligned to its own size; a higher-numbered
 # region overrides a lower one where they overlap.  Privileged code also gets

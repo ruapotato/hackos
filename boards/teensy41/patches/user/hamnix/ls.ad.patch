@@ -1,4 +1,4 @@
-HackOS teensy41 size patch to user/hamnix/ls.ad (build/teensy41/root only).
+Hamnix Micro teensy41 size patch to user/hamnix/ls.ad (build/teensy41/root only).
 
 Reason: the directory-listing buffer is 64 KiB of static data, which makes
 `ls` an 80 KiB process.  16 KiB (LISTBUF bounds every use; a longer listing

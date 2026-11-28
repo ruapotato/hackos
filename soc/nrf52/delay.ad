@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- busy-wait delays on an nRF52 (Cortex-M4F, 64 MHz).
+# Hamnix Micro -- busy-wait delays on an nRF52 (Cortex-M4F, 64 MHz).
 # UNTESTED ON HARDWARE.
 #
 # Counted with the DWT cycle counter at 64 cycles per microsecond.  The

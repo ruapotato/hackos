@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- linker script for QEMU `-M mps2-an386` (ARM MPS2, AN386, Cortex-M4).
+/* Hamnix Micro -- linker script for QEMU `-M mps2-an386` (ARM MPS2, AN386, Cortex-M4).
  *
  * Memory map, from `info mtree -f` on the machine (2026-11-27, QEMU 10.0.13):
  *       0x00000000-0x003fffff ram  mps.ssram1     (aliased again at 0x00400000)

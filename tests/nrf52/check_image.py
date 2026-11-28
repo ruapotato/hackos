@@ -34,7 +34,7 @@ def num(k):
 
 
 syms = {}
-for line in subprocess.run(['llvm-nm', f'{B}/hackos.elf'], capture_output=True, text=True).stdout.split('\n'):
+for line in subprocess.run(['llvm-nm', f'{B}/hmicro.elf'], capture_output=True, text=True).stdout.split('\n'):
     p = line.split()
     if len(p) == 3:
         syms[p[2]] = int(p[0], 16)
@@ -48,9 +48,9 @@ check(facts['BL_SD_DEFAULT_NRF52840'] == '6.1.1', "Adafruit's nRF52840 bootloade
 mk = open('boards/feather_nrf52840/board.mk').read()
 check(re.search(r'^NRF_APP_START \?= 0x0*26000$', mk, re.M) is not None and app == 0x26000,
       f"NRF_APP_START 0x26000 = S140 6.1.1's own size word (SD_SIZE_GET); 7.3.0 would be 0x{num('SD_S140_7_3_0_APP_START'):x}")
-check(syms['hackos_vectors'] == app and syms['__vectors_start'] == app, f"vector table at the application start 0x{app:x}")
+check(syms['hmicro_vectors'] == app and syms['__vectors_start'] == app, f"vector table at the application start 0x{app:x}")
 
-ph = subprocess.run(['llvm-readelf', '-l', f'{B}/hackos.elf'], capture_output=True, text=True).stdout
+ph = subprocess.run(['llvm-readelf', '-l', f'{B}/hmicro.elf'], capture_output=True, text=True).stdout
 loads = [l.split() for l in ph.split('\n') if l.strip().startswith('LOAD')]
 bad = [l for l in loads if int(l[4], 16) and not (app <= int(l[3], 16) < user_end)]
 check(loads and not bad, f"every ELF load segment with file contents has its load address inside 0x{app:x}..0x{user_end:x} "
@@ -59,7 +59,7 @@ check(loads and not bad, f"every ELF load segment with file contents has its loa
 # the image's bytes, from the HEX
 mem = {}
 base = 0
-for line in open(f'{B}/hackos.hex'):
+for line in open(f'{B}/hmicro.hex'):
     r = bytes.fromhex(line.strip()[1:])
     c, a, t = r[0], (r[1] << 8) | r[2], r[3]
     if t == 0:
@@ -100,7 +100,7 @@ check(syms['__prog_end'] == 0x20040000 and syms['__heap_end'] <= syms['__prog_st
 check(syms['__prog_start'] <= 0x20020000 <= syms['__prog_end'] - 0x1C000, "a 112 KB shell block fits at 0x20020000 (its 128 KB boundary)")
 
 # UF2
-data = open(f'{B}/hackos.uf2', 'rb').read()
+data = open(f'{B}/hmicro.uf2', 'rb').read()
 check(len(data) % 512 == 0 and len(data) > 0, f"UF2: {len(data) // 512} blocks of 512 bytes")
 blocks = [data[i:i + 512] for i in range(0, len(data), 512)]
 fam = num('BL_UF2_FAMILY_NRF52840')

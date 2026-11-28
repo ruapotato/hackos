@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- Teensy 4.1 (NXP i.MX RT1062): boot header, vector table, and the
+/* Hamnix Micro -- Teensy 4.1 (NXP i.MX RT1062): boot header, vector table, and the
  * code that must run before the stack exists.  Included by
  * arch/armv7m/startup.S.  UNTESTED ON HARDWARE.
  *
@@ -32,8 +32,8 @@
 #define BOARD_RESET_EARLY 1
 
         .section .flashconfig, "a", %progbits
-        .global hackos_fcb
-hackos_fcb:
+        .global hmicro_fcb
+hmicro_fcb:
         .word   0x42464346        /* 0x000 tag "FCFB" */
         .word   0x56010000        /* 0x004 version 1.0.0 (PJRC's value) */
         .word   0x00000000
@@ -162,31 +162,31 @@ hackos_fcb:
         .word   0x00000000
         .word   0x00000000
         .word   0x00000000
-        .size hackos_fcb, . - hackos_fcb
+        .size hmicro_fcb, . - hmicro_fcb
 
         .section .ivt, "a", %progbits
-        .global hackos_ivt
-        .type hackos_ivt, %object
-hackos_ivt:
+        .global hmicro_ivt
+        .type hmicro_ivt, %object
+hmicro_ivt:
         .word   0x412000D1              /* tag 0xD1, length 0x0020, version 0x41 */
         .word   Reset_Handler           /* entry (Thumb bit set by the linker) */
         .word   0                       /* reserved1 */
         .word   0                       /* dcd: none */
-        .word   hackos_boot_data        /* boot_data */
-        .word   hackos_ivt              /* self */
+        .word   hmicro_boot_data        /* boot_data */
+        .word   hmicro_ivt              /* self */
         .word   0                       /* csf: none (unsigned image) */
         .word   0                       /* reserved2 */
-        .size hackos_ivt, . - hackos_ivt
+        .size hmicro_ivt, . - hmicro_ivt
 
         .section .bootdata, "a", %progbits
-        .global hackos_boot_data
-        .type hackos_boot_data, %object
-hackos_boot_data:
+        .global hmicro_boot_data
+        .type hmicro_boot_data, %object
+hmicro_boot_data:
         .word   0x60000000              /* start of the image */
         .word   __flash_image_len       /* its length */
         .word   0                       /* plugin: no */
         .word   0xFFFFFFFF              /* placeholder (NXP's g_boot_data) */
-        .size hackos_boot_data, . - hackos_boot_data
+        .size hmicro_boot_data, . - hmicro_boot_data
 
 /* The vector table VTOR is pointed at (16 system entries + 158 interrupts,
  * MIMXRT1062.h NUMBER_OF_INT_VECTORS = 174; aligned to 1 KB, the power of two
@@ -194,9 +194,9 @@ hackos_boot_data:
  * entry is the reset handler.                                            */
         .section .vectors, "a", %progbits
         .balign 1024
-        .global hackos_vectors
-        .type hackos_vectors, %object
-hackos_vectors:
+        .global hmicro_vectors
+        .type hmicro_vectors, %object
+hmicro_vectors:
         .word   __stack_top             /*  0 initial MSP                 */
         .word   Reset_Handler           /*  1 reset                       */
         .word   nmi_handler             /*  2 NMI                         */
@@ -217,7 +217,7 @@ hackos_vectors:
         .rept   132                     /* IRQ 26..157                    */
         .word   irq_default_handler
         .endr
-        .size hackos_vectors, . - hackos_vectors
+        .size hmicro_vectors, . - hmicro_vectors
 
 /* board_reset_early: called by Reset_Handler with interrupts masked, before
  * the stack pointer is set (it uses no stack; r0-r3 only).

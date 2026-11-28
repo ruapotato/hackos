@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- LPUART (i.MX RT1060 and RT1170 families: the same IP block).
+# Hamnix Micro -- LPUART (i.MX RT1060 and RT1170 families: the same IP block).
 #
 # UNTESTED ON HARDWARE.  Register layout and bit masks are checked against
 # NXP's MIMXRT1062.h (and compared with MIMXRT1176_cm7.h) by

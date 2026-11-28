@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- linker script for the Teensy 4.1 (NXP i.MX RT1062).
+/* Hamnix Micro -- linker script for the Teensy 4.1 (NXP i.MX RT1062).
  * UNTESTED ON HARDWARE.
  *
  * Memory (RT1060 reference manual, system memory map; PJRC's
@@ -124,7 +124,7 @@ SECTIONS
     __flash_image_len = ALIGN(__flash_end - ORIGIN(FLASH), 1024);
     __ram_end = ORIGIN(DTCM) + LENGTH(DTCM);
 
-    /* .bss is cleared by hackos_start, .xbss is not: on the mps2 board
+    /* .bss is cleared by hmicro_start, .xbss is not: on the mps2 board
      * that table is in memory QEMU zeroes.  Here it must be inside the
      * cleared range, so .xbss directly precedes .bss and the start-up code
      * clears from __xbss_start (see board_init_early). */

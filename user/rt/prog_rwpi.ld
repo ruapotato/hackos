@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- layout of a user program for PROG_ABI=rwpi (boards without RAM
+/* Hamnix Micro -- layout of a user program for PROG_ABI=rwpi (boards without RAM
  * for whole programs: BOARD=feather-nrf52840).
  *
  * Compiled with `-fropi -frwpi`: code and read-only data are reached
@@ -20,9 +20,9 @@
  *
  * No relocations are applied at load time: a pointer stored in initialised
  * data (R_ARM_ABS32) would need one, and the Makefile's check refuses such
- * a program (none of HackOS's or Hamnix's programs has one).
+ * a program (none of Hamnix Micro's or Hamnix's programs has one).
  * The stack travels in PT_GNU_STACK as for a PIE (`-z stack-size=N`).     */
-ENTRY(hackos_crt_start)
+ENTRY(hmicro_crt_start)
 
 /* No PHDRS: lld then makes one PT_LOAD per address range (with
  * --no-rosegment, code and constants share the first) and fills in
@@ -31,7 +31,7 @@ ENTRY(hackos_crt_start)
 SECTIONS
 {
     . = 0;
-    .text : ALIGN(8) { *(.text.hackos_crt_start) *(.text .text.*) }
+    .text : ALIGN(8) { *(.text.hmicro_crt_start) *(.text .text.*) }
     .rodata : ALIGN(8) { *(.rodata .rodata.*) }
     . = 0x40000000;
     .data : ALIGN(8) { *(.data.rel.ro .data.rel.ro.*) *(.data .data.*) }

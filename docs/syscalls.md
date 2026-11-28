@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS system calls
+# Hamnix Micro system calls
 
 Status: milestone 4, emulators only (QEMU's Cortex-M7 and Cortex-M4 machines, Renode's nRF52840). This is the interface between unprivileged
 code and the kernel: programs loaded from the file system (processes), and
@@ -8,7 +8,7 @@ the unprivileged threads that the kernel test image carries inside itself.
 
 ## How a call is made
 
-A program calls `hackos_syscall(nr, a0, a1, a2, a3, a4, a5)`, normally through
+A program calls `hmicro_syscall(nr, a0, a1, a2, a3, a4, a5)`, normally through
 a wrapper: `user/rt/rt.ad` for programs (it supplies the `sys_*` names Hamnix
 programs declare as `extern def`), `user/sys.ad` for threads inside the kernel
 image. The stub is two instructions, `svc #0` and a return; all the work is in
@@ -53,7 +53,7 @@ Anything else is `-EFAULT` (-14) and the kernel does not touch the memory.
 
 Numbers are Hamnix's native numbers (`arch/x86/kernel/syscall.ad` at commit
 `1c5d976a`) for every call both systems have, so a program written against
-Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
+Hamnix's `sys_*` stubs keeps its meaning. Hamnix Micro-only calls start at 512.
 
 ### Files
 
@@ -75,11 +75,11 @@ Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
 | 22 | `sys_mkdir(path)` | tmpfs only | same |
 | 23 | `sys_read_nb(fd, buf, n)` | > 0 bytes, 0 = nothing yet, -1 = end of file | same contract |
 | 260 | `sys_create(path, flags, mode)` | `mode & DMDIR` makes a directory, else create/truncate and open read-write | same |
-| 261 | `sys_stat_p9(path, buf, n)` | a 9P2000 stat record; bytes written | same record layout; uid/gid are the string `hackos`; times are seconds |
+| 261 | `sys_stat_p9(path, buf, n)` | a 9P2000 stat record; bytes written | same record layout; uid/gid are the string `hmicro`; times are seconds |
 | 262 | `sys_fstat_p9(fd, buf, n)` | the same for a descriptor (the name is empty) | same |
 | 263 | `sys_remove(path)` | as `unlink` | same |
 | 265 | `sys_errstr(buf, n)` | copies the caller's last error string | read only; Hamnix can also install a string |
-| 514 | `sys_rename(old, new)` | tmpfs only | Hamnix renames through `wstat` (266), which HackOS does not implement |
+| 514 | `sys_rename(old, new)` | tmpfs only | Hamnix renames through `wstat` (266), which Hamnix Micro does not implement |
 
 ### Processes
 
@@ -89,7 +89,7 @@ Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
 | 4 | `sys_getpid()` | the process id (a process is one thread; the ids are the same numbers) | same |
 | 10 | `sys_execve_env(path, argv, envp)` | replaces the caller's program; returns only on failure (`-ENOENT`, `-ENOEXEC` -8, `-ENOMEM`, `-E2BIG` -7) | same; the program must be a position-independent ELF for this machine |
 | 12 | `sys_waitpid(pid)`, `sys_waitpid_nb_raw(pid, flags)` | the exit code of process `pid` once it has ended, and the process is gone; `flags` bit 0: `-EAGAIN` (-11) instead of waiting; `-ECHILD` (-10) for an unknown pid | same |
-| 24 | `sys_yield()` | give up the rest of the time slice. **After 16 empty polls in a row** (a `read_nb` that found nothing, or a `waitpid_jc` that found its process still running) **it waits instead**: until console input arrives, a pipe is written, a process ends, or 250 ms pass. A read that returns data, or any write, ends the streak | Hamnix schedules cooperatively; HackOS also preempts. The wait exists because Hamnix's shell and editor wait for a key, and the shell for its foreground job, by polling and yielding; left alone that keeps the processor awake for ever |
+| 24 | `sys_yield()` | give up the rest of the time slice. **After 16 empty polls in a row** (a `read_nb` that found nothing, or a `waitpid_jc` that found its process still running) **it waits instead**: until console input arrives, a pipe is written, a process ends, or 250 ms pass. A read that returns data, or any write, ends the streak | Hamnix schedules cooperatively; Hamnix Micro also preempts. The wait exists because Hamnix's shell and editor wait for a key, and the shell for its foreground job, by polling and yielding; left alone that keeps the processor awake for ever |
 | 256 | `sys_rfork(flags)` | **vfork**: needs `RFPROC`; the child runs on the parent's memory with its own descriptors and `/fd` names, and the parent is suspended until the child calls `exec` or `exit`. `RFNOWAIT` (0x100) detaches the child. Other flag bits are ignored | Hamnix copies the address space (copy on write) and can also change namespaces; see below |
 | 288, 289 | `sys_getuid()`, `sys_getgid()` | 1: there is one user, the owner | same value for Hamnix's hostowner |
 | 290 | `sys_setuid(uid)` | succeeds for the current uid only | |
@@ -97,10 +97,10 @@ Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
 | 298 | `sys_tcsetpgrp(pgid)` | names the group that has the console: Ctrl-C ends every process in it with exit code 130 | Hamnix posts SIGINT, which a program may catch; also Ctrl-Z |
 | 299 | `sys_waitpid_jc(pid, &status)` | never waits: `pid` when the process has ended (`status = (code & 0xFF) << 8 \| 1`, and it is gone), 0 while it runs, `-ECHILD` | no stopped or continued states |
 | 308 | `nanosleep({sec, nsec})` | rounded up to scheduler ticks (1 ms) | same structure |
-| 516 | `sys_sleep_ms(ms)` | | HackOS only |
-| 517 | `sys_spawn(path, argv)` | a new process running `path` with the caller's descriptors, `/fd` names and directory; returns its id. No fork involved: the native way to start a program | HackOS only (Hamnix retired its `spawn` call in favour of `rfork` + `exec`) |
-| 518 | `halt(status)` | prints `[hackos] exit status N` and resets the machine | HackOS only |
-| 520 | `sys_suspend(ms, sources)` | stops the whole system until a wake source fires: `sources` bit 0 = a byte at the console, bit 1 = after `ms` milliseconds. Returns the source that fired (1 or 2); `-EINVAL` when nothing could end it or the board cannot suspend. The clock is moved by the time spent. See [`power.md`](power.md) | HackOS only |
+| 516 | `sys_sleep_ms(ms)` | | Hamnix Micro only |
+| 517 | `sys_spawn(path, argv)` | a new process running `path` with the caller's descriptors, `/fd` names and directory; returns its id. No fork involved: the native way to start a program | Hamnix Micro only (Hamnix retired its `spawn` call in favour of `rfork` + `exec`) |
+| 518 | `halt(status)` | prints `[hmicro] exit status N` and resets the machine | Hamnix Micro only |
+| 520 | `sys_suspend(ms, sources)` | stops the whole system until a wake source fires: `sources` bit 0 = a byte at the console, bit 1 = after `ms` milliseconds. Returns the source that fired (1 or 2); `-EINVAL` when nothing could end it or the board cannot suspend. The clock is moved by the time spent. See [`power.md`](power.md) | Hamnix Micro only |
 
 A new program starts with every register zero that the kernel does not use
 to pass something in (argc and argv in `r0`-`r3`, the static base in `r9` of
@@ -122,7 +122,7 @@ Hamnix's shell does not build pipelines from `pipe` and `dup`. Every process
 has sixteen names `/fd/0` ... `/fd/15`; each is bound to the console, one end
 of a pipe, a file, or nothing, and a descriptor opened on `/fd/N` resolves the
 name at every read and write, in the process that makes the call. So a parent
-can redirect a child after the child exists. HackOS implements this part of
+can redirect a child after the child exists. Hamnix Micro implements this part of
 Hamnix's namespace model and nothing else of it.
 
 | Nr | Wrapper | Behaviour |
@@ -139,7 +139,7 @@ when the process ends; that is what delivers end-of-file to a reader and
 
 One rule exists only because of vfork. Hamnix's shell binds a child's standard
 streams *after* `rfork` + `exec` and relies on Hamnix's cooperative scheduler
-not to run the child before the parent gives up the processor. HackOS
+not to run the child before the parent gives up the processor. Hamnix Micro
 preempts, so a child that came from `rfork` is **held after `exec`** until its
 parent next yields, waits, sleeps, reads or forks again. `sys_spawn` children
 are not held.
@@ -147,7 +147,7 @@ are not held.
 ### /proc
 
 Text files rendered by the kernel when they are opened (`fs/procfs.ad`). They
-are what Hamnix's `ps`, `free`, `df` and `date` read, with HackOS's content.
+are what Hamnix's `ps`, `free`, `df` and `date` read, with Hamnix Micro's content.
 
 | File | Content |
 |--|--|

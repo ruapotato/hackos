@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- TI TCA8418 I2C keypad scanner (the HackerSlide keyboard's chip,
+# Hamnix Micro -- TI TCA8418 I2C keypad scanner (the HackerSlide keyboard's chip,
 # address 0x34).  UNTESTED ON HARDWARE: written from TI's datasheet
 # (SCPS222) and run against the register model in tca8418_model.ad.
 #

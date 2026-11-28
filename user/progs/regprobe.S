@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- regprobe: what does a brand-new program find in its registers?
+/* Hamnix Micro -- regprobe: what does a brand-new program find in its registers?
  *
  * A program must not start with anything another program (or the kernel)
  * left behind.  This one is its own entry point, so nothing has run before
@@ -13,7 +13,7 @@
  * r0-r3 carry argc and argv.  Reading s0 is this program's first use of the
  * FPU, which is exactly the case in question.                             */
         .syntax unified
-#ifdef HACKOS_CPU_M4
+#ifdef HMICRO_CPU_M4
         .cpu cortex-m4
         .fpu fpv4-sp-d16
 #else
@@ -21,11 +21,11 @@
         .fpu fpv5-d16
 #endif
         .thumb
-        .section .text.hackos_crt_start, "ax", %progbits
-        .global hackos_crt_start
+        .section .text.hmicro_crt_start, "ax", %progbits
+        .global hmicro_crt_start
         .thumb_func
-        .type   hackos_crt_start, %function
-hackos_crt_start:
+        .type   hmicro_crt_start, %function
+hmicro_crt_start:
         orrs    r4, r5
         orrs    r4, r6
         orrs    r4, r7
@@ -34,7 +34,7 @@ hackos_crt_start:
         orr     r4, r4, r11
         orr     r4, r4, r12
         orr     r4, r4, lr
-#ifndef HACKOS_RWPI
+#ifndef HMICRO_RWPI
         orr     r4, r4, r9
 #endif
         movs    r2, #0
@@ -55,4 +55,4 @@ hackos_crt_start:
         movs    r3, #0
         svc     #0
 4:      b       4b
-        .size   hackos_crt_start, . - hackos_crt_start
+        .size   hmicro_crt_start, . - hmicro_crt_start

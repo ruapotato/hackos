@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- faults raised by a thread: report, end the thread, carry on.
+# Hamnix Micro -- faults raised by a thread: report, end the thread, carry on.
 #
-# hackos_fault_entry (arch/armv7m/startup.S) offers every fault taken from
-# thread mode on the process stack to hackos_thread_fault() below.  It runs in
+# hmicro_fault_entry (arch/armv7m/startup.S) offers every fault taken from
+# thread mode on the process stack to hmicro_thread_fault() below.  It runs in
 # handler mode on the main stack, which is intact even when the thread's own
 # stack is not.  The thread is turned into a zombie whose exit code says what
 # happened; whoever joins it reads the code.  Faults in handler mode, inside a
@@ -48,7 +48,7 @@ def _below_block(addr: uint32, psp: uint32, t: Ptr[Thread]) -> uint32:
     return 0
 
 
-def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint64:
+def hmicro_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint64:
     if sched_running == 0 or sched_current == 0 or cpu_basepri() != 0:
         return 1
     # 11: an `svc` the kernel does not accept from this thread (an unknown
@@ -100,9 +100,9 @@ def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint
     if stacking == 0:
         pc = cast[Ptr[uint32]](frame)[6]
     if (t[0].flags & TF_PROC) != 0:
-        kputs("\n*** HackOS: process ")
+        kputs("\n*** Hamnix Micro: process ")
     else:
-        kputs("\n*** HackOS: thread ")
+        kputs("\n*** Hamnix Micro: thread ")
     kput_u64(cast[uint64](t[0].tid))
     kputs(" '")
     kputs(&t[0].name[0])
@@ -158,9 +158,9 @@ def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint
 def _trap_bad_stack(tp: uint64, sp: uint64) -> int64:
     t: Ptr[Thread] = thr(tp)
     if (t[0].flags & TF_PROC) != 0:
-        kputs("\n*** HackOS: process ")
+        kputs("\n*** Hamnix Micro: process ")
     else:
-        kputs("\n*** HackOS: thread ")
+        kputs("\n*** Hamnix Micro: thread ")
     kput_u64(cast[uint64](t[0].tid))
     kputs(" '")
     kputs(&t[0].name[0])

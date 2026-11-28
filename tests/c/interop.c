@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS test: the C side of the Adder <-> C calling tests in
+/* Hamnix Micro test: the C side of the Adder <-> C calling tests in
  * tests/kt_cinterop.ad.  Ordinary C, ordinary prototypes.                 */
 #include <stdint.h>
 #include <string.h>

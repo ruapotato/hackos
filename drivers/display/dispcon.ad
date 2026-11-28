@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the console on a display: text screen, panel, and the thread
+# Hamnix Micro -- the console on a display: text screen, panel, and the thread
 # between them.
 #
 # Console output is written into the text screen at once (it is only memory)

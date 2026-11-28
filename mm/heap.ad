@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- heap allocator: first fit over an address-ordered free list, with
+# Hamnix Micro -- heap allocator: first fit over an address-ordered free list, with
 # immediate coalescing in both directions.
 #
 # One `Heap` describes one contiguous arena.  The kernel has two: the kernel

@@ -1,4 +1,4 @@
-HackOS feather-nrf52840 size patch to init/main.ad.
+Hamnix Micro feather-nrf52840 size patch to init/main.ad.
 Applied by scripts/mkroot.sh in build/feather-nrf52840/root only; the
 committed file is unchanged.
 

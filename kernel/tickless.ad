@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- stopping and resuming a SysTick tick for tickless idle
+# Hamnix Micro -- stopping and resuming a SysTick tick for tickless idle
 # (kernel/sched/core.ad, _idle_main), for boards whose tick is SysTick.
 #
 # SysTick is a 24-bit down-counter that reloads from RVR when it reaches 0.

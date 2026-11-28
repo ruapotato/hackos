@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS audio path: design note (no implementation)
+# Hamnix Micro audio path: design note (no implementation)
 
 Status: design only, written 2026-11-27. Nothing here is built or tested.
 There is no audio code in the tree. This note proposes an I2S output path
@@ -115,7 +115,7 @@ Two ways to feed the FIFO:
 | eDMA, two blocks of 256 frames | about 172 /s [D] | what the Teensy library does; needs an eDMA driver, a DMA-safe buffer and cache care on the M7 |
 
 The SD driver in the tree avoids DMA today, so interrupt mode first and
-eDMA second is the low-risk order. HackOS leaves the core at the boot ROM
+eDMA second is the low-risk order. Hamnix Micro leaves the core at the boot ROM
 clock; the audio PLL is separate from the core PLL, so audio clocking does
 not depend on raising the core clock, but the decode budget does (2.4).
 i.MX RT117x has the same SAI block with a different clock tree; not
@@ -280,7 +280,7 @@ needs only `memcpy`, `memmove` and `memset` from libc and no allocator
 No published Cortex-M7 MP3 figure was found. By extrapolation [E] from the
 Cortex-M4 numbers, with no credit for the M7's better per-MHz performance,
 30 to 70 MHz of work is 5 to 12 % of a 600 MHz core. Even the heaviest
-case is easy. The open point is the clock HackOS actually runs at: the
+case is easy. The open point is the clock Hamnix Micro actually runs at: the
 core is left at whatever the boot ROM set, and if that is far below
 600 MHz the margin shrinks in proportion. The boot banner reports the
 measured clock; that number decides whether the clock set-up must come
@@ -331,7 +331,7 @@ linked image. The FSF lists the RPSL as a free but GPL-incompatible
 licence for this reason and for its choice-of-venue clause [S15]. The
 RCSL is a separate agreement with RealNetworks and is not an open
 licence. Conclusion: Helix, and wrappers around it such as Adafruit_MP3
-and the Teensy codec library's MP3 part, cannot go into HackOS. Whether a
+and the Teensy codec library's MP3 part, cannot go into Hamnix Micro. Whether a
 separately loaded Helix program on the file system would count as mere
 aggregation is a legal question this note does not rely on.
 

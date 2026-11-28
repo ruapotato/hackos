@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- pipes.
+# Hamnix Micro -- pipes.
 #
 # The interface follows Hamnix's fs/pipe.ad as its shell uses it: a pipe is a
 # SLOT (pipe_alloc_chan), not a pair of descriptors, and whoever binds an end
@@ -11,7 +11,7 @@
 #
 # The code is new.  Hamnix's file was not copied: a quarter of it is a
 # self-test written against Hamnix's task structure, its blocking paths use
-# five wait-queue calls HackOS does not have (prepare/cancel/commit) plus a
+# five wait-queue calls Hamnix Micro does not have (prepare/cancel/commit) plus a
 # yield loop on the write side, and its ring is a fixed 128 KiB per pipe.
 # Here both sides sleep on wait queues, the ring is PIPE_CAP bytes from the
 # kernel heap, and every operation is a short critical section (the copy is

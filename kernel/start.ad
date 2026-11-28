@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- C-runtime-level start-up, in Adder.
+# Hamnix Micro -- C-runtime-level start-up, in Adder.
 #
 # Reset_Handler (arch/armv7m/startup.S) has set MSP and enabled the FPU; it
-# calls hackos_start() with interrupts masked.  Nothing here may read an
+# calls hmicro_start() with interrupts masked.  Nothing here may read an
 # initialised global before the .data copy, or any global before the .bss
 # clear.
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_irq_enable
 from board.board import board_console_init, board_init_early
-from kernel.exit import hackos_exit
+from kernel.exit import hmicro_exit
 # Not called from here, but arch/armv7m/startup.S refers to them by name, so
 # they must be part of every image: the fault report and the run-time helpers
 # behind __aeabi_uldivmod, memcpy, __aeabi_l2d, ...
-from kernel.fault import hackos_fault
+from kernel.fault import hmicro_fault
 from kernel.rt import rt_udivmod64, rt_sdivmod64, rt_memcpy, rt_memmove, rt_memset, rt_u64_to_f64, rt_i64_to_f64, rt_f64_to_u64, rt_f64_to_i64
 
 # main() is defined by the application (the root file of the build), which
@@ -26,10 +26,10 @@ extern def __data_start()
 extern def __data_end()
 extern def __bss_start()
 extern def __bss_end()
-extern def hackos_vectors()
+extern def hmicro_vectors()
 
 
-def hackos_start():
+def hmicro_start():
     # .data: copy the initial values from their load address (in CODE) to RAM.
     src: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&__data_load))
     dst: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&__data_start))
@@ -47,7 +47,7 @@ def hackos_start():
         i = i + 1
     # VTOR (0xE000ED08): point the core at our vector table explicitly, so the
     # image does not depend on being linked at the reset default.
-    mmio_write32(0xE000ED08, cast[uint32](cast[uint64](&hackos_vectors)))
+    mmio_write32(0xE000ED08, cast[uint32](cast[uint64](&hmicro_vectors)))
     # SHCSR (0xE000ED24): enable the MemManage, BusFault and UsageFault
     # exceptions (bits 16, 17, 18) so they are reported as themselves instead
     # of escalating to HardFault.
@@ -58,4 +58,4 @@ def hackos_start():
     board_console_init()
     cpu_irq_enable()
     rc: int32 = main()
-    hackos_exit(cast[uint32](rc))
+    hmicro_exit(cast[uint32](rc))

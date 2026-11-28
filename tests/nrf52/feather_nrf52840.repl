@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 David Hamner
-// Renode platform for tests/nrf52/: the nRF52840 parts HackOS touches, with
+// Renode platform for tests/nrf52/: the nRF52840 parts Hamnix Micro touches, with
 // Renode's own nRF52840 peripheral models (the same models and addresses as
 // Renode's platforms/cpus/nrf52840.repl, without its SVD download).
 // Renode has no QSPI, USB or LED model; the LED pin is a GPIO output.

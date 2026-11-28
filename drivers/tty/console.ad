@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the console: UART output, interrupt-driven input, line discipline.
+# Hamnix Micro -- the console: UART output, interrupt-driven input, line discipline.
 #
 # Output is polled (board_console_putc).  A write from a thread holds the
 # console mutex for its whole buffer, so messages do not interleave; writes

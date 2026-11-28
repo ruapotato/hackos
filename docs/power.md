@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS power management
+# Hamnix Micro power management
 
 Status: milestone 4. Everything here has run in emulators only. **No current
 has been measured, because there is no hardware.** What is measured is how

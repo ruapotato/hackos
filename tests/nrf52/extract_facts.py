@@ -4,7 +4,7 @@
 # extract_facts.py BOOTLOADER_DIR ARDUINO_DIR > feather_facts.txt
 #
 # Reads Adafruit's nRF52 bootloader (MIT) and Arduino core (variant files:
-# LGPL-2.1) checkouts AS DATA and prints the facts HackOS's Feather port
+# LGPL-2.1) checkouts AS DATA and prints the facts Hamnix Micro's Feather port
 # depends on, one per line: NAME VALUE  # where it comes from.  Only these
 # extracted numbers are committed (tests/nrf52/feather_facts.txt), with the
 # commits and file hashes; none of Adafruit's code is copied.

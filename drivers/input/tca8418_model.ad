@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- a register model of the TCA8418, attached to the I2C bus in
+# Hamnix Micro -- a register model of the TCA8418, attached to the I2C bus in
 # software (drivers/i2c/bus.ad) so that the driver, the key map and the
 # console path run before the keyboard exists.
 #

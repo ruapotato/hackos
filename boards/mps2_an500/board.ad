@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS board support: QEMU `mps2-an500` (ARM MPS2 FPGA board, AN500 image).
+# Hamnix Micro board support: QEMU `mps2-an500` (ARM MPS2 FPGA board, AN500 image).
 #
 # Facts checked against QEMU 10.0 (hw/arm/mps2.c, hw/char/cmsdk-apb-uart.c)
 # and the running machine's `info mtree`:
@@ -22,7 +22,7 @@
 #   board_mpu_{code,kram,xram}_{base,size}, board_mpu_extra   MPU plan
 #   board_storage_init     registers the block device FAT is mounted from
 #   board_code_loaded      after a program image was written to RAM
-#   board_halt             last call before the system reset of hackos_exit
+#   board_halt             last call before the system reset of hmicro_exit
 
 from kernel.cpu import mmio_read32, mmio_write32
 from kernel.block.blk import blk_init
@@ -151,7 +151,7 @@ def board_code_loaded(base: uint64, size: uint64):
     return
 
 
-# hackos_exit(code) calls this, then requests a system reset (which ends
+# hmicro_exit(code) calls this, then requests a system reset (which ends
 # QEMU under -no-reboot).
 def board_halt(code: uint32):
     if board_halt_set != 0:

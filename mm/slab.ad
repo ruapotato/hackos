@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- kernel heap under the names Hamnix code expects.
+# Hamnix Micro -- kernel heap under the names Hamnix code expects.
 #
 # Hamnix's mm/slab.ad offers kmalloc/kzalloc/kfree (addresses as uint64) and an
-# allocation-site tag used by its leak accounting.  HackOS provides the same
+# allocation-site tag used by its leak accounting.  Hamnix Micro provides the same
 # names on top of mm/heap.ad, so files ported from Hamnix (fs/tmpfs.ad, ...)
 # import `mm.slab` unchanged.  There are no slab caches here: every request is
 # a first-fit block.  The site tag is accepted and counted, nothing more.
@@ -23,7 +23,7 @@ extern def __user_end()
 extern def __prog_start()
 extern def __prog_end()
 
-# Site tags used by the Hamnix files that HackOS carries.  The values are
+# Site tags used by the Hamnix files that Hamnix Micro carries.  The values are
 # Hamnix's (mm/slab.ad, commit 1c5d976a) so its debug output stays comparable.
 KM_SITE_NONE: uint64 = 0
 KM_SITE_TMPFS: uint64 = 10

@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS display and keyboard: the frameworks, and their emulated devices
+# Hamnix Micro display and keyboard: the frameworks, and their emulated devices
 
 Status: milestone 4. The code below runs in QEMU (`make test`, `make test-m4`)
 against emulated devices, so that the console, the shell and the editor can
@@ -80,7 +80,7 @@ To look at the system's screen yourself:
 
 ```sh
 qemu-system-arm -M mps2-an500 -nographic -no-reboot -serial mon:stdio -serial file:/tmp/panel.bin \
-    -device loader,file=build/sd.img,addr=0x20200000 -kernel build/hackos.elf
+    -device loader,file=build/sd.img,addr=0x20200000 -kernel build/hmicro.elf
 # ... use the shell, then `halt`
 mkdir /tmp/frames && python3 tests/display/panel2png.py /tmp/panel.bin /tmp/frames --keep 5
 ```

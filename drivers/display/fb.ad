@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- a frame buffer for small monochrome and grey displays.
+# Hamnix Micro -- a frame buffer for small monochrome and grey displays.
 #
 # 1 or 2 bits per pixel, packed most-significant-bit first, each row padded
 # to a whole byte: the layout e-paper controllers take, and the one a PNG

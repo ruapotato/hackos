@@ -1,7 +1,7 @@
-HackOS patch to Hamnix user/hamsh.ad (commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9).
+Hamnix Micro patch to Hamnix user/hamsh.ad (commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9).
 
 Reason: the shell keeps its whole state in static arenas sized for a desktop:
-4.16 MB of zero-initialised data, which on HackOS is the size of the block
+4.16 MB of zero-initialised data, which on Hamnix Micro is the size of the block
 every instance of the shell occupies (there is no demand paging: bss is real
 memory from the first instruction).  This patch divides the four big arenas
 and their dependent tables, and nothing else:
@@ -20,7 +20,7 @@ is changed.  Result: bss 4,163,664 -> 1,525,832 bytes.
 
 Not changed, and why hamsh needs no patch for them:
   * fork: the kernel implements rfork(RFPROC) as vfork (kernel/proc.ad).
-  * the GUI built-ins: lib/hamui.ad, lib/hamsdl*.ad are HackOS stand-ins.
+  * the GUI built-ins: lib/hamui.ad, lib/hamsdl*.ad are Hamnix Micro stand-ins.
   * the system calls: user/rt/rt.ad supplies Hamnix's names.
 
 `make test` reverse-applies this patch to user/hamnix/hamsh.ad (minus its

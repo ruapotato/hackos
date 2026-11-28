@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- linker script for QEMU `-M mps2-an500` (ARM MPS2, AN500, Cortex-M7).
+/* Hamnix Micro -- linker script for QEMU `-M mps2-an500` (ARM MPS2, AN500, Cortex-M7).
  *
  * Memory map, checked two ways (2026-11-26, QEMU 10.0.13):
  *   - `info mtree -f` on the running machine:

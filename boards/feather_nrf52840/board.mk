@@ -2,13 +2,13 @@
 # Copyright (C) 2026 David Hamner
 # BOARD=feather-nrf52840: Adafruit Feather nRF52840 Express (Nordic
 # nRF52840, Cortex-M4F 64 MHz, 1 MB flash, 256 KB RAM).  UNTESTED ON HARDWARE.
-#   make BOARD=feather-nrf52840       build/feather-nrf52840/hackos.elf, .bin, .hex, .uf2
+#   make BOARD=feather-nrf52840       build/feather-nrf52840/hmicro.elf, .bin, .hex, .uf2
 #   make test-nrf52                   everything that can be checked without it
 #                                     (tests/nrf52/; boots it in Renode)
-# Flashing: double-tap reset, copy hackos.uf2 to the FTHR840BOOT drive
+# Flashing: double-tap reset, copy hmicro.uf2 to the FTHR840BOOT drive
 # (docs/boards/feather-nrf52840.md).
-IMAGES := hackos
-BOARD_ALL := $(B)/hackos.uf2 $(B)/hackos.hex $(B)/hackos.bin
+IMAGES := hmicro
+BOARD_ALL := $(B)/hmicro.uf2 $(B)/hmicro.hex $(B)/hmicro.bin
 CPU := cortex-m4
 FPU := fpv4-sp-d16
 SOFT_DOUBLE := 1

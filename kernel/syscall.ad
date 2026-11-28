@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- system calls.
+# Hamnix Micro -- system calls.
 #
-# Entry: a thread executes `svc #0` through the stub hackos_syscall(nr, a0..a5)
+# Entry: a thread executes `svc #0` through the stub hmicro_syscall(nr, a0..a5)
 # (arch/armv7m/switch.S).  The stub is called with the Adder convention, so at
 # the SVC the call number is in r0 (r1 = its high word), a0 in r2:r3, and
 # a1..a5 are 8-byte slots on the caller's stack.  The core pushes r0-r3 with
@@ -13,7 +13,7 @@
 # r0:r1 slots and returned to the caller by the exception return.
 #
 # Numbers are Hamnix's native ones (arch/x86/kernel/syscall.ad at 1c5d976a)
-# wherever HackOS implements the same call; HackOS-only calls start at 512.
+# wherever Hamnix Micro implements the same call; Hamnix Micro-only calls start at 512.
 # docs/syscalls.md has the table and the differences.
 #
 # Pointers from an unprivileged caller are checked against what the MPU lets
@@ -26,7 +26,7 @@ from kernel.rt import rt_memcpy
 from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
-from kernel.exit import hackos_exit
+from kernel.exit import hmicro_exit
 from kernel.power import power_suspend
 
 extern def __text_end()
@@ -78,7 +78,7 @@ SYS_MMAP: uint32 = 302
 SYS_MUNMAP: uint32 = 304
 SYS_NANOSLEEP: uint32 = 308
 SYS_FDSLOT_ARG: uint32 = 324        # (pid, fdnum)
-# ---- HackOS only ----
+# ---- Hamnix Micro only ----
 SYS_THREAD_SPAWN: uint32 = 512
 SYS_THREAD_JOIN: uint32 = 513
 SYS_RENAME: uint32 = 514
@@ -145,7 +145,7 @@ def _sys_nanosleep(req: uint64) -> int64:
 
 
 # Dispatch.  The numbers come in three ranges (Hamnix's classic calls below
-# 256, its Plan 9 style ones from 256, HackOS's own from 512); each range
+# 256, its Plan 9 style ones from 256, Hamnix Micro's own from 512); each range
 # has its own chain of comparisons, so no call is found after more than the
 # calls of its own range.  read and write are first.
 def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64:
@@ -390,7 +390,7 @@ def _sys_own(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> int6
             return _bad()
         return cast[int64](proc_sys_spawn(cast[Ptr[uint8]](a0), a1))
     if nr == SYS_HALT:
-        hackos_exit(cast[uint32](a0))
+        hmicro_exit(cast[uint32](a0))
         return 0
     if nr == SYS_SUSPEND:
         return cast[int64](power_suspend(a0, cast[uint32](a1)))

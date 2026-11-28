@@ -1,4 +1,4 @@
-HackOS teensy41 size patch to user/hamnix/hamsh.ad (on top of
+Hamnix Micro teensy41 size patch to user/hamnix/hamsh.ad (on top of
 user/hamnix/hamsh.ad.patch, which the committed file already carries).
 Applied by scripts/mkroot.sh in build/teensy41/root only.
 

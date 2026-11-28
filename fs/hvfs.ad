@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the file layer: descriptors, paths, mounts, device files.
+# Hamnix Micro -- the file layer: descriptors, paths, mounts, device files.
 #
-# This is new HackOS code, not a port of Hamnix's fs/vfs.ad.  That file cannot
+# This is new Hamnix Micro code, not a port of Hamnix's fs/vfs.ad.  That file cannot
 # be lifted: its descriptors live in Hamnix's task structure, every open goes
 # through the Plan 9 channel layer (namec.ad/chan.ad), and its read and write
 # paths never call tmpfs directly (see the milestone-2 report for the
@@ -15,8 +15,8 @@
 # errors are negative errno values plus a per-thread error string.
 #
 # Mounts:  "/"     tmpfs.  Hamnix's tmpfs only serves a fixed set of top-level
-#                  names, so HackOS keeps its whole tree under the tmpfs root
-#                  named "root": the HackOS path /a/b is the tmpfs path
+#                  names, so Hamnix Micro keeps its whole tree under the tmpfs root
+#                  named "root": the Hamnix Micro path /a/b is the tmpfs path
 #                  /root/a/b.  The tmpfs file stays unmodified this way.
 #          "/dev"  device files: console (the UART), null, zero.
 #          "/bin"  the programs built into the kernel image, read-only and
@@ -30,7 +30,7 @@
 #                  (what Hamnix's write path supports); no mkdir, no rename,
 #                  and a redirection cannot target it yet.
 #
-# /fd names.  This is the one piece of Hamnix's namespace model HackOS has,
+# /fd names.  This is the one piece of Hamnix's namespace model Hamnix Micro has,
 # because Hamnix's shell wires every pipe and redirection with it: each
 # process has sixteen names /fd/0../fd/15, and each name is bound to a
 # console, one end of a pipe, a file, or nothing (vfs_fdbind).  A descriptor
@@ -90,7 +90,7 @@ OWRITE: uint32 = 1
 ORDWR: uint32 = 2
 OTRUNC: uint32 = 16
 OAPPEND: uint32 = 128
-OCREATE: uint32 = 0x1000            # HackOS-internal: create if missing
+OCREATE: uint32 = 0x1000            # Hamnix Micro-internal: create if missing
 
 SEEK_SET: uint32 = 0
 SEEK_CUR: uint32 = 1
@@ -106,7 +106,7 @@ OF_PROCW: uint32 = 8                # a writable /proc file: slot = pid for <pid
 OF_FATW: uint32 = 7                 # ... open for writing: dirbuf = its path on the volume, aux1 = size
 
 FS_KIND_ROM: uint32 = 1             # = FS_KIND_CPIO, "read-only baked root" in Hamnix's table
-FS_KIND_PROC: uint32 = 5            # = FS_KIND_EXT4 in Hamnix's table: HackOS has no ext4 and serves /proc (fs/procfs.ad) under this kind
+FS_KIND_PROC: uint32 = 5            # = FS_KIND_EXT4 in Hamnix's table: Hamnix Micro has no ext4 and serves /proc (fs/procfs.ad) under this kind
 FS_KIND_FD: uint32 = 2              # = FS_KIND_PROCFS, names served by the kernel
 
 # What an /fd name is bound to (Hamnix's DEVFD_* values).
@@ -242,7 +242,7 @@ def vfs_canon(path: Ptr[uint8], out: Ptr[uint8]) -> int32:
     return 0
 
 
-# HackOS canonical path -> tmpfs key ("/root" + path).  out: VFS_PATH_MAX + 8.
+# Hamnix Micro canonical path -> tmpfs key ("/root" + path).  out: VFS_PATH_MAX + 8.
 def _tkey(canon: Ptr[uint8], out: Ptr[uint8]):
     out[0] = 47
     out[1] = 114
@@ -460,7 +460,7 @@ def vfs_fat_mount() -> uint32:
         return 0
     if fat_init(slot) != 0:
         return 0
-    # fat_init registers Hamnix's mount point, /mnt; HackOS wants /sd
+    # fat_init registers Hamnix's mount point, /mnt; Hamnix Micro wants /sd
     hm: int32 = vfs_mount("/mnt", FS_KIND_FAT, 5, 0)
     if hm >= 0:
         vfs_umount(hm)
@@ -1330,9 +1330,9 @@ def _stat_encode(buf: Ptr[uint8], nbuf: uint64, name: Ptr[uint8], qtype: uint32,
     _put32(buf, 33, cast[uint32](length))
     _put32(buf, 37, cast[uint32](length >> 32))
     off: uint32 = _putstr(buf, 41, name)
-    off = _putstr(buf, off, "hackos")
-    off = _putstr(buf, off, "hackos")
-    off = _putstr(buf, off, "hackos")
+    off = _putstr(buf, off, "hmicro")
+    off = _putstr(buf, off, "hmicro")
+    off = _putstr(buf, off, "hmicro")
     return cast[int64](off)
 
 

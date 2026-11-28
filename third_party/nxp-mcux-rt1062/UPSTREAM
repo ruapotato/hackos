@@ -15,8 +15,8 @@ Licence:    BSD-3-Clause, Copyright NXP (and Freescale): every file below
             AGPL-3.0-or-later work if its notices are kept.  The usual
             reading, not legal advice.
 
-How HackOS uses them: as DATA.  Nothing here is compiled or linked into an
-image.  HackOS's drivers are Adder (soc/imxrt/, soc/imxrt1062/,
+How Hamnix Micro uses them: as DATA.  Nothing here is compiled or linked into an
+image.  Hamnix Micro's drivers are Adder (soc/imxrt/, soc/imxrt1062/,
 boards/teensy41/); the scripts in tests/imxrt/ read these files as text and
 check every register address, offset, bit mask, interrupt number, pin-mux
 tuple and clock gate the Adder code uses against them, and check the boot

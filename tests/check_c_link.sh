@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS link-time rule for mixing C and Adder.
+# Hamnix Micro link-time rule for mixing C and Adder.
 #
 # An Adder function takes every integer or pointer argument as a 64-bit slot;
 # a C function does not.  The linker binds by name only, so a C call to an
@@ -18,7 +18,7 @@
 #       64-bit slots.
 #   R3  No C or assembly object may define a bare C library name
 #       (memcpy, memset, strlen, ...): Adder code owns those names with its
-#       own convention.  C code gets hackos_c_* (lib/cshim).
+#       own convention.  C code gets hmicro_c_* (lib/cshim).
 #
 # usage: check_c_link.sh <adder.ll> <adder.o> <asm.o>... -- <c.o>...
 # The .ll is read for the compiler's `; ADDER_CABI_EXPORT/IMPORT name` lines.
@@ -49,7 +49,7 @@ while read -r s; do
     grep -qxF -- "$s" "$T/export" && continue
     case "$s" in __aeabi_*) grep -qxF -- "$s" "$T/asmdef" && continue;; esac
     if grep -qxF -- "$s" "$T/adef"; then
-        echo "R1: C code calls '$s', an Adder-convention function (export it with extern \"C\" or use the hackos_c_ form)"
+        echo "R1: C code calls '$s', an Adder-convention function (export it with extern \"C\" or use the hmicro_c_ form)"
     else
         echo "R1: C code needs '$s', which nothing C-callable defines"
     fi

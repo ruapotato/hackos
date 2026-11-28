@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2026 David Hamner -->
-# HackOS
+# Hamnix Micro
 
 A small operating system for the HackerSlide hack pad: a handheld built around
 an NXP i.MX RT117x microcontroller (ARM Cortex-M7, double-precision FPU, memory
-protection unit but no MMU, 64-128 MB of SDRAM). HackOS is written in
+protection unit but no MMU, 64-128 MB of SDRAM). Hamnix Micro is written in
 [Adder](https://github.com/HamnixOS/adder), the language of the Hamnix operating
 system (it needs the `cortex-m7` branch of
 [ruapotato/adder](https://github.com/ruapotato/adder/tree/cortex-m7)), and is meant to reuse Hamnix's file-system layer, libraries and shell
@@ -14,7 +14,7 @@ on top of a new kernel that needs no page tables.
 
 **A shell prompt that runs real programs, an editor, a display and a
 keyboard to run them on, and a processor that sleeps when there is nothing
-to do: all in emulators.** HackOS boots to Hamnix's shell, `hamsh`, on the
+to do: all in emulators.** Hamnix Micro boots to Hamnix's shell, `hamsh`, on the
 serial console. The shell is an unprivileged process loaded from a file; so
 are `ls`, `cat`, `grep`, `vi` and the other 30 programs it runs. It runs in
 QEMU's `mps2-an500` (Cortex-M7) and `mps2-an386` (Cortex-M4F) machines and,
@@ -52,7 +52,7 @@ New in milestone 4 (all checked by `make test`, `make test-m4`,
   `> file 2>&1`, `def`, history (also across `exit`), Tab completion, and
   Ctrl-C for a whole pipeline. Here-documents do not exist in this hamsh.
 - **More programs** from Hamnix, unmodified: `mv touch tail sort uniq tr
-  date df free ps kill od tee cut seq vi`; HackOS's own `sleep setdate
+  date df free ps kill od tee cut seq vi`; Hamnix Micro's own `sleep setdate
   suspend idlestat keypress`. `/proc` has what `ps`, `free`, `df` and
   `date` read.
 - **Holes closed**: a new program starts with zeroed registers, floating
@@ -105,7 +105,7 @@ real display or keyboard, a persistent file system on flash, audio.
 ## A second board: the Teensy 4.1 (UNTESTED ON HARDWARE)
 
 `make BOARD=teensy41` builds the same system for a PJRC Teensy 4.1 (NXP
-i.MX RT1062): `build/teensy41/hackos.hex` for the Teensy loader, with the
+i.MX RT1062): `build/teensy41/hmicro.hex` for the Teensy loader, with the
 FlexSPI boot header, the console on `Serial1` (pins 0/1, 115200), the LED on
 pin 13 as a sign of life, and `/sd` on the built-in microSD socket. The
 i.MX RT drivers (LPUART, GPIO, IOMUXC, clock gates and roots, LPI2C, LPSPI,
@@ -123,7 +123,7 @@ which to check the untested parts: [`docs/boards/teensy41.md`](docs/boards/teens
 
 `make BOARD=feather-nrf52840` builds it for Adafruit's Feather nRF52840
 Express (Nordic nRF52840: Cortex-M4F at 64 MHz, single-precision FPU,
-8-region MPU, 1 MB flash, 256 KB RAM): `build/feather-nrf52840/hackos.uf2`
+8-region MPU, 1 MB flash, 256 KB RAM): `build/feather-nrf52840/hmicro.uf2`
 for the board's UF2 bootloader (double-tap reset, copy the file to the
 FTHR840BOOT drive). It has the console on the TX/RX header pins (UARTE0,
 115200), the red LED as a sign of life, and the scheduler tick from RTC1.
@@ -148,7 +148,7 @@ Requirements: `clang` and `ld.lld` (19 is what was used), `llvm-objdump`,
 was used), Python 3.10+, GNU make, `patch`, and mtools (`mformat`, `mcopy`,
 `mmd`) for the FAT image. No ARM GCC, no newlib, no compiler-rt.
 
-HackOS needs the Adder compiler with the `thumbv7em-none-eabihf` target
+Hamnix Micro needs the Adder compiler with the `thumbv7em-none-eabihf` target
 (branch `cortex-m7` of the Adder fork). The two trees are separate; point
 `ADDER` at a checkout:
 
@@ -233,13 +233,13 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `kernel/rt.ad` | 64-bit divide/modulo, integer/float64 conversion, memcpy/memset |
 | `kernel/fault.ad`, `kernel/print.ad`, `kernel/printk/` | fatal report, console formatting |
 | `mm/` | heap (`heap.ad`) and the allocation names Hamnix code expects |
-| `fs/hvfs.ad` | descriptors, paths, mounts, device files, `/bin`, `/fd` names, the FAT glue (HackOS) |
+| `fs/hvfs.ad` | descriptors, paths, mounts, device files, `/bin`, `/fd` names, the FAT glue (Hamnix Micro) |
 | `fs/tmpfs.ad`, `fs/fat.ad`, `fs/vfs_mount.ad`, `lib/p9dir.ad`, `lib/9p/` | copied from Hamnix (`fs/HAMNIX_ORIGIN`); `tmpfs.ad` with a size patch |
 | `user/hamnix/` | Hamnix's shell and programs, copied; `hamsh.ad` with a size patch |
 | `lib/p9.ad`, `perror.ad`, `regex.ad`, `hamcomplete.ad`, `passwd/` | Hamnix libraries those programs import, copied |
-| `lib/hamui.ad`, `lib/hamsdl*.ad` | HackOS stand-ins for Hamnix's GUI libraries (the shell imports them) |
+| `lib/hamui.ad`, `lib/hamsdl*.ad` | Hamnix Micro stand-ins for Hamnix's GUI libraries (the shell imports them) |
 | `user/rt/` | what every program is linked with: entry point, system-call wrappers, heap, linker script |
-| `user/progs/` | HackOS's own programs: `hello`, `halt`, the process test program, a C program |
+| `user/progs/` | Hamnix Micro's own programs: `hello`, `halt`, the process test program, a C program |
 | `user/sys.ad`, `user/faults.ad` | unprivileged code that is part of the kernel test image |
 | `drivers/tty/console.ad` | UART console with line discipline |
 | `drivers/i2c/` | software I2C bus, Sensirion platform layer and driver declarations |

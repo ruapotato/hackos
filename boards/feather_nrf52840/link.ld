@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- linker script for the Adafruit Feather nRF52840 Express
+/* Hamnix Micro -- linker script for the Adafruit Feather nRF52840 Express
  * (Nordic nRF52840).  UNTESTED ON HARDWARE.
  *
  * Flash (1 MB at 0), as Adafruit's UF2 bootloader lays it out
  * (Adafruit_nRF52_Bootloader: linker/nrf52840.ld, dfu_types.h, uf2cfg.h,
  * CMakeLists.txt):
  *   0x00000000  MBR (4 KB)                      never written by a UF2 copy
- *   0x00001000  SoftDevice S140 6.1.1           kept: HackOS does not use it,
+ *   0x00001000  SoftDevice S140 6.1.1           kept: Hamnix Micro does not use it,
  *                                               the bootloader's BLE DFU does
  *   0x00026000  APPLICATION = this image        __app_start (board.mk)
  *   0x000AD000  __uf2_limit: Adafruit's bootloader 0.2.6 (2018, shipped on

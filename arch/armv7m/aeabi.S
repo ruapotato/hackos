@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- EABI run-time helper shims (ARMv7-M, hard float).
+/* Hamnix Micro -- EABI run-time helper shims (ARMv7-M, hard float).
  *
  * LLVM calls __aeabi_uldivmod, __aeabi_memcpy, __aeabi_l2d and friends with
  * the C convention; their implementations are Adder functions (kernel/rt.ad)
@@ -10,7 +10,7 @@
  * touches no data.
  */
         .syntax unified
-#ifdef HACKOS_CPU_M4                    /* Cortex-M4F: single-precision FPU */
+#ifdef HMICRO_CPU_M4                    /* Cortex-M4F: single-precision FPU */
         .cpu cortex-m4
         .fpu fpv4-sp-d16
 #else

@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 David Hamner */
-/* HackOS -- vector tables for QEMU `mps2-an500`; included by
+/* Hamnix Micro -- vector tables for QEMU `mps2-an500`; included by
  * arch/armv7m/startup.S (moved there from unchanged).                    */
 /* Address 0 holds only what reset needs: the core reads the initial MSP and
  * the reset vector from there before any code runs.  The rest of the first
  * 4 KB of the image is empty and becomes an MPU no-access region (the null
  * pointer guard, kernel/mpu.ad), so the real vector table lives behind it and
- * hackos_start() points VTOR at it.  Until then interrupts are masked; a fault
+ * hmicro_start() points VTOR at it.  Until then interrupts are masked; a fault
  * that early still finds a handler through the copies below.              */
         .section .boot_vectors, "a", %progbits
-        .global hackos_boot_vectors
-        .type hackos_boot_vectors, %object
-hackos_boot_vectors:
+        .global hmicro_boot_vectors
+        .type hmicro_boot_vectors, %object
+hmicro_boot_vectors:
         .word   __stack_top             /*  0 initial MSP                 */
         .word   Reset_Handler           /*  1 reset                       */
         .word   nmi_handler             /*  2 NMI                         */
@@ -19,13 +19,13 @@ hackos_boot_vectors:
         .word   MemManage_Handler       /*  4                             */
         .word   BusFault_Handler        /*  5                             */
         .word   UsageFault_Handler      /*  6                             */
-        .size hackos_boot_vectors, . - hackos_boot_vectors
+        .size hmicro_boot_vectors, . - hmicro_boot_vectors
 
         .section .vectors, "a", %progbits
         .balign 128                     /* VTOR bits [6:0] are zero       */
-        .global hackos_vectors
-        .type hackos_vectors, %object
-hackos_vectors:
+        .global hmicro_vectors
+        .type hmicro_vectors, %object
+hmicro_vectors:
         .word   __stack_top             /*  0 initial MSP                 */
         .word   Reset_Handler           /*  1 reset                       */
         .word   nmi_handler             /*  2 NMI                         */
@@ -43,5 +43,5 @@ hackos_vectors:
         .rept   31                      /* 17.. external interrupts 1..31 */
         .word   irq_default_handler
         .endr
-        .size hackos_vectors, . - hackos_vectors
+        .size hmicro_vectors, . - hmicro_vectors
 

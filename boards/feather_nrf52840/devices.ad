@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS board devices: Feather nRF52840.  No display driver and no keyboard are bound
+# Hamnix Micro board devices: Feather nRF52840.  No display driver and no keyboard are bound
 # on this board yet: the console is the UART alone.  drivers/display/ has
 # the frame buffer, the panel driver model and the text screen;
 # drivers/input/ the TCA8418 driver and the key map.  A board with the parts

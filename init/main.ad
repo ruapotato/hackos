@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the system image: kernel, the programs under /bin, and an init
+# Hamnix Micro -- the system image: kernel, the programs under /bin, and an init
 # thread that keeps Hamnix's shell running on the console.
 #
 # The shell is /bin/hamsh, an unprivileged process like any other.  It does
@@ -52,7 +52,7 @@ def init_main(arg: uint64) -> int64:
 
 
 def main() -> int32:
-    kputs("\nHackOS 0.4 (milestone 4) -- ")
+    kputs("\nHamnix Micro 0.4 (milestone 4) -- ")
     kputs(board_cpu_name())
     kputs(", ")
     kputs(board_name())

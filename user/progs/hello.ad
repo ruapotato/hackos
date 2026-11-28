@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- the smallest program: prints a line and its arguments.
+# Hamnix Micro -- the smallest program: prints a line and its arguments.
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 

@@ -8,7 +8,7 @@
 Reads the `#elif defined(__IMXRT1062__) && defined(ARDUINO_TEENSY41)` section
 as text (CORE_PINn_CONFIG = IOMUXC_SW_MUX_CTL_PAD_<pad>, CORE_PINn_BIT,
 CORE_PINn_PORTREG) and prints one line per pin.  The output is a table of
-facts in HackOS's own format; check_pins.py compares the board's pin mux
+facts in Hamnix Micro's own format; check_pins.py compares the board's pin mux
 against it, and against core_pins.h again when that file is given.
 """
 import re, sys

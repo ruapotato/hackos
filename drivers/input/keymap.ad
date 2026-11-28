@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- from key positions to console input: the HackerSlide keyboard.
+# Hamnix Micro -- from key positions to console input: the HackerSlide keyboard.
 #
 # The scanner (drivers/input/tca8418.ad) reports a chip row and column and
 # pressed or released.  This turns that into the bytes a serial terminal

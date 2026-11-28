@@ -1,4 +1,4 @@
-HackOS teensy41 size patch to lib/regex.ad (applied in build/teensy41/root only).
+Hamnix Micro teensy41 size patch to lib/regex.ad (applied in build/teensy41/root only).
 
 Reason: rx_ends, the end positions a repetition can take at each of 4
 nesting levels, is 512 KiB of grep's 699 KiB of static data; the Teensy

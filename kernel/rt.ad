@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS run-time support: the routines LLVM-generated Thumb-2 code calls
+# Hamnix Micro run-time support: the routines LLVM-generated Thumb-2 code calls
 # behind the programmer's back, written in Adder.
 #
 # There is no compiler-rt, libgcc or newlib on this toolchain, so everything

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- a character-cell text screen on a frame buffer.
+# Hamnix Micro -- a character-cell text screen on a frame buffer.
 #
 # cols x rows cells of 8 x 8 or 8 x 16 pixels (the 8 x 8 font drawn with
 # every row doubled), black on white, with the part of VT100 that the shell
@@ -23,7 +23,7 @@
 from drivers.display.fb import Fb, fb_glyph, fb_fill, fb_scroll_up, fb_dirty
 from mm.slab import kmalloc
 
-extern "C" def hackos_font8x8(c: uint32) -> Ptr[uint8]
+extern "C" def hmicro_font8x8(c: uint32) -> Ptr[uint8]
 
 TC_INV: uint32 = 0x80               # cell attribute: inverse
 
@@ -65,7 +65,7 @@ def _draw(x: uint32, y: uint32, v: uint32, flip: uint32):
     if inv != 0:
         bg = fg
         fg = 0
-    fb_glyph(_fb(), x * 8, y * tc_ch, hackos_font8x8(v & 0x7F), 8, tc_yscale, fg, bg)
+    fb_glyph(_fb(), x * 8, y * tc_ch, hmicro_font8x8(v & 0x7F), 8, tc_yscale, fg, bg)
 
 
 def _set(x: uint32, y: uint32, v: uint32):

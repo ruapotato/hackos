@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- threads and the scheduler.
+# Hamnix Micro -- threads and the scheduler.
 #
 # The file sits at kernel/sched/core.ad because that is where Hamnix keeps its
 # scheduler: files ported from Hamnix import `set_current_errstr` and

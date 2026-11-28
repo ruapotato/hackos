@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- Cortex-M7 core access from Adder.
+# Hamnix Micro -- Cortex-M7 core access from Adder.
 #
 # Special registers are read and written by the leaf routines in
 # arch/armv7m/cpu.S.  Adder's inline assembly takes no operands, so a value

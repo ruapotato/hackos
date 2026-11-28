@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- synchronisation: mutex, semaphore, condition variable, message
+# Hamnix Micro -- synchronisation: mutex, semaphore, condition variable, message
 # queue, and the spinlock names Hamnix code calls.
 #
 # Everything is built on wait queues and critical sections from

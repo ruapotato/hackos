@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS fault-handler test image: deliberately executes an undefined
+# Hamnix Micro fault-handler test image: deliberately executes an undefined
 # instruction.  Expected: the UsageFault handler prints the fault status
 # registers (CFSR with UFSR.UNDEFINSTR set) and the stacked PC, then ends the
 # emulator run with status 3.  Reaching the end of main() is the FAILURE case.
 
-from kernel.start import hackos_start
-from kernel.fault import hackos_fault
+from kernel.start import hmicro_start
+from kernel.fault import hmicro_fault
 from kernel.print import kputs
 
 
 def main() -> int32:
-    kputs("HackOS fault test: executing an undefined instruction (udf #0)\n")
+    kputs("Hamnix Micro fault test: executing an undefined instruction (udf #0)\n")
     asm_volatile("udf #0")
     kputs("ERROR: execution continued past udf\n")
     return 1

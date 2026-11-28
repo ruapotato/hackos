@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS board devices: QEMU `mps2-an386`.  The display and the keyboard of this
+# Hamnix Micro board devices: QEMU `mps2-an386`.  The display and the keyboard of this
 # board, both emulated (docs/display-input.md).  Imported as board.devices
 # by the system image and the kernel test image only; board.ad stays free of
 # anything that needs the scheduler.
@@ -45,7 +45,7 @@ def _dev_tee(c: uint32) -> int32:
 
 # Before the reset: what was printed last reaches the panel.  That takes the
 # scheduler (the panel is busy for a while after each refresh), and
-# hackos_exit has interrupts off.
+# hmicro_exit has interrupts off.
 def _dev_halt() -> int32:
     if sched_running != 0 and sched_in_handler() == 0:
         cpu_irq_enable()

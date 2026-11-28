@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- thread entry points that fault on purpose (tests and the monitor's
+# Hamnix Micro -- thread entry points that fault on purpose (tests and the monitor's
 # `fault` command).  They use no globals, so they can run unprivileged.
 
 

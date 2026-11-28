@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 David Hamner
-# HackOS -- idlestat [SECONDS] [-p]: how often is the processor woken while
+# Hamnix Micro -- idlestat [SECONDS] [-p]: how often is the processor woken while
 # the system has nothing to do?
 #
 # Reads /proc/power, sleeps SECONDS (default 5), reads it again and prints
