@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- help: where to look.  Hamnix's own help (user/help.ad) indexes
+# the manual pages under /usr/share/man and hands topics to `man`; a
+# microcontroller image carries neither, and Hamnix's shell has no help
+# built in (it runs /bin/help), so without this program `help` at the
+# prompt did nothing at all -- found on the first real board.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def out(s: Ptr[uint8]):
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    sys_write(1, s, n)
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    out("hamsh, the Hamnix shell, on a microcontroller.\n")
+    out("  programs      ls /bin\n")
+    out("  built in      cd pwd echo export unset alias source read exit\n")
+    out("                jobs fg bg wait kill\n")
+    out("  pipes, files  a | b    a > f    a >> f    a < f    a &\n")
+    out("  keys          Tab completes, Up/Down history, Ctrl-C stops a job\n")
+    out("  system        cat /proc/version /proc/meminfo /proc/tasks\n")
+    out("  restart       halt 0\n")
+    return 0

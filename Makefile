@@ -109,7 +109,7 @@ SRC_AD := $(wildcard drivers/display/*.c kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.
 #   user/hamnix/NAME.ad   copied from Hamnix (fs/HAMNIX_ORIGIN)
 # Per program: STACK_NAME (bytes of stack, default 8192) and HEAP_NAME
 # (bytes of heap for sys_mmap, default 0).
-PROGS_OWN    := hello ptest crel halt regprobe sleep setdate suspend idlestat keypress
+PROGS_OWN    := hello help ptest crel halt regprobe sleep setdate suspend idlestat keypress
 HEAP_ptest   := 8192
 PROGS_HAMNIX := echo cat ls cp rm mkdir wc head grep hamsh mv touch tail sort uniq tr date df free ps kill od tee cut seq vi
 STACK_hamsh  ?= 65536
