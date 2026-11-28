@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS board support: QEMU `mps2-an386` (ARM MPS2 FPGA board, AN386 image).
+#
+# Facts checked against QEMU 10.0 (hw/arm/mps2.c, hw/char/cmsdk-apb-uart.c)
+# and the running machine's `info mtree`:
+#   SYSCLK (CPU clock, SysTick CLKSOURCE=1) = 25 MHz, refclk = 1 MHz
+#   UART0 = CMSDK APB UART at 0x40004000 (RX irq 0, TX irq 1)
+#     +0x00 DATA      rx/tx byte
+#     +0x04 STATE     bit0 TXFULL, bit1 RXFULL, bit2 TXOVERRUN, bit3 RXOVERRUN
+#     +0x08 CTRL      bit0 TX_EN, bit1 RX_EN, bit2 TX_INTEN, bit3 RX_INTEN
+#     +0x0C INTSTATUS
+#     +0x10 BAUDDIV   must be >= 16; baud = pclk / BAUDDIV
+#   A byte written to DATA is only transmitted while CTRL.TX_EN is set.
+
+# The functions every board provides (the kernel imports them as board.board;
+# Makefile: BOARD, scripts/mkroot.sh):
+#   board_name, board_cpu_hz, board_init_early, board_late_init
+#   board_console_{init,putc,rx_irq_enable,rx_ready,getc,rx_irq_ack}
+#   board_tick_start (board_systick_csr, board_systick_reload)   scheduler tick
+#   board_mpu_xip_{rbar,rasr}, board_xip_{lo,hi}   flash window of /bin (XIP)
+#   board_mpu_{code,kram,xram}_{base,size}, board_mpu_extra   MPU plan
+#   board_storage_init     registers the block device FAT is mounted from
+#   board_code_loaded      after a program image was written to RAM
+#   board_halt             last call before the system reset of hackos_exit
+
+from kernel.cpu import mmio_read32, mmio_write32
+from kernel.block.blk import blk_init
+
+
+def board_name() -> Ptr[uint8]:
+    return "QEMU mps2-an386"
+
+
+def board_cpu_hz() -> uint32:
+    return 25000000
+
+
+# Before the console exists (after .data/.bss are set up).  Nothing to do in
+# the emulator.
+def board_init_early():
+    return
+
+
+# After kernel_init, before the scheduler starts.
+def board_late_init():
+    return
+
+
+# SysTick: CLKSOURCE=1 (the 25 MHz CPU clock), TICKINT, ENABLE.
+def board_systick_csr() -> uint32:
+    return 7
+
+
+def board_systick_reload(hz: uint32) -> uint32:
+    return board_cpu_hz() / hz - 1
+
+
+# The scheduler's tick: SysTick, `hz` times a second, calling the kernel's
+# systick_handler (exception 15) directly.
+def board_tick_start(hz: uint32):
+    mmio_write32(0xE000E010, 0)
+    mmio_write32(0xE000E014, board_systick_reload(hz))
+    mmio_write32(0xE000E018, 0)
+    mmio_write32(0xE000E010, board_systick_csr())
+
+
+# Programs are copied whole into RAM here (PROG_ABI=pie): no flash window
+# for running code in place (kernel/mpu.ad region 4, kernel/uaccess.ad).
+def board_mpu_xip_rbar() -> uint32:
+    return 0
+
+
+def board_mpu_xip_rasr() -> uint32:
+    return 0
+
+
+def board_xip_lo() -> uint64:
+    return 0
+
+
+def board_xip_hi() -> uint64:
+    return 0
+
+
+# Regions 0, 2 and 3 of the MPU plan (kernel/mpu.ad): the code region, the
+# kernel RAM and the large RAM; each a power of two aligned to its size.
+def board_mpu_code_base() -> uint32:
+    return 0x00000000
+
+
+def board_mpu_code_size() -> uint32:
+    return 0x400000
+
+
+def board_mpu_kram_base() -> uint32:
+    return 0x20000000
+
+
+def board_mpu_kram_size() -> uint32:
+    return 0x400000
+
+
+def board_mpu_xram_base() -> uint32:
+    return 0x21000000
+
+
+def board_mpu_xram_size() -> uint32:
+    return 0x1000000
+
+
+# Regions 8.. if the board needs any (MPU still off when this runs).
+def board_mpu_extra():
+    return
+
+
+# The FAT volume at /sd: the RAM disk the harness preloads (kernel/block/blk.ad).
+def board_storage_init() -> int32:
+    return blk_init()
+
+
+# A program image has just been written to [base, base+size).  QEMU has no
+# caches.
+def board_code_loaded(base: uint64, size: uint64):
+    return
+
+
+# hackos_exit(code) calls this, then requests a system reset (which ends
+# QEMU under -no-reboot).
+def board_halt(code: uint32):
+    return
+
+
+def board_console_init():
+    # 25 MHz / 115200 = 217
+    mmio_write32(0x40004010, 217)
+    mmio_write32(0x40004008, 1)          # TX_EN
+
+
+def board_console_putc(c: uint32):
+    # wait while the transmit holding register is full
+    while (mmio_read32(0x40004004) & 1) != 0:
+        c = c
+    mmio_write32(0x40004000, c & 255)
+
+
+# ---- receive side (interrupt driven; IRQ 0 = UART0 RX) ----------------------
+def board_console_rx_irq_enable():
+    mmio_write32(0x40004008, 0xB)        # TX_EN | RX_EN | RX_INTEN
+    # NVIC: priority of IRQ 0 = 0x80 (kernel aware), then enable it.
+    cast[Ptr[volatile uint8]](0xE000E400)[0] = 0x80
+    mmio_write32(0xE000E100, 1)
+
+
+def board_console_rx_ready() -> uint32:
+    return (mmio_read32(0x40004004) >> 1) & 1
+
+
+def board_console_getc() -> uint32:
+    return mmio_read32(0x40004000) & 255
+
+
+def board_console_rx_irq_ack():
+    mmio_write32(0x4000400C, 2)          # INTCLEAR: RX

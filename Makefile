@@ -10,6 +10,8 @@
 #   make measure            cost of the i64 value model vs. C (tests/measure.sh)
 #   make BOARD=teensy41     the Teensy 4.1 image: build/teensy41/hackos.hex
 #                           (docs/boards/teensy41.md)
+#   make test-m4            the kernel tests and the shell session once more,
+#                           on QEMU's Cortex-M4F machine (BOARD=qemu-m4)
 #   make test-teensy        the checks that can be made without the board:
 #                           boot header, register constants, pin table, the
 #                           drivers against register models (tests/imxrt/)
@@ -28,9 +30,10 @@ BOARD   ?= qemu-mps2
 BOARD_DIR_qemu-mps2 := mps2_an500
 BOARD_DIR_teensy41  := teensy41
 BOARD_DIR_feather-nrf52840 := feather_nrf52840
+BOARD_DIR_qemu-m4   := mps2_an386
 BOARD_DIR := $(BOARD_DIR_$(BOARD))
 ifeq ($(BOARD_DIR),)
-$(error unknown BOARD=$(BOARD); known: qemu-mps2 teensy41 feather-nrf52840)
+$(error unknown BOARD=$(BOARD); known: qemu-mps2 qemu-m4 teensy41 feather-nrf52840)
 endif
 ADDER   ?= ../adder
 CLANG   ?= clang
@@ -135,7 +138,7 @@ endif
 STRIP   ?= llvm-strip
 
 .SECONDARY:
-.PHONY: all test run size measure clean compiler test-teensy test-nrf52
+.PHONY: all test run size measure clean compiler test-teensy test-nrf52 test-m4
 all: $(IMAGES:%=$(B)/%.elf) $(BOARD_ALL)
 
 # Bootstrap the compiler in ITS tree if its binary is missing or older than
@@ -296,6 +299,12 @@ $(B)/hackos.uf2: $(B)/hackos.hex scripts/mkuf2.py
 test-nrf52:
 	$(MAKE) BOARD=feather-nrf52840 ADDER=$(ADDER)
 	ADDER=$(ADDER) bash tests/nrf52/run_all.sh
+
+# The kernel tests and the shell session on QEMU's Cortex-M4F machine
+# (tests/m4/run_all.sh).
+test-m4:
+	$(MAKE) BOARD=qemu-m4 ADDER=$(ADDER) build/qemu-m4/hackos.elf build/qemu-m4/ktest.elf build/qemu-m4/sd.img
+	ADDER=$(ADDER) bash tests/m4/run_all.sh
 
 # The checks of the i.MX RT code that need no board (tests/imxrt/README).
 test-teensy:

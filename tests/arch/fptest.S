@@ -11,8 +11,13 @@
  * d8-d15 are callee-saved: the PendSV handler must save them.  Touches no
  * memory except its own stack, so it also runs unprivileged.               */
         .syntax unified
+#ifdef HACKOS_CPU_M4                    /* d0-d15 exist as register pairs */
+        .cpu cortex-m4
+        .fpu fpv4-sp-d16
+#else
         .cpu cortex-m7
         .fpu fpv5-d16
+#endif
         .thumb
         .section .text.fp_hold, "ax", %progbits
         .global fp_hold

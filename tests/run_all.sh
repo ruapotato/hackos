@@ -21,11 +21,18 @@ NM="${NM:-llvm-nm}"
 OBJDUMP="${OBJDUMP:-llvm-objdump}"
 SIZE="${SIZE:-llvm-size}"
 OBJCOPY="${OBJCOPY:-llvm-objcopy}"
-B=build
+# The same runner serves a second QEMU board (tests/m4/run_all.sh sets
+# these): the build directory, the machine, the first two hex digits of the
+# 16 MB RAM (where the arenas are), and which sections to run.
+B="${HACKOS_B:-build}"
+MACHINE="${HACKOS_MACHINE:-mps2-an500}"
+XP="${HACKOS_XP:-60}"
+ONLY="${HACKOS_ONLY:-1 2 3 4 5 6 7 8}"
+want() { case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 # An image ends its run by printing "[hackos] exit status N" and requesting a
 # system reset; -no-reboot turns the reset into the end of the emulator run.
 # No semihosting: the guest has no channel to the host except its UART.
-QFLAGS="-M mps2-an500 -nographic -monitor none -serial stdio -no-reboot"
+QFLAGS="-M $MACHINE -nographic -monitor none -serial stdio -no-reboot"
 # Kernel tests run with QEMU's instruction counter as the clock (32 ns per
 # instruction, idle time skipped): tick-exact timing checks then do not depend
 # on how busy the host is.  The monitor session below runs in real time.
@@ -75,6 +82,7 @@ wait_for() {  # wait_for <fixed string> [occurrences]  (up to 60 s)
 say() { printf "$1" >&9; }
 qemu_wait() { local rc; wait $QPID; rc=$?; exec 9>&-; rm -f $B/uart.in; run_status "$QLOG" $rc; }
 
+if want 1; then
 echo "[test] === 1. compiler: thumbv7em target ($ADDER/scripts/test_llvm_thumbv7em.sh)"
 if bash "$ADDER/scripts/test_llvm_thumbv7em.sh" > $B/compiler_test.log 2>&1; then
     ok "compiler regression test ($(grep -c '   ok:' $B/compiler_test.log) assertions)"
@@ -82,6 +90,8 @@ else
     bad "compiler regression test (see $B/compiler_test.log)"; grep -v '   ok:' $B/compiler_test.log
 fi
 
+fi
+if want 2; then
 echo "[test] === 2. files copied from Hamnix are unmodified, or differ only by a recorded patch (fs/HAMNIX_ORIGIN)"
 ncopies=0; npatched=0
 while read -r sum path; do
@@ -129,6 +139,8 @@ expect "  ... C calling an Adder kernel function" $B/clink_bad.log "^R1: C code 
 expect "  ... C defining a bare C library name" $B/clink_bad.log "^R3: .*'strlen'"
 
 rm -f $B/*.bin
+fi
+if want 3; then
 echo "[test] === 3. static checks on the images"
 for img in hackos monitor ktest selftest; do
     undef="$("$NM" -u $B/$img.elf | wc -l)"
@@ -162,6 +174,8 @@ tb="$("$SIZE" -A $B/hackos.elf | awk '$1==".xbss"{print $3}')"
 nv="$(grep -c '^define void @' $B/hackos.ll)"
 [ "$nv" -gt 50 ] && ok "result-less functions are emitted as void ($nv of them)" || bad "only $nv void functions"
 
+fi
+if want 4; then
 echo "[test] === 4. run-time self-test under QEMU (milestone 1 checks)"
 EXPECTED_SELF="$(grep -cE '^ +check\(' demo/main.ad)"
 run_qemu $B/selftest.elf $B/selftest.out; rc=$?
@@ -172,6 +186,8 @@ nfail="$(grep -c '^FAIL ' $B/selftest.out)"; npass="$(grep -c '^PASS ' $B/selfte
 [ "$npass" = "$EXPECTED_SELF" ] && ok "$npass PASS lines (all $EXPECTED_SELF checks ran)" || bad "$npass PASS lines, expected $EXPECTED_SELF"
 expect "RESULT: PASS" $B/selftest.out '^RESULT: PASS'
 
+fi
+if want 5; then
 echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, processes, pipes, console)"
 EXPECTED_K="$(grep -cE '^ +check\(' tests/ktest_main.ad)"
 qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT $SDCARD"
@@ -193,8 +209,8 @@ nfail="$(grep -c '^FAIL ' $B/ktest.txt)"; npass="$(grep -c '^PASS ' $B/ktest.txt
 [ "$npass" = "$EXPECTED_K" ] && ok "$npass PASS lines (all $EXPECTED_K checks ran)" || bad "$npass PASS lines, expected $EXPECTED_K"
 expect "RESULT: PASS" $B/ktest.txt '^RESULT: PASS'
 # the fault reports must name the thread
-expect "stack overflow reported with the thread's name (user)" $B/ktest.txt "thread [0-9]+ 'deep-user' ended: stack overflow at 0x60f"
-expect "stack overflow reported with the thread's name (kernel thread)" $B/ktest.txt "thread [0-9]+ 'deep-kern' ended: stack overflow at 0x60[0-3]"
+expect "stack overflow reported with the thread's name (user)" $B/ktest.txt "thread [0-9]+ 'deep-user' ended: stack overflow at 0x${XP}f"
+expect "stack overflow reported with the thread's name (kernel thread)" $B/ktest.txt "thread [0-9]+ 'deep-kern' ended: stack overflow at 0x${XP}[0-3]"
 expect "kernel-memory access reported with the thread's name" $B/ktest.txt "thread [0-9]+ 'peek' ended: unprivileged access violation at 0x20"
 expect "null pointer reported at address 0" $B/ktest.txt "'null-user' ended: unprivileged access violation at 0x00000000"
 expect "console echo: the typed line came back" $B/ktest.txt '^status report$'
@@ -232,10 +248,12 @@ else
     bad "process benchmark lines missing"
 fi
 expect "tmpfs per-file cost reported" $B/ktest.txt '^BENCH tmpfs: an empty file takes 0 bytes of kernel heap, its first byte [0-9]+ more'
-expect "a faulting process is reported as a process, by name" $B/ktest.txt "process [0-9]+ 'ptest' ended: stack overflow at 0x60"
+expect "a faulting process is reported as a process, by name" $B/ktest.txt "process [0-9]+ 'ptest' ended: stack overflow at 0x$XP"
 expect "a breakpoint instruction in a process is reported, the system carries on" $B/ktest.txt "process [0-9]+ 'ptest' ended: breakpoint instruction or escalated fault"
 expect "the loaded C program printed through its relocated pointers" $B/ktest.txt '^crel: relocated pointers ok$'
 
+fi
+if want 6; then
 echo "[test] === 6. monitor session over the UART (real-time clock, commands typed by the harness)"
 qemu_start $B/monitor.elf $B/monitor.out
 p=0
@@ -304,6 +322,8 @@ expect "monitor: counters" $M '^system calls [0-9]+  thread faults 4  console by
 expect "monitor: unknown command" $M '^unknown or incomplete command: bogus'
 nd="$(grep -c '^d$' $M)"; [ "$nd" = 1 ] && ok "monitor: /tmp/d listed once, gone after rm" || bad "monitor: /tmp/d listed $nd times"
 
+fi
+if want 7; then
 echo "[test] === 7. fatal-fault report under QEMU (undefined instruction before the scheduler runs)"
 run_qemu $B/faulttest.elf $B/faulttest.out; rc=$?
 cat $B/faulttest.out
@@ -317,6 +337,8 @@ pc="$(tr -d '\r' < $B/faulttest.out | awk '$1=="pc"{print $3}')"
     || bad "stacked pc '$pc' vs udf at '$udf'"
 grep -q 'continued past udf' $B/faulttest.out && bad "execution continued past the fault" || ok "execution did not continue past the fault"
 
+fi
+if want 8; then
 echo "[test] === 8. the shell: Hamnix's hamsh as a process on the UART console, running programs from /bin"
 # The session is typed into the emulated UART like the monitor session above.
 # hamsh redraws its prompt line at every keystroke, so prompts cannot be
@@ -397,7 +419,7 @@ cat $B/shell.txt
 S=$B/shell.txt
 NPROG="$(echo $(grep -c . <<< "$(ls $B/user | grep -v '\.')"))"
 [ $rc -eq 0 ] && ok "shell: 'halt 0' ended the run with status 0" || bad "shell: exit status $rc"
-expect "shell: banner of the system image" $S '^HackOS 0\.3 \(milestone 3\)'
+expect "shell: banner of the system image" $S '^HackOS 0\.[0-9]+ \(milestone [0-9]+\)'
 expect "shell: hamsh's own banner (it is running as a process)" $S "^hamsh . Hamnix shell"
 expect "shell: a built-in" $S '^hello from hamsh$'
 expect "shell: ls /bin lists the programs (an external command found through PATH)" $S '^hamsh$'
@@ -437,6 +459,7 @@ expect "shell: rm on the card" $S '^cat: cannot open /sd/BACK.BIN: .*file does n
 nmark="$(grep -c '^0 0 0$' $S)"
 [ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"
 
+fi
 echo
 if [ $fails -eq 0 ]; then echo "[test] ALL TESTS PASSED"; exit 0; fi
 echo "[test] $fails TEST(S) FAILED"; exit 1
