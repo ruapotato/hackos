@@ -18,7 +18,7 @@ device's programs, and between the device and a PC over a serial line; an
 editor, a display and a keyboard, and a processor that sleeps when there
 is nothing to do: all in emulators.** Hamnix Micro boots to Hamnix's shell, `hamsh`, on the
 serial console. The shell is an unprivileged process loaded from a file; so
-are `ls`, `cat`, `grep`, `vi` and the other 30 programs it runs. It runs in
+are `ls`, `cat`, `grep`, `vi` and the other 35 programs it runs. It runs in
 QEMU's `mps2-an500` (Cortex-M7) and `mps2-an386` (Cortex-M4F) machines and,
 as the Feather nRF52840 image, in Renode. On real hardware only the
 milestone-3 image has run (a Feather nRF52840, 2026-11-28); nothing of
