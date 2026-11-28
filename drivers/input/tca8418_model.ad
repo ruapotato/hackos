@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- a register model of the TCA8418, attached to the I2C bus in
+# software (drivers/i2c/bus.ad) so that the driver, the key map and the
+# console path run before the keyboard exists.
+#
+# What it models, from TI's datasheet: the register pointer (a write's first
+# byte) and reads from it; CFG, INT_STAT (write 1 to clear), KEY_LCK_EC,
+# the 10-event FIFO behind KEY_EVENT_A, KP_GPIO1-3; INT asserted while an
+# enabled status bit is set; a key on a pin that is not configured as a
+# keypad pin produces nothing; an 11th event sets OVR_FLOW_INT and is lost
+# (CFG.OVR_FLOW_M = 0).  Not modelled: GPIO mode, the keypad lock, debounce
+# timing, auto-increment.
+# tca_model_key() is the finger: the tests and /proc/keys use it.
+
+from drivers.i2c.bus import i2c_attach
+from drivers.input.tca8418 import tca8418_irq, TCA_ADDR
+
+tm_reg: Array[48, uint8]
+tm_ptr: uint32 = 0
+tm_fifo: Array[10, uint8]
+tm_count: uint32 = 0
+tm_int: uint32 = 0                  # the INT line: 1 = asserted (low on the pin)
+tm_dropped: uint64 = 0
+tm_attached: uint32 = 0
+
+
+def _tm_update_int():
+    was: uint32 = tm_int
+    st: uint32 = cast[uint32](tm_reg[2])
+    cfg: uint32 = cast[uint32](tm_reg[1])
+    tm_int = 0
+    if ((st & 0x01) != 0 and (cfg & 0x01) != 0) or ((st & 0x08) != 0 and (cfg & 0x08) != 0):
+        tm_int = 1
+    if tm_int != 0 and was == 0:
+        tca8418_irq()                   # the falling edge of INT
+
+
+def _tm_write(data: Ptr[uint8], n: uint32) -> int32:
+    if n == 0:
+        return 0
+    tm_ptr = cast[uint32](data[0])
+    i: uint32 = 1
+    while i < n:
+        if tm_ptr == 2:
+            tm_reg[2] = cast[uint8](cast[uint32](tm_reg[2]) & (0xFF ^ cast[uint32](data[i])))
+            if tm_count != 0:
+                tm_reg[2] = cast[uint8](cast[uint32](tm_reg[2]) | 0x01)     # events remain: K_INT comes back
+        elif tm_ptr < 48 and tm_ptr != 3 and tm_ptr != 4:
+            tm_reg[tm_ptr] = data[i]
+        i = i + 1
+    was: uint32 = tm_int
+    _tm_update_int()
+    if tm_int != 0 and was != 0 and (cast[uint32](tm_reg[1]) & 0x10) != 0:
+        tca8418_irq()                   # INT_CFG: INT is pulsed again while events remain
+    return 0
+
+
+def _tm_read(data: Ptr[uint8], n: uint32) -> int32:
+    i: uint32 = 0
+    while i < n:
+        v: uint32 = 0
+        if tm_ptr == 3:
+            v = tm_count
+        elif tm_ptr == 4:
+            if tm_count != 0:
+                v = cast[uint32](tm_fifo[0])
+                k: uint32 = 1
+                while k < tm_count:
+                    tm_fifo[k - 1] = tm_fifo[k]
+                    k = k + 1
+                tm_count = tm_count - 1
+        elif tm_ptr < 48:
+            v = cast[uint32](tm_reg[tm_ptr])
+        data[i] = cast[uint8](v)
+        i = i + 1
+    return 0
+
+
+# Press (down = 1) or release the key at chip ROW `row`, COL `col`.
+def tca_model_key(row: uint32, col: uint32, down: uint32):
+    if row > 7 or col > 9:
+        return
+    if (cast[uint32](tm_reg[0x1D]) & (cast[uint32](1) << row)) == 0:
+        return
+    cmask: uint32 = cast[uint32](tm_reg[0x1E]) | ((cast[uint32](tm_reg[0x1F]) & 3) << 8)
+    if (cmask & (cast[uint32](1) << col)) == 0:
+        return
+    if tm_count == 10:
+        tm_dropped = tm_dropped + 1
+        tm_reg[2] = cast[uint8](cast[uint32](tm_reg[2]) | 0x08)
+    else:
+        tm_fifo[tm_count] = cast[uint8]((row * 10 + col + 1) | (down << 7))
+        tm_count = tm_count + 1
+        tm_reg[2] = cast[uint8](cast[uint32](tm_reg[2]) | 0x01)
+    _tm_update_int()
+
+
+# Put the model on the bus at the chip's address, in its reset state.
+def tca_model_attach() -> int32:
+    i: uint32 = 0
+    while i < 48:
+        tm_reg[i] = 0
+        i = i + 1
+    tm_ptr = 0
+    tm_count = 0
+    tm_int = 0
+    if tm_attached != 0:
+        return 0
+    tm_attached = 1
+    return i2c_attach(TCA_ADDR, cast[uint64](&_tm_write), cast[uint64](&_tm_read))

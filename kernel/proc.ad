@@ -504,6 +504,8 @@ def _basename(path: Ptr[uint8]) -> Ptr[uint8]:
 
 
 def _adopt(t: Ptr[Thread], img: Ptr[Image]):
+    t[0].ulo = img[0].lo                # the context switch saves only inside the block
+    t[0].uhi = img[0].hi
     t[0].stack_top = img[0].stack_top
     t[0].mem_base = img[0].base
     t[0].mem_lo = img[0].lo
@@ -734,6 +736,8 @@ def proc_rfork(flags: uint32) -> int32:
     c[0].mpu.rbar = p[0].mpu.rbar
     c[0].mpu.rasr = p[0].mpu.rasr
     c[0].stack_top = p[0].stack_top
+    c[0].ulo = p[0].ulo
+    c[0].uhi = p[0].uhi
     c[0].pgid = p[0].pgid
     c[0].pflags = PF_VFORK
     rt_memcpy(cast[uint64](csp), cast[uint64](&p[0].svc_regs[0]), 32)

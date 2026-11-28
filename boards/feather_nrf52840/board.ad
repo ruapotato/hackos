@@ -137,14 +137,7 @@ def board_init_early():
 
 
 # ---- console: UARTE0 on TX (P0.25) and RX (P0.24) ------------------------
-# No display driver on this board yet: the console is the UART alone
-# (drivers/display/ has the frame buffer, the panel driver model and the
-# text screen; a board with a panel calls dispcon_start and forwards the
-# console's bytes here, as boards/mps2_an500 does for its fake panel).
-def board_display_start() -> int32:
-    return -1
-
-
+# No display on this board: the console is the UART alone.
 def board_console_tee(c: uint32):
     return
 

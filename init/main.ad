@@ -11,7 +11,8 @@
 from kernel.init import kernel_init
 from kernel.sched.core import thread_create, sched_start, thread_sleep
 from kernel.print import kputs
-from board.board import board_name, board_cpu_name, board_late_init, board_display_start
+from board.board import board_name, board_cpu_name, board_late_init
+from board.devices import board_display_start, board_input_start
 from kernel.printk.printk import printk1, printk2
 from kernel.proc import proc_spawn, proc_waitpid
 from drivers.tty.console import console_rx_enable, console_set_mode, CON_RAW
@@ -59,6 +60,7 @@ def main() -> int32:
     kernel_init()
     board_late_init()
     board_display_start()               # the console on a display too, where the board has one
+    board_input_start()                 # ... and a keyboard beside the UART, where it has one
     console_rx_enable()
     thread_create("init", cast[uint64](&init_main), 0, 2, 16384, 0)
     sched_start()

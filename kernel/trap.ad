@@ -12,7 +12,7 @@
 
 from kernel.cpu import mmio_read32, mmio_write32, cpu_basepri, cpu_set_basepri, cpu_set_psp, cpu_control
 from kernel.print import kputs, kput_hex32, kput_u64, kputc
-from kernel.sched.core import Thread, thr, sched_current, sched_running, thread_kill_current_from_fault, STACK_GUARD, TF_PROC
+from kernel.sched.core import Thread, thr, sched_current, sched_running, thread_kill_current_from_fault, sched_report_hook, sched_report_hook_set, STACK_GUARD, TF_PROC
 
 FAULT_STACK_OVERFLOW: uint32 = 1
 FAULT_ACCESS: uint32 = 2
@@ -152,3 +152,28 @@ def hackos_thread_fault(kind: uint64, frame: uint64, exc_return: uint64) -> uint
         code = 132
     thread_kill_current_from_fault(code, what, addr)
     return 0
+
+
+# The context switch refused to save a thread's context (sched_bad_stack).
+def _trap_bad_stack(tp: uint64, sp: uint64) -> int64:
+    t: Ptr[Thread] = thr(tp)
+    if (t[0].flags & TF_PROC) != 0:
+        kputs("\n*** HackOS: process ")
+    else:
+        kputs("\n*** HackOS: thread ")
+    kput_u64(cast[uint64](t[0].tid))
+    kputs(" '")
+    kputs(&t[0].name[0])
+    kputs("' ended: stack overflow at ")
+    kput_hex32(cast[uint32](sp))
+    kputs(" (no room for its context at a switch) ***\n")
+    trap_count = trap_count + 1
+    trap_last_tid = t[0].tid
+    trap_last_kind = FAULT_STACK_OVERFLOW
+    trap_last_addr = cast[uint32](sp)
+    return 0
+
+
+def trap_init():
+    sched_report_hook = _trap_bad_stack
+    sched_report_hook_set = 1

@@ -15,3 +15,8 @@ nordic-mdk-nrf52840/ is read as data only (tests/nrf52/check_regs.py), as
 nxp-mcux-rt1062/ is.  llvm-compiler-rt-builtins/ is compiled for boards
 with SOFT_DOUBLE=1 only (BOARD=feather-nrf52840): it defines the run-time
 ABI's __aeabi_d* helpers and calls nothing outside itself.
+
+font8x8/ (public domain) is the glyph table of the display's text screen:
+its header is compiled through drivers/display/font8x8.c into the images of
+boards that have a display (the QEMU boards today) and read as data by
+tests/display/panel2png.py.

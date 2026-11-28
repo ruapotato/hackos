@@ -13,7 +13,10 @@
         .equ    T_SVC_CTRL,   24        /* caller's CONTROL.nPRIV          */
         .equ    T_EXEC_NEW,   28        /* 1: an exec has just loaded a program */
         .equ    T_SVC_REGS,   32        /* caller's r4-r11 at system-call entry */
-        .equ    T_STATE,      68        /* scheduler state                 */
+        .equ    T_KLO,        64        /* lowest address a context may be saved at on the kernel stack */
+        .equ    T_ULO,        68        /* ... on the thread's own (unprivileged) stack */
+        .equ    T_UHI,        72        /* end of the memory its unprivileged stack pointer may be in */
+        .equ    T_STATE,      80        /* scheduler state                 */
         .equ    T_ZOMBIE,      4
         .equ    KERNEL_BASEPRI, 0x40
         .equ    FPCCR,        0xE000EF34
@@ -74,6 +77,34 @@ fp_dirty:
  * Saved below the exception frame: [d8-d15 if FP], r4-r11.               */
         func    pendsv_handler
         mrs     r0, psp
+        /* The context goes below the thread's stack pointer, written with
+         * the handler's privilege.  So first: is there room for it where
+         * this thread's stack may be?  A kernel stack that is nearly full
+         * would take the save into its guard (a fault in handler mode,
+         * which is fatal); an unprivileged thread whose stack pointer sits
+         * at the very bottom of its memory, or anywhere it likes, would
+         * have the kernel write below or outside what it owns.  A thread
+         * without the room is ended as a stack overflow instead
+         * (sched_bad_stack) and nothing is saved.                         */
+        movw    r3, #:lower16:sched_current
+        movt    r3, #:upper16:sched_current
+        ldr     r2, [r3]
+        mrs     r1, control
+        tst     r1, #1
+        ite     ne
+        ldrne   r3, [r2, #T_ULO]        /* running unprivileged: its own stack */
+        ldreq   r3, [r2, #T_KLO]        /* kernel thread, or inside a system call */
+        ite     ne
+        ldrne   r12, [r2, #T_UHI]
+        ldreq   r12, [r2, #T_KSTACK_TOP]
+        sub     r1, r0, #32
+        tst     lr, #0x10
+        it      eq
+        subeq   r1, r1, #64
+        cmp     r1, r3
+        blo     9f
+        cmp     r0, r12
+        bhi     9f
         tst     lr, #0x10
         bne     1f
         vstmdb  r0!, {d8-d15}
@@ -82,15 +113,12 @@ fp_dirty:
         movs    r1, #1
         strb    r1, [r3]
 1:      stmdb   r0!, {r4-r11}
-        movw    r3, #:lower16:sched_current
-        movt    r3, #:upper16:sched_current
-        ldr     r2, [r3]
-        str     r0, [r2, #T_SP]
+        str     r0, [r2, #T_SP]         /* r2 is still the current thread  */
         str     lr, [r2, #T_EXC]
         mrs     r1, control
         and     r1, r1, #1
         str     r1, [r2, #T_CTRL]
-        movs    r0, #KERNEL_BASEPRI     /* the ready queues are shared     */
+8:      movs    r0, #KERNEL_BASEPRI     /* the ready queues are shared     */
         msr     basepri, r0             /* with interrupt handlers         */
         bl      sched_pick              /* Adder: updates sched_current    */
         movs    r0, #0
@@ -120,6 +148,10 @@ fp_dirty:
         msr     control, r2             /* privilege of the incoming thread */
         isb
         bx      lr
+9:      push    {r4, lr}                /* no room for the context: end the thread */
+        bl      sched_bad_stack         /* Adder: r0:r1 = its stack pointer */
+        pop     {r4, lr}
+        b       8b
         .size   pendsv_handler, . - pendsv_handler
 
 /* ------------------------------------------------------------------ */

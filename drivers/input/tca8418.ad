@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- TI TCA8418 I2C keypad scanner (the HackerSlide keyboard's chip,
+# address 0x34).  UNTESTED ON HARDWARE: written from TI's datasheet
+# (SCPS222) and run against the register model in tca8418_model.ad.
+#
+# The chip scans up to 8 rows x 10 columns itself, debounces, and queues
+# key events in a 10-deep FIFO; it pulls INT low while it has something to
+# say.  Registers used:
+#     0x01 CFG          KE_IEN (bit 0) key events raise INT; OVR_FLOW_IEN
+#                       (bit 3) so does a FIFO overflow; INT_CFG (bit 4) INT
+#                       is released for 50 us and re-asserted while events
+#                       remain
+#     0x02 INT_STAT     K_INT (bit 0), OVR_FLOW_INT (bit 3); write 1 to clear
+#     0x03 KEY_LCK_EC   bits 3:0 = events in the FIFO
+#     0x04 KEY_EVENT_A  reading takes one event: bit 7 = pressed, bits 6:0 =
+#                       key number = row * 10 + column + 1; 0 = FIFO empty
+#     0x1D-0x1F KP_GPIO1-3   which ROW0-7, COL0-7, COL8-9 pins are keypad pins
+#
+# I2C cannot be done in an interrupt handler here (a transfer waits), so the
+# INT pin's handler only calls tca8418_irq(), which wakes the keyboard
+# thread; the thread drains the FIFO and hands every event to the key map
+# (drivers/input/keymap.ad).  Nothing polls: with no key pressed the thread
+# sleeps and the processor can too.
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, thread_create, sched_running, WAIT_FOREVER
+from drivers.i2c.bus import i2c_write, i2c_read, I2C_OK
+from drivers.input.keymap import keymap_key
+
+TCA_ADDR: uint32 = 0x34
+TCA_CFG: uint32 = 0x01
+TCA_INT_STAT: uint32 = 0x02
+TCA_KEY_LCK_EC: uint32 = 0x03
+TCA_KEY_EVENT_A: uint32 = 0x04
+TCA_KP_GPIO1: uint32 = 0x1D
+TCA_KP_GPIO2: uint32 = 0x1E
+TCA_KP_GPIO3: uint32 = 0x1F
+TCA_CFG_KE_IEN: uint32 = 0x01
+TCA_CFG_OVR_FLOW_IEN: uint32 = 0x08
+TCA_CFG_INT_CFG: uint32 = 0x10
+TCA_INT_K: uint32 = 0x01
+TCA_INT_OVR_FLOW: uint32 = 0x08
+
+tca_wq: WaitQueue
+tca_pending: uint32 = 0             # INT fired since the thread last looked
+tca_ready: uint32 = 0
+tca_events: uint64 = 0              # key events taken from the chip
+tca_overflows: uint64 = 0           # times the chip's FIFO overflowed (keys were lost)
+tca_errors: uint64 = 0              # I2C transfers that failed
+tca_irqs: uint64 = 0
+
+
+def _wr(reg: uint32, v: uint32) -> int32:
+    b: Array[2, uint8]
+    b[0] = cast[uint8](reg)
+    b[1] = cast[uint8](v)
+    r: int32 = i2c_write(TCA_ADDR, &b[0], 2)
+    if r != I2C_OK:
+        tca_errors = tca_errors + 1
+    return r
+
+
+# -1 on a failed transfer, else the register's value.
+def _rd(reg: uint32) -> int32:
+    b: Array[2, uint8]
+    b[0] = cast[uint8](reg)
+    if i2c_write(TCA_ADDR, &b[0], 1) != I2C_OK or i2c_read(TCA_ADDR, &b[1], 1) != I2C_OK:
+        tca_errors = tca_errors + 1
+        return -1
+    return cast[int32](b[1])
+
+
+# Take everything the chip has queued.  Thread context.  Returns the number
+# of events, or -1 when the chip does not answer.
+def tca8418_drain() -> int32:
+    st: int32 = _rd(TCA_INT_STAT)
+    if st < 0:
+        return -1
+    n: int32 = 0
+    if (cast[uint32](st) & TCA_INT_OVR_FLOW) != 0:
+        tca_overflows = tca_overflows + 1
+    while n < 16:
+        ev: int32 = _rd(TCA_KEY_EVENT_A)
+        if ev <= 0:
+            break
+        code: uint32 = cast[uint32](ev) & 0x7F
+        if code >= 1 and code <= 80:
+            keymap_key((code - 1) / 10, (code - 1) % 10, (cast[uint32](ev) >> 7) & 1)
+            tca_events = tca_events + 1
+        n = n + 1
+    _wr(TCA_INT_STAT, cast[uint32](st) & (TCA_INT_K | TCA_INT_OVR_FLOW))
+    return n
+
+
+# From the INT pin's interrupt handler (or the model): something is queued.
+def tca8418_irq():
+    tca_irqs = tca_irqs + 1
+    tca_pending = 1
+    if tca_ready != 0 and sched_running != 0:
+        wq_wake_all(&tca_wq)
+
+
+def _tca_main(arg: uint64) -> int64:
+    while 1 == 1:
+        irq: uint32 = cpu_irq_save()
+        while tca_pending == 0:
+            wq_wait(&tca_wq, WAIT_FOREVER)
+        tca_pending = 0
+        cpu_irq_restore(irq)
+        tca8418_drain()
+    return 0
+
+
+# Configure the chip: `rows` = which of ROW0-7 carry keys (a bit each),
+# `cols` = which of COL0-9.  Starts the keyboard thread when `thread` is
+# set (a test may drain by hand instead).  0, or -1 when the chip does not
+# answer.
+def tca8418_init(rows: uint32, cols: uint32, thread: uint32) -> int32:
+    if _wr(TCA_KP_GPIO1, rows & 0xFF) != I2C_OK:
+        return -1
+    _wr(TCA_KP_GPIO2, cols & 0xFF)
+    _wr(TCA_KP_GPIO3, (cols >> 8) & 0x03)
+    _wr(TCA_INT_STAT, 0x1F)
+    _wr(TCA_CFG, TCA_CFG_KE_IEN | TCA_CFG_OVR_FLOW_IEN | TCA_CFG_INT_CFG)
+    if _rd(TCA_CFG) != cast[int32](TCA_CFG_KE_IEN | TCA_CFG_OVR_FLOW_IEN | TCA_CFG_INT_CFG):
+        return -1
+    if tca_ready == 0:
+        wq_init(&tca_wq)
+        tca_ready = 1
+        if thread != 0:
+            thread_create("keyboard", cast[uint64](&_tca_main), 0, 2, 3072, 0)
+    return 0

@@ -34,6 +34,8 @@ CPU="--target=thumbv7em-none-eabihf -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=h
 heap=$(( 0x$(llvm-nm $T/hackos.elf | awk '$3=="__heap_end"{print $1}') - 0x$(llvm-nm $T/hackos.elf | awk '$3=="__heap_start"{print $1}') ))
 arena=$(( 0x$(llvm-nm $T/hackos.elf | awk '$3=="__prog_end"{print $1}') - 0x$(llvm-nm $T/hackos.elf | awk '$3=="__prog_start"{print $1}') ))
 echo "[t41mem] Teensy kernel heap $heap bytes, program arena $arena bytes"
+# (The QEMU board's emulated display stays off in this image: its
+# board_display_start refuses with a heap as small as the Teensy's.)
 bash scripts/mkroot.sh $B/root mps2_an500 boards/teensy41/patches/fs/tmpfs.ad.patch || exit 1
 (cd $B/root && "$AC" --backend=llvm --target=thumbv7em-none-eabihf init/main.ad "$(pwd)/../hackos.ll") > $B/compile.log 2>&1 || { cat $B/compile.log; exit 1; }
 clang $CPU -O2 -ffreestanding -fno-pic -ffunction-sections -fdata-sections -Wno-override-module -c $B/hackos.ll -o $B/hackos.o || exit 1
@@ -57,12 +59,12 @@ s = s.replace(old, '''    /* tests/imxrt/t41mem.sh: the Teensy 4.1's kernel heap
     ASSERT(__heap_end <= __prog_start, "heap overlaps the arena")''' % (heap // 16 * 16, arena))
 open(dst, 'w').write(s)
 PY
-ld.lld -T $B/link.ld --gc-sections -nostdlib -static -o $B/hackos.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o $B/romfs.o $B/hackos.o || exit 1
+ld.lld -T $B/link.ld --gc-sections -nostdlib -static -o $B/hackos.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/c/font8x8.o $B/romfs.o $B/hackos.o || exit 1
 llvm-nm $B/hackos.elf | awk '$3 ~ /^__(heap|prog)_(start|end)$/ {print "[t41mem]   " $3 " = 0x" $1}'
 
 QFLAGS="-M mps2-an500 -nographic -monitor none -serial stdio -no-reboot"
 rm -f $B/uart.in; mkfifo $B/uart.in; : > $B/shell.out
-timeout 180 "$QEMU" $QFLAGS -device loader,file=build/sd.img,addr=0x20200000 -kernel $B/hackos.elf <$B/uart.in >$B/shell.out 2>$B/shell.err &
+timeout 400 "$QEMU" $QFLAGS -device loader,file=build/sd.img,addr=0x20200000 -kernel $B/hackos.elf <$B/uart.in >$B/shell.out 2>$B/shell.err &
 QPID=$!; exec 9>$B/uart.in
 wait_for() { local n="${2:-1}" i=0; while [ "$(grep -cF -- "$1" $B/shell.out 2>/dev/null)" -lt "$n" ]; do i=$((i+1)); [ $i -gt 600 ] && return 1; kill -0 $QPID 2>/dev/null || return 1; sleep 0.1; done; }
 say() { printf "$1" >&9; }

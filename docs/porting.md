@@ -2,8 +2,8 @@
 <!-- Copyright (C) 2026 David Hamner -->
 # Porting HackOS to a new board
 
-HackOS runs on three boards so far: QEMU `mps2-an500` (Cortex-M7, the test
-machine), the Teensy 4.1 (i.MX RT1062, Cortex-M7) and the Adafruit
+HackOS runs on four boards so far: QEMU `mps2-an500` (Cortex-M7, the test
+machine) and `mps2-an386` (Cortex-M4F, `BOARD=qemu-m4`), the Teensy 4.1 (i.MX RT1062, Cortex-M7) and the Adafruit
 Feather nRF52840 (Cortex-M4F). This note says what a new one needs, in
 the order to write it. The last two are UNTESTED ON HARDWARE; their docs
 in `docs/boards/` say how each was checked without the board.
@@ -42,6 +42,12 @@ A board directory holds five files:
 | `board_code_loaded(base, size)` | after code was written to RAM (I-cache invalidate on the M7) |
 | `board_late_init()` | after `kernel_init`: the boot report (clocks, chip id), the heartbeat thread |
 | `board_halt(code)` | last call before the reset: flush the UART; for a code other than 0, signal it and stop |
+| `board_cpu_name()` | for the banner |
+| `board_console_rx_throttle(on)` | hold the console's sender off / let it go (flow control, or the receive interrupt off where the emulator back-pressures); may do nothing |
+| `board_console_tee(c)` | every console byte, for a display; empty without one |
+| `board_tick_stop_for(ticks)`, `board_tick_resume()` | tickless idle (docs/power.md); return 0 to keep the periodic tick |
+| `board_suspend(ms, sources, res)` | suspend; return 0 when not supported |
+| `board_display_start()`, `board_input_start()` (in `devices.ad`, imported as `board.devices` by the system image) | put the console on a display / attach a keyboard (docs/display-input.md); return -1 without one |
 
 ## 3. A new board on a chip family HackOS knows
 

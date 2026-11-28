@@ -24,11 +24,8 @@
 #   board_code_loaded      after a program image was written to RAM
 #   board_halt             last call before the system reset of hackos_exit
 
-from kernel.cpu import mmio_read32, mmio_write32, cpu_irq_enable, cpu_irq_disable
+from kernel.cpu import mmio_read32, mmio_write32
 from kernel.block.blk import blk_init
-from kernel.sched.core import sched_running, sched_in_handler
-from drivers.display.fakepanel import fakepanel_setup
-from drivers.display.dispcon import dispcon_start, dispcon_putc, dispcon_sync
 from kernel.tickless import systick_stop_for, systick_resume, systick_suspend
 
 
@@ -157,44 +154,27 @@ def board_code_loaded(base: uint64, size: uint64):
 # hackos_exit(code) calls this, then requests a system reset (which ends
 # QEMU under -no-reboot).
 def board_halt(code: uint32):
-    if sched_running != 0 and sched_in_handler() == 0:
-        # what was printed last reaches the panel: that takes the scheduler
-        # (the panel is busy for a while after each refresh), and
-        # hackos_exit has interrupts off
-        cpu_irq_enable()
-        dispcon_sync()
-        cpu_irq_disable()
+    if board_halt_set != 0:
+        h: Fn[int32] = board_halt_fn
+        h()
     return
 
 
-# ---- the display: a fake e-paper panel on the second UART ------------------
-# UART1 (CMSDK APB UART at 0x40005000) is the fake panel's byte sink
-# (drivers/display/fakepanel.ad); the test harness has QEMU write it to a
-# file (-serial file:...), and tests/display/panel2png.py turns that into
-# PNG frames.  Without a second -serial the bytes go nowhere.
-def board_panel_out(c: uint32) -> int32:
-    while (mmio_read32(0x40005004) & 1) != 0:
-        c = c
-    mmio_write32(0x40005000, c & 255)
-    return 0
+# Every byte the console prints (drivers/tty/console.ad) and the last call
+# before a reset go to the board's devices, where there are any
+# (boards/*/devices.ad sets these when the system image starts a display).
+# Function pointers, so that this file, which every image imports, does not
+# pull the display and keyboard code into images that have no scheduler.
+board_tee_fn: Fn[int32, uint32]
+board_tee_set: uint32 = 0
+board_halt_fn: Fn[int32]
+board_halt_set: uint32 = 0
 
 
-def board_panel_port_init():
-    mmio_write32(0x40005010, 16)         # the fastest divider the model takes
-    mmio_write32(0x40005008, 1)          # TX_EN
-
-
-# The console also appears on a display: an 800 x 480 fake panel (the size
-# of the HackerSlide's e-paper), 100 x 30 text cells.  Called by the system
-# image; the kernel test image drives the display code itself.
-def board_display_start() -> int32:
-    board_panel_port_init()
-    return dispcon_start(fakepanel_setup(800, 480, 1, board_panel_out), 2)
-
-
-# Every byte the console prints (drivers/tty/console.ad).
 def board_console_tee(c: uint32):
-    dispcon_putc(c)
+    if board_tee_set != 0:
+        f: Fn[int32, uint32] = board_tee_fn
+        f(c)
 
 
 def board_console_init():

@@ -4,7 +4,7 @@
 
 from kernel.start import hackos_start
 from kernel.fault import hackos_fault
-from kernel.trap import hackos_thread_fault
+from kernel.trap import hackos_thread_fault, trap_init
 from kernel.syscall import syscall_dispatch, syscall_init
 from kernel.sched.core import sched_init, sched_start, sched_pick, systick_handler
 from kernel.mpu import mpu_init
@@ -20,6 +20,7 @@ def kernel_init():
     mpu_init()
     sched_init()
     syscall_init()
+    trap_init()
     console_init()
     vfs_init()
     vfs_fat_mount()

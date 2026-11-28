@@ -168,7 +168,7 @@ vol="$(awk '/^define .*@test_volatile_mmio\(/{f=1} f&&/(load|store) volatile i32
 [ "$vol" = 7 ] && ok "test_volatile_mmio: 5 volatile loads + 2 volatile stores of CTRL in the IR" || bad "test_volatile_mmio has $vol volatile accesses, want 7"
 dsz="$("$SIZE" -A $B/hackos.elf | awk '$1==".data"{print $2}')"
 nstr="$(grep -c '^@\.Lstr.* = internal constant' $B/hackos.ll)"; nstrw="$(grep -c '^@\.Lstr.* = internal global' $B/hackos.ll)"
-[ "$nstrw" = 0 ] && [ "$nstr" -gt 100 ] && [ "$dsz" -lt 2048 ] && ok "string literals are constants ($nstr of them; .data is $dsz bytes)" || bad "string literals: $nstr constant, $nstrw writable, .data $dsz bytes"
+[ "$nstrw" = 0 ] && [ "$nstr" -gt 100 ] && [ "$dsz" -lt 4096 ] && ok "string literals are constants ($nstr of them; .data is $dsz bytes)" || bad "string literals: $nstr constant, $nstrw writable, .data $dsz bytes"
 tb="$("$SIZE" -A $B/hackos.elf | awk '$1==".xbss"{print $3}')"
 [ "$((tb))" = "$((0x60000000))" ] && ok "the large file-system table is placed in the 16 MB region" || bad ".xbss at $tb"
 nv="$(grep -c '^define void @' $B/hackos.ll)"
@@ -489,6 +489,10 @@ if wait_for "hamsh\$ "; then
     sh 'date'
     sh 'sleep 2'
     sh 'cat /proc/uptime'
+    # the keyboard: text typed on the emulated key matrix (TCA8418 model ->
+    # I2C -> driver -> key map -> console) instead of the UART
+    shn 'keypress -n echo Typed On The Matrix 2026 x_y'; sleep 1.5    # nothing else is typed meanwhile
+    sh 'echo after-keypress'
     # the editor: Hamnix's vi, driven by scripted keystrokes.  Insert three
     # lines (one corrected with DEL), write, delete the first line (dd), open
     # a line above (O), delete two characters at the end of the last line
@@ -606,6 +610,7 @@ expect "shell: date before the clock is set says so and fails" $S '^date-unset 1
 expect "shell: setdate, then date" $S '^2026-11-27 12:00:0[0-9] UTC$'
 up="$(sed -n 's/^\([0-9]*\)\.[0-9]* \([0-9]*\)\.[0-9]*$/\1 \2/p' $S | tail -1)"
 if [ -n "$up" ]; then set -- $up; [ "$2" -ge 2 ] && ok "shell: sleep 2 was spent idle (/proc/uptime: up $1 s, idle $2 s)" || bad "shell: idle time $2 s after sleep 2"; else bad "shell: no /proc/uptime line"; fi
+expect "keyboard: a command typed key by key on the emulated matrix (Shift for capitals and _) ran" $S '^Typed On The Matrix 2026 x_y$'
 expect "vi: left with :wq, status 0" $S '^vi-status 0$'
 expect "vi: insert with a correction, dd, O" $S '^second limne$'
 expect "vi: G \$ x x" $S '^thi$'

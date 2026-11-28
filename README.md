@@ -10,27 +10,66 @@ system (it needs the `cortex-m7` branch of
 [ruapotato/adder](https://github.com/ruapotato/adder/tree/cortex-m7)), and is meant to reuse Hamnix's file-system layer, libraries and shell
 on top of a new kernel that needs no page tables.
 
-## Status: milestone 3, emulator only
+## Status: milestone 4, emulators only
 
-**A shell prompt that runs real programs, in the emulator.** HackOS boots to
-Hamnix's shell, `hamsh`, on the serial console. The shell is an unprivileged
-process loaded from a file; so are `ls`, `cat`, `grep` and the other programs
-it runs. Pipelines, redirections and shell scripts work. All of it runs in
-QEMU's `mps2-an500` machine (an ARM development board model with a
-Cortex-M7). Nothing here has run on real hardware; QEMU does not model the
-i.MX RT1170, so no HackerSlide peripheral is touched.
+**A shell prompt that runs real programs, an editor, a display and a
+keyboard to run them on, and a processor that sleeps when there is nothing
+to do: all in emulators.** HackOS boots to Hamnix's shell, `hamsh`, on the
+serial console. The shell is an unprivileged process loaded from a file; so
+are `ls`, `cat`, `grep`, `vi` and the other 30 programs it runs. It runs in
+QEMU's `mps2-an500` (Cortex-M7) and `mps2-an386` (Cortex-M4F) machines and,
+as the Feather nRF52840 image, in Renode. Nothing here has run on real
+hardware.
 
 ```
 hamsh$ ls /bin | grep h | wc
-5 5 27
-hamsh$ echo second line >> /tmp/note
-hamsh$ cat /sd/README.TXT
+hamsh$ vi /tmp/notes
+hamsh$ ptest loop &
+hamsh$ ps
+hamsh$ idlestat 3
+idlestat, tickless: 3000 ms, of them idle 2999
+  processor wake-ups from sleep: 6.6 per second (20)
+hamsh$ suspend 30
 ```
 
-Works, and is checked by `make test`:
+New in milestone 4 (all checked by `make test`, `make test-m4`,
+`make test-nrf52`):
 
-- **Ctrl-C** ends the foreground program, whether it loops in its own code
-  or waits inside the kernel.
+- **Power** ([`docs/power.md`](docs/power.md)). Tickless idle: with nothing
+  runnable the periodic tick is stopped until the next timer is due. An idle
+  system is woken about 6 times a second instead of 1000 (measured in QEMU
+  and Renode; current cannot be measured without hardware). `suspend` stops
+  the whole system until a key or a time.
+- **An editor**: Hamnix's `vi`, copied unmodified, tested with scripted
+  keystrokes.
+- **A display and a keyboard before the hardware**
+  ([`docs/display-input.md`](docs/display-input.md)): a frame buffer, an
+  e-paper driver model (full and partial refresh, busy, ghosting), a text
+  screen for the console, a TCA8418 scanner driver and a key map; with a
+  fake panel that leaves PNG frames and a register model of the scanner.
+  The tests read the text back out of the PNG.
+- **More of the shell**, tested: background jobs and `jobs`, `kill PID`,
+  `> file 2>&1`, `def`, history (also across `exit`), Tab completion, and
+  Ctrl-C for a whole pipeline. Here-documents do not exist in this hamsh.
+- **More programs** from Hamnix, unmodified: `mv touch tail sort uniq tr
+  date df free ps kill od tee cut seq vi`; HackOS's own `sleep setdate
+  suspend idlestat keypress`. `/proc` has what `ps`, `free`, `df` and
+  `date` read.
+- **Holes closed**: a new program starts with zeroed registers, floating
+  point included; a process can bind only pipes and files it holds; console
+  input survives a pasted block (the sender is held off); the Cortex-M4
+  path runs the full kernel test suite (`make test-m4`), which found that
+  a context switch could write a thread's registers into its stack guard or
+  below a process's memory: the switch now checks for room first. System
+  call 266 instructions (milestone 3: 464; milestone 2: 379); context switch
+  227 (232; 200), of which about 20 are that check and the one that keeps
+  floating-point values from crossing between threads.
+- **Audio**: a design note only, [`docs/audio.md`](docs/audio.md).
+
+Works since milestone 3, and is checked by `make test`:
+
+- **Ctrl-C** ends the foreground program or pipeline, whether it loops in
+  its own code or waits inside the kernel.
 - **Processes without an MMU.** A program is a position-independent ELF
   executable. The loader copies it from the file system into one block of
   memory (stack at the bottom, code and data above), applies its relocations,
@@ -44,24 +83,24 @@ Works, and is checked by `make test`:
 - **Pipes and `/fd` names**, the one part of Hamnix's namespace model its
   shell cannot do without: `/fd/0`.. are names bound per process to the
   console, a pipe end or a file.
-- **Hamnix's shell and nine of its programs**, copied from Hamnix: `echo cat
-  ls cp rm mkdir wc head grep` under `/bin`, which is a read-only table of
-  files inside the kernel image, read in place. The shell's source differs
-  from Hamnix's by a patch of 41 lines that makes its static tables smaller.
-- **Files.** Hamnix's RAM file system at `/` (now 8 KiB for a small file
-  instead of 128 KiB), devices at `/dev`, and Hamnix's FAT32 code at `/sd`
-  over a RAM disk that the emulator preloads with an image: read, create,
-  append, overwrite, remove, run programs from it.
+- **Hamnix's shell and programs**, copied from Hamnix, under `/bin`, which
+  is a read-only table of files inside the kernel image, read in place. The
+  shell's source differs from Hamnix's by a patch of 41 lines that makes its
+  static tables smaller.
+- **Files.** Hamnix's RAM file system at `/` (8 KiB for a small file),
+  devices at `/dev`, `/proc`, and Hamnix's FAT32 code at `/sd` over a RAM
+  disk that the emulator preloads with an image: read, create, append,
+  overwrite, remove, run programs from it.
 - **Threads, synchronisation, system calls, memory protection, heap,
-  console, C code in the image**: the kernel core of milestone 2, unchanged
-  in behaviour. System calls are numbered like Hamnix's native interface
-  where the calls match; see [`docs/syscalls.md`](docs/syscalls.md).
+  console, C code in the image**: the kernel core of milestone 2. System
+  calls are numbered like Hamnix's native interface where the calls match;
+  see [`docs/syscalls.md`](docs/syscalls.md).
 - Runs end with a status line and a system reset; nothing depends on a
-  debugger channel (semihosting is gone).
+  debugger channel.
 
-Does not exist yet: signals other than Ctrl-C ending the foreground
-program, threads inside a process, shared libraries, a way to compile on
-the device, USB, PSRAM.
+Does not exist yet: signals a program can catch, threads inside a process,
+shared libraries, a way to compile on the device, USB, PSRAM, a driver for a
+real display or keyboard, a persistent file system on flash, audio.
 
 ## A second board: the Teensy 4.1 (UNTESTED ON HARDWARE)
 
@@ -130,19 +169,27 @@ everything here from source, and runs:
 3. static checks on the linked images (vector tables, the empty null-guard
    area, constants in read-only memory, no undefined symbols);
 4. the run-time self-test from milestone 1 (arithmetic, FPU, start-up);
-5. the kernel tests: one image, 163 counted checks, including processes
-   (isolation, faults, spawn, rfork, exec, wait), pipes and FAT, with console
-   input typed into the emulated UART by the harness;
+5. the kernel tests: one image, 197 counted checks, including processes
+   (isolation, faults, spawn, rfork, exec, wait), pipes, FAT, power (tickless
+   idle, suspend), the display stack and the keyboard stack, with console
+   input typed into the emulated UART by the harness; then the fake panel's
+   output is turned into PNG frames and the text read back from the pixels;
 6. a scripted session with the kernel monitor (`build/monitor.elf`);
 7. an image that faults before the scheduler starts, for the fatal report;
 8. a scripted session with the shell: pipelines, redirections, a faulting
-   program, the FAT volume, and a script file run by a second shell.
+   program, the FAT volume, a script file run by a second shell, jobs, kill,
+   history, completion, the editor, a command typed on the emulated key
+   matrix, idle and suspend measurements, a pasted block; and the same
+   session as the fake e-paper panel showed it.
 
 Every check prints `PASS` or `FAIL`; the number of `PASS` lines must equal the
 number of checks in the source, so a check that does not run is a failure.
 The kernel tests use QEMU's instruction counter as the clock, which makes the
 tick-exact timing checks independent of the host's load; the two typed
 sessions run in real time.
+
+`make test-m4` runs parts 5 and 8 again on QEMU's Cortex-M4F machine
+(`BOARD=qemu-m4`: single-precision FPU, software float64, 8-region MPU).
 
 Other targets: `make size`, `make measure` (code size of small functions
 against the same functions in C; sizes of the image and of every program),
@@ -207,6 +254,16 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `docs/boards/teensy41.md` | flashing, wiring, first power-up, bring-up checklist, memory |
 | `docs/boards/feather-nrf52840.md` | the same for the Feather nRF52840 |
 | `docs/porting.md` | what a new board, chip family or architecture needs |
+| `docs/power.md` | tickless idle, suspend, the board's hooks, what was measured |
+| `docs/display-input.md` | frame buffer, e-paper driver model, fake panel and PNG frames, text screen; TCA8418 driver, key map, the chip model; the I2C bus interface |
+| `docs/audio.md` | design note for an audio path (no implementation) |
+| `boards/mps2_an386/` | QEMU's Cortex-M4F machine (`BOARD=qemu-m4`, `make test-m4`) |
+| `kernel/power.ad`, `kernel/tickless.ad` | suspend and the power counters; stopping and resuming a SysTick tick |
+| `fs/procfs.ad` | `/proc` |
+| `drivers/display/` | frame buffer, panel driver model, fake panel, text screen, the console's display thread, the font wrapper |
+| `drivers/input/` | TCA8418 scanner driver, its register model, the key map |
+| `tests/display/panel2png.py` | the fake panel's records to PNG frames, and text read back from them |
+| `tests/m4/` | `make test-m4` |
 
 Assembly is five files (about 740 lines): what the processor requires at
 exception entry and exit, register access, the calling-convention shims, and
@@ -237,12 +294,11 @@ linked. A C file works the same way (`user/progs/crel.c`).
 - Nothing has run on hardware. The QEMU board's tables are sized for its
   16 MB; the Teensy 4.1's (1 MB) are smaller by per-board patches, with the
   limits listed in docs/boards/teensy41.md.
-- **No signals, one exception.** Ctrl-C ends the process group the shell
-  has named as the foreground one (`tcsetpgrp`), with status 130. Hamnix's
-  shell names a group for a single foreground command, not for a pipeline:
-  a pipeline that hangs cannot be stopped. There is no `kill`, no Ctrl-Z,
-  and no end-of-file key while the console is in raw mode: `wc` typed without
-  a redirection waits until Ctrl-C.
+- **No signals.** Ctrl-C ends the foreground command or pipeline (status
+  130), `kill PID` any process (137). There is no Ctrl-Z, and no end-of-file
+  key while the console is in raw mode: `wc` typed without a redirection
+  waits until Ctrl-C. While pasted input is being held off (more than half a
+  ring of unread input), Ctrl-C is held with it.
 - **`rfork` is vfork.** A built-in command inside a pipeline, a `{ }` block
   after `&`, and everything else where Hamnix's shell forks and keeps running
   shell code works only as far as vfork allows: the child runs in the shell's
@@ -253,10 +309,17 @@ linked. A C file works the same way (`user/progs/crel.c`).
 - A process block is readable, writable and executable throughout: a program
   can overwrite its own code. Its size is fixed at start; there is no way to
   grow a heap.
-- Registers are not cleared when a program starts: a new process can see
-  floating-point register values left by whatever ran before it.
+- The shell and the editor poll for input; the kernel turns their polling
+  into waiting (docs/power.md), which leaves four wake-ups a second while
+  idle. `kill` ends a process outright; nothing can be caught.
+- The display stack has only ever driven the fake panel; scrolling costs a
+  full refresh per line. The keyboard layout is provisional. No SPI
+  interface, no nRF52 I2C driver, no persistent file system on flash.
 - A process is one thread. 32 threads and processes in all, 16 descriptors
-  and 16 `/fd` names each, 16 pipes.
+  and 16 `/fd` names each, 16 pipes. hamsh quirks seen: no here-documents
+  (`cat << EOF` is `cat` on the console); a word ending in `:` starts a
+  block, so `cut -d:` must be written `cut -d ":"`; `kill %1` does not
+  parse, `kill PID` does; a number such as `01` is printed as `1`.
 - The shell is large: a 400 KB file and a 2 MB block per running instance.
 - FAT: FAT32 only, new names 8.3 only, no `mkdir`, no rename, no redirection
   to a file on it, one volume.
@@ -277,8 +340,8 @@ Files copied from Hamnix (`fs/HAMNIX_ORIGIN`: the file systems, the shell, the
 programs and their libraries) are GPL-3.0-or-later by the same author. `third_party/` holds code under its own licences (currently
 BSD-3-Clause: Sensirion's driver, NXP's RT1062 device files, Nordic's
 nRF52840 device headers; Apache-2.0 WITH LLVM-exception: LLVM compiler-rt's
-software double precision), each with its licence file and an `UPSTREAM`
-record. Of Adafruit's bootloader (MIT) and Arduino core (LGPL-2.1) nothing
+software double precision; public domain: Daniel Hepper's font8x8), each
+with its licence file and an `UPSTREAM` record. Of Adafruit's bootloader (MIT) and Arduino core (LGPL-2.1) nothing
 is copied: `tests/nrf52/feather_facts.txt` records extracted numbers (pins,
 addresses, keys), with the sources' commits and hashes. Nothing of PJRC's Teensy core is
 copied (its licence adds a condition to MIT's); its pin table and boot block

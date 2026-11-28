@@ -310,6 +310,34 @@ is not in the ROM table), or (b) XIP: the QSPI peripheral maps the flash at
 loader to run code there. Renode has no QSPI model, so either would be
 untested.
 
+### Milestone 4 update (measured in Renode, 2026-11-27)
+
+| | bytes |
+|--|--|
+| flash: kernel text | 170,688 (was 126,920) |
+| flash: `/bin`, 33 programs run in place | about 300,600 (was 247,976) |
+| `.data` / `.bss` and tables | 1,888 / 36,488 |
+| kernel heap | 49,408; 7,216 in use at boot; 39,000-42,700 at the session's peak |
+| program arena | 163,840 (unchanged) |
+
+Beside the shell (114,688 bytes) the arena has one 32 KB and one 16 KB gap.
+New programs: `vi` 24 KB (it edits 200 lines of 79 characters here), `sort`
+24 KB (48 lines), `tail` 20 KB, `cut` 16 KB, the rest 5-10 KB. So: the shell
+plus **one** of `vi`, `sort`, `grep`, `ptest`; or a pipeline of small
+programs (start the biggest stage first: `sort < f | head`, not
+`cat f | sort`). The kernel heap is the binding limit late in a long
+session: 4 KB per process, 1 KB per pipe, 2 KB and up per file in `/`.
+The init thread's stack is 4 KB (2,460 bytes used). The halt report now
+lists the kernel threads' stacks, the console's counters and a guard word
+behind the UART's DMA buffer.
+
+Power: tickless idle on RTC1 (about 6.6 processor wake-ups per second at an
+idle shell in Renode, 1000 with the periodic tick); `suspend [SECONDS] [-n]`
+(docs/power.md). Console flow control: XON/XOFF by default (`picocom --flow
+x`), optional RTS (`CONSOLE_RTS_PIN` in `boards/feather_nrf52840/board.ad`).
+All UNTESTED ON HARDWARE; add to the bring-up checklist: paste a block of
+text, `idlestat 5`, `suspend 10`, `suspend 10 -n` with a current meter.
+
 ## 8. How this board is put together
 
 | Path | What |

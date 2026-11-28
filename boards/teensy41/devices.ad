@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS board devices: Teensy 4.1.  No display driver and no keyboard are bound
+# on this board yet: the console is the UART alone.  drivers/display/ has
+# the frame buffer, the panel driver model and the text screen;
+# drivers/input/ the TCA8418 driver and the key map.  A board with the parts
+# registers a panel and calls dispcon_start, registers its I2C controller,
+# wires the scanner's INT pin to tca8418_irq() and calls tca8418_init, as
+# boards/mps2_an500/devices.ad does for the emulated ones.
+
+
+def board_display_start() -> int32:
+    return -1
+
+
+def board_input_start() -> int32:
+    return -1

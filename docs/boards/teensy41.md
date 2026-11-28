@@ -203,6 +203,17 @@ shell and the coreutils at the sizes above; it **is** required for the
 compiler on the device (milestone-3 report, section 14) and for anything
 with a working set beyond ~256 KB.
 
+### Milestone 4 update
+
+The image is 463,944 bytes of text, 2,400 of data, 101,424 of bss; 33
+programs. `vi` holds 1024 lines of 127 characters here and `sort` 256 lines
+(size patches). Not on this board yet: tickless idle and suspend (the hooks
+say "not supported": SysTick here counts a 100 kHz reference; a GPT would be
+the time base), console flow control (no pins: a full input ring drops and
+counts), the display and keyboard stacks (no driver for a real panel or the
+scanner's bus). Nothing new was exercised for this board beyond the build
+and its existing checks.
+
 ## 8. Notes for the HackerSlide board (i.MX RT1176)
 
 `soc/imxrt/` (LPUART, LPI2C, LPSPI, GPIO, uSDHC, IOMUXC call form, delay)

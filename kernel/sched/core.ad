@@ -27,7 +27,7 @@
 #     opens exactly that block to it (kernel/proc.ad has the loader, exec,
 #     rfork and wait).  One thread per process.
 #
-# The first eighteen words of Thread (up to and including `state`) are read
+# The first twenty-one words of Thread (up to and including `state`) are read
 # and written by switch.S at fixed offsets; do not move them.
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq_disable, cpu_irq_enable, mmio_read32, mmio_write32
@@ -92,9 +92,13 @@ class Thread:
                                     #    (zeros; r9 = an RWPI program's static base), zeroes
                                     #    the FP registers and clears this
     svc_regs: Array[8, uint32]      # 32 caller's r4-r11 at system-call entry
+    klo: uint32                     # 64 lowest address the context switch may save at on the
+                                    #    kernel stack (above its guard)
+    ulo: uint32                     # 68 ... on the thread's own stack while it runs unprivileged
+    uhi: uint32                     # 72 end of the memory that stack pointer may be in
     # ---- scheduler ----
-    tid: uint32                     # 64
-    state: volatile uint32          # 68 written by interrupt handlers; read by switch.S
+    tid: uint32                     # 76
+    state: volatile uint32          # 80 written by interrupt handlers; read by switch.S
     prio: uint32                    # effective priority
     base_prio: uint32
     slice: uint32
@@ -171,6 +175,10 @@ sched_spawn_hook_set: uint32 = 0
 sched_deadlock_hook: Fn[int64, uint64]
 sched_deadlock_hook_set: uint32 = 0
 reaper_wq: WaitQueue
+# Prints "thread/process N ended: stack overflow" for sched_bad_stack
+# (kernel/trap.ad sets it; the scheduler does not print).
+sched_report_hook: Fn[int64, uint64, uint64]
+sched_report_hook_set: uint32 = 0
 # The process group that has the terminal (tcsetpgrp); 0 = none.  Ctrl-C at
 # the console ends the processes of this group (sched_kill_group).
 tty_fg_pgid: uint32 = 0
@@ -500,6 +508,23 @@ def thread_poll_wait():
     cpu_irq_restore(irq)
 
 
+# The context switch found no room for the outgoing thread's context where
+# its stack may be (arch/armv7m/switch.S): its stack has overflowed, or its
+# stack pointer is not in its own memory.  Handler mode; the thread is
+# ended and never resumed.
+sched_bad_stacks: uint32 = 0
+
+
+def sched_bad_stack(sp: uint64):
+    t: uint64 = sched_current
+    if thr(t)[0].state == T_ZOMBIE or thr(t)[0].state == T_UNUSED:
+        return                          # already ended (a fault moved its stack pointer away): nothing to save anyway
+    sched_bad_stacks = sched_bad_stacks + 1
+    if sched_report_hook_set != 0:
+        sched_report_hook(t, sp)
+    thread_kill_current_from_fault(139, 1, cast[uint32](sp))
+
+
 # Exception 15, once per tick.
 def systick_handler():
     irq: uint32 = cpu_irq_save()
@@ -679,6 +704,7 @@ def _thread_kstack(t: Ptr[Thread], ksz: uint32) -> int32:
     if t[0].kstack_base == 0:
         return -1
     t[0].kstack_top = cast[uint32](t[0].kstack_base) + ksz
+    t[0].klo = cast[uint32](t[0].kstack_base) + STACK_GUARD
     kw: Ptr[uint32] = cast[Ptr[uint32]](t[0].kstack_base)
     i: uint32 = 0
     while i < ksz / 4:
@@ -737,6 +763,8 @@ def thread_create(name: Ptr[uint8], entry: uint64, arg: uint64, prio: uint32, st
             uw[i] = STACK_FILL
             i = i + 1
         top = cast[uint32](t[0].ustack_base) + ssz
+        t[0].ulo = cast[uint32](t[0].ustack_base) + STACK_GUARD
+        t[0].uhi = top
     # Initial context: {r4-r11} then the exception frame the first switch
     # "returns" through.
     f: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](top - 64))

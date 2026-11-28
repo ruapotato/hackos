@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS board devices: QEMU `mps2-an500`.  The display and the keyboard of this
+# board, both emulated (docs/display-input.md).  Imported as board.devices
+# by the system image and the kernel test image only; board.ad stays free of
+# anything that needs the scheduler.
+
+from kernel.cpu import mmio_read32, mmio_write32, cpu_irq_enable, cpu_irq_disable
+from kernel.sched.core import sched_running, sched_in_handler
+from board.board import board_tee_fn, board_tee_set, board_halt_fn, board_halt_set
+from drivers.display.fakepanel import fakepanel_setup
+from drivers.display.dispcon import dispcon_start, dispcon_putc, dispcon_sync
+from drivers.input.keymap import keymap_init, keymap_find
+from drivers.input.tca8418 import tca8418_init
+from drivers.input.tca8418_model import tca_model_attach, tca_model_key
+from fs.procfs import proc_keys_fn, proc_keys_set
+from mm.slab import kheap
+from mm.heap import heap_total
+
+
+# ---- the display: a fake e-paper panel on the second UART ------------------
+# UART1 (CMSDK APB UART at 0x40005000) is the fake panel's byte sink
+# (drivers/display/fakepanel.ad); the test harness has QEMU write it to a
+# file (-serial file:...), and tests/display/panel2png.py turns that into
+# PNG frames.  Without a second -serial the bytes go nowhere.
+def board_panel_out(c: uint32) -> int32:
+    while (mmio_read32(0x40005004) & 1) != 0:
+        c = c
+    mmio_write32(0x40005000, c & 255)
+    return 0
+
+
+def board_panel_port_init():
+    mmio_write32(0x40005010, 16)         # the fastest divider the model takes
+    mmio_write32(0x40005008, 1)          # TX_EN
+
+
+# The console also appears on a display: an 800 x 480 fake panel (the size
+# of the HackerSlide's e-paper), 100 x 30 text cells.  Called by the system
+# image; the kernel test image drives the display code itself.
+def _dev_tee(c: uint32) -> int32:
+    dispcon_putc(c)
+    return 0
+
+
+# Before the reset: what was printed last reaches the panel.  That takes the
+# scheduler (the panel is busy for a while after each refresh), and
+# hackos_exit has interrupts off.
+def _dev_halt() -> int32:
+    if sched_running != 0 and sched_in_handler() == 0:
+        cpu_irq_enable()
+        dispcon_sync()
+        cpu_irq_disable()
+    return 0
+
+
+def board_display_start() -> int32:
+    # The frame buffer is 48 KB of kernel heap.  This board's own heap is
+    # megabytes; tests/imxrt/t41mem.sh runs it with the Teensy's 170 KB to
+    # try the Teensy's memory budget, and the Teensy has no display.
+    if heap_total(&kheap) < 0x100000:
+        return -1
+    board_panel_port_init()
+    r: int32 = dispcon_start(fakepanel_setup(800, 480, 1, board_panel_out), 2)
+    if r == 0:
+        board_tee_fn = _dev_tee
+        board_tee_set = 1
+        board_halt_fn = _dev_halt
+        board_halt_set = 1
+    return r
+
+
+# ---- the keyboard: an emulated TCA8418 on the software I2C bus -----------
+# The driver, the key map and the console path are the device's; only the
+# chip is a model (drivers/input/tca8418_model.ad).  /proc/keys is the
+# finger: text written there is typed key by key, modifiers held as the
+# layout needs them.
+def _board_type_keys(msg: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        k: uint32 = keymap_find(cast[uint32](msg[i]))
+        if k != 0xFFFFFFFF:
+            row: uint32 = k & 0xFF
+            col: uint32 = (k >> 8) & 0xFF
+            if (k & 0x10000) != 0:
+                tca_model_key(3, 0, 1)          # Shift down
+            if (k & 0x40000) != 0:
+                tca_model_key(3, 1, 1)          # Fn down
+            tca_model_key(row, col, 1)
+            tca_model_key(row, col, 0)
+            if (k & 0x40000) != 0:
+                tca_model_key(3, 1, 0)
+            if (k & 0x10000) != 0:
+                tca_model_key(3, 0, 0)
+        i = i + 1
+    return 0
+
+
+# Called by the system image.  0, or -1.
+def board_input_start() -> int32:
+    keymap_init()
+    if tca_model_attach() != 0:
+        return -1
+    if tca8418_init(0x3F, 0x3FF, 1) != 0:
+        return -1
+    proc_keys_fn = _board_type_keys
+    proc_keys_set = 1
+    return 0

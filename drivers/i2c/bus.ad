@@ -2,11 +2,23 @@
 # Copyright (C) 2026 David Hamner
 # HackOS -- I2C bus, software side.
 #
-# A device is an address plus a write and a read function.  There is no I2C
-# controller driver yet (the emulated board's is not modelled usefully and the
-# target's LPI2C needs the real chip), so the only devices are ones attached
-# in software: tests attach an emulated sensor.  A controller driver will
-# provide the same two entry points for real devices.
+# One interface for everything that talks I2C, on every board:
+#     i2c_write(addr, data, n)      write n bytes to the device at addr
+#     i2c_read(addr, data, n)       read n bytes from it
+# Behind it are two kinds of thing:
+#   * devices attached in software (i2c_attach): register models, used to
+#     develop and test drivers before the hardware exists (the SHT4x and
+#     TCA8418 models);
+#   * one controller (i2c_set_controller): the board's real bus, two
+#     functions (addr, data, n) -> I2C_OK or I2C_NACK.  A transfer to an
+#     address no software device has goes there.  A board registers its
+#     controller's functions bound to the right instance: the nRF52's TWI
+#     (soc/nrf52/twi.ad, exercised in Renode against its SI70xx model), the
+#     i.MX RT's LPI2C (soc/imxrt/lpi2c.ad: written, not yet registered by
+#     the Teensy board).
+# A register read is a write of the register number followed by a read; a
+# controller that can do a repeated START between the two may; nothing here
+# depends on it.
 
 I2C_MAX_DEV: uint32 = 8
 I2C_OK: int32 = 0
@@ -22,6 +34,17 @@ class I2cDev:
 
 i2c_devs: Array[8, I2cDev]
 i2c_transfers: uint64 = 0
+i2c_ctl_wr: Fn[int32, uint32, Ptr[uint8], uint32]
+i2c_ctl_rd: Fn[int32, uint32, Ptr[uint8], uint32]
+i2c_ctl_set: uint32 = 0
+i2c_ctl_transfers: uint64 = 0       # transfers that went to the controller
+
+
+# The board's real bus (see the top of the file).
+def i2c_set_controller(wr: Fn[int32, uint32, Ptr[uint8], uint32], rd: Fn[int32, uint32, Ptr[uint8], uint32]):
+    i2c_ctl_wr = wr
+    i2c_ctl_rd = rd
+    i2c_ctl_set = 1
 
 
 def i2c_attach(addr: uint32, wr: uint64, rd: uint64) -> int32:
@@ -59,7 +82,11 @@ def _i2c_find(addr: uint32) -> int32:
 def i2c_write(addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
     d: int32 = _i2c_find(addr)
     if d < 0:
-        return I2C_NACK
+        if i2c_ctl_set == 0:
+            return I2C_NACK
+        i2c_ctl_transfers = i2c_ctl_transfers + 1
+        cw: Fn[int32, uint32, Ptr[uint8], uint32] = i2c_ctl_wr
+        return cw(addr, data, n)
     i2c_transfers = i2c_transfers + 1
     f: Fn[int32, Ptr[uint8], uint32] = cast[Fn[int32, Ptr[uint8], uint32]](i2c_devs[d].wr)
     return f(data, n)
@@ -68,7 +95,11 @@ def i2c_write(addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
 def i2c_read(addr: uint32, data: Ptr[uint8], n: uint32) -> int32:
     d: int32 = _i2c_find(addr)
     if d < 0:
-        return I2C_NACK
+        if i2c_ctl_set == 0:
+            return I2C_NACK
+        i2c_ctl_transfers = i2c_ctl_transfers + 1
+        cr: Fn[int32, uint32, Ptr[uint8], uint32] = i2c_ctl_rd
+        return cr(addr, data, n)
     i2c_transfers = i2c_transfers + 1
     f: Fn[int32, Ptr[uint8], uint32] = cast[Fn[int32, Ptr[uint8], uint32]](i2c_devs[d].rd)
     return f(data, n)

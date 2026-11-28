@@ -58,7 +58,7 @@ from drivers.tty.console import console_read, console_write
 from fs.vfs_mount import vfs_mount, vfs_umount, vfs_fs_kind, vfs_fs_rel, FS_KIND_TMPFS, FS_KIND_DEVFS, FS_KIND_CPIO, FS_KIND_PROCFS, FS_KIND_FAT
 from fs.fat import fat_init, fat_lookup, fat_read, fat_listdir, fat_create, fat_write, fat_delete
 from kernel.block.blk import blk_init
-from fs.procfs import proc_lookup, proc_note_pid, proc_pid_dir, proc_render, proc_listdir, proc_note, proc_set_time, proc_fat_mounted, PROC_BUF, PROC_REALTIME, PROC_POWER
+from fs.procfs import proc_lookup, proc_note_pid, proc_pid_dir, proc_render, proc_listdir, proc_note, proc_set_time, proc_fat_mounted, proc_keys, PROC_BUF, PROC_REALTIME, PROC_POWER, PROC_KEYS
 from kernel.power import power_ctl
 from kernel.pipe import pipe_init, pipe_alloc_chan, pipe_valid, pipe_owner, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_release_unbound
 from fs.tmpfs import tmpfs_lookup, tmpfs_open_for_write_t, tmpfs_read, tmpfs_write, tmpfs_size, tmpfs_ftruncate, tmpfs_unlink, tmpfs_rename, tmpfs_mkdir, tmpfs_listdir, tmpfs_path_is_dir, tmpfs_path_exists, tmpfs_mtime, tmpfs_is_dir, tmpfs_table, TmpfsEntry, TMPFS_MAX_FILES
@@ -102,7 +102,7 @@ OF_DEV: uint32 = 3
 OF_ROM: uint32 = 4                  # a file of /bin; slot = index into the ROM table
 OF_FDNAME: uint32 = 5               # "/fd/N"; slot = N, resolved at every read and write
 OF_FAT: uint32 = 6                  # a file on /sd open for reading: aux0 = first cluster, aux1 = size
-OF_PROCW: uint32 = 8                # a writable /proc file: slot = pid for <pid>/note, -1 realtime, -2 power
+OF_PROCW: uint32 = 8                # a writable /proc file: slot = pid for <pid>/note, -1 realtime, -2 power, -3 keys
 OF_FATW: uint32 = 7                 # ... open for writing: dirbuf = its path on the volume, aux1 = size
 
 FS_KIND_ROM: uint32 = 1             # = FS_KIND_CPIO, "read-only baked root" in Hamnix's table
@@ -504,6 +504,8 @@ def _proc_open(rel0: Ptr[uint8], wants_write: uint32) -> int32:
             return _install(OF_PROCW, -1, OWRITE, 0, 0)
         if which == PROC_POWER:
             return _install(OF_PROCW, -2, OWRITE, 0, 0)
+        if which == PROC_KEYS:
+            return _install(OF_PROCW, -3, OWRITE, 0, 0)
         if rel[0] == 0 or proc_pid_dir(rel) != 0:
             return _err(EISDIR, "is a directory")
         return _err(EROFS, "read-only file")
@@ -1082,7 +1084,11 @@ def vfs_write(fd: int32, buf: Ptr[uint8], n: uint64) -> int64:
         pslot: int32 = f[0].slot
         mutex_unlock(&fs_lock)
         prc: int32 = 0
-        if pslot == -2:
+        if pslot == -3:
+            prc = proc_keys(buf, n)
+            if prc == -19:
+                return cast[int64](_err(EINVAL, "keys: no emulated keyboard on this board"))
+        elif pslot == -2:
             prc = power_ctl(buf, n)
         elif pslot < 0:
             prc = proc_set_time(buf, n)
