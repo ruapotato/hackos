@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- power management, the board-independent part.
+#
+# Three levels, cheapest first:
+#
+#   idle      Nothing is runnable.  The idle thread stops the periodic tick
+#             until the next timer is due and sleeps (kernel/sched/core.ad,
+#             _idle_main; the board's board_tick_stop_for/_resume).  Threads
+#             keep their state; any interrupt wakes the system; the clock
+#             stays right.  This happens by itself.
+#   suspend   power_suspend(ms, sources), system call 520, /bin/suspend.
+#             The whole system stops in the calling thread, scheduler
+#             included, until one of the named wake sources fires:
+#                 WAKE_CONSOLE  a byte arrives at the console
+#                 WAKE_TIMER    `ms` milliseconds have passed
+#             The board decides what it can switch off meanwhile
+#             (board_suspend): the Feather releases the 32 MHz crystal
+#             when the console is not a wake source and sleeps in System ON
+#             on RTC1 alone; the QEMU boards have no low-power timer and
+#             keep SysTick going in long stretches just to know the time.
+#             Afterwards the clock is moved by the time the board reports,
+#             so timers that came due fire at once.
+#   off       not here: a board's deepest state (nRF52 System OFF, wake by
+#             reset or a pin) loses RAM and is a reboot.
+#
+# What cannot be measured without hardware is current.  What can: how often
+# the processor is woken.  The counters below are that; /proc/power shows
+# them, and the tests compute wake-ups per second from them.
+
+from kernel.cpu import cpu_irq_disable, cpu_irq_enable
+from kernel.sched.core import sched_now, sched_ticks_skipped, sched_switches, threads, set_current_errstr, pw_tick_irqs, pw_idle_sleeps, pw_idle_long, pw_ticks_skipped, pw_max_skip, pw_poll_waits, SCHED_TICKLESS
+from board.board import board_suspend
+
+WAKE_CONSOLE: uint32 = 1
+WAKE_TIMER: uint32 = 2
+
+pw_suspends: uint64 = 0             # completed suspends
+pw_suspend_ms: uint64 = 0           # time spent suspended
+pw_last_wake: uint32 = 0            # what ended the last one (a WAKE_ value)
+pw_last_ms: uint64 = 0              # how long the last one lasted
+pw_suspend_wakes: uint64 = 0        # times the processor woke inside suspends (board-reported)
+
+
+# Suspend until a wake source fires.  Returns the source that did (a WAKE_
+# value), or -22 when nothing could wake the system (no source, or TIMER
+# without a time) or the board cannot use one of the sources.
+def power_suspend(ms: uint64, sources: uint32) -> int32:
+    if (sources & (WAKE_CONSOLE | WAKE_TIMER)) == 0 or (sources & 0xFFFFFFFC) != 0:
+        set_current_errstr("suspend: no usable wake source (1 = console, 2 = timer)")
+        return -22
+    if (sources & WAKE_TIMER) != 0 and ms == 0:
+        set_current_errstr("suspend: a timer wake needs a time")
+        return -22
+    if (sources & WAKE_TIMER) == 0:
+        ms = 0
+    res: Array[2, uint64]
+    res[0] = 0                          # milliseconds that passed
+    res[1] = 0                          # times the processor woke meanwhile
+    cpu_irq_disable()
+    reason: int32 = board_suspend(ms, sources, &res[0])
+    if reason > 0:
+        pw_suspends = pw_suspends + 1
+        pw_suspend_ms = pw_suspend_ms + res[0]
+        pw_suspend_wakes = pw_suspend_wakes + res[1]
+        pw_last_wake = cast[uint32](reason)
+        pw_last_ms = res[0]
+        sched_ticks_skipped(res[0])     # the tick is 1 ms
+    cpu_irq_enable()
+    if reason <= 0:
+        set_current_errstr("suspend: not supported by this board")
+        return -22
+    return reason
+
+
+class PwBuf:
+    p: Ptr[uint8]
+    n: uint64
+    cap: uint64
+
+
+def _c(b: Ptr[PwBuf], c: uint32):
+    if b[0].n < b[0].cap:
+        b[0].p[b[0].n] = cast[uint8](c)
+        b[0].n = b[0].n + 1
+
+
+def _line(b: Ptr[PwBuf], label: Ptr[uint8], v: uint64):
+    i: uint32 = 0
+    while label[i] != 0:
+        _c(b, cast[uint32](label[i]))
+        i = i + 1
+    while i < 20:
+        _c(b, 32)
+        i = i + 1
+    d: Array[24, uint8]
+    n: uint32 = 0
+    if v == 0:
+        d[0] = 48
+        n = 1
+    while v != 0:
+        d[n] = cast[uint8](48 + v % 10)
+        v = v / 10
+        n = n + 1
+    while n > 0:
+        n = n - 1
+        _c(b, cast[uint32](d[n]))
+    _c(b, 10)
+
+
+# /proc/power.
+def power_render(buf: Ptr[uint8], cap: uint64) -> uint64:
+    pb: PwBuf
+    pb.p = buf
+    pb.n = 0
+    pb.cap = cap
+    b: Ptr[PwBuf] = &pb
+    _line(b, "uptime_ms:", sched_now())
+    _line(b, "idle_ms:", threads[0].cpu_ticks)
+    _line(b, "tickless:", cast[uint64](SCHED_TICKLESS))
+    _line(b, "tick_irqs:", pw_tick_irqs)
+    _line(b, "ticks_skipped:", pw_ticks_skipped)
+    _line(b, "longest_skip_ms:", pw_max_skip)
+    _line(b, "idle_sleeps:", pw_idle_sleeps)
+    _line(b, "idle_sleeps_long:", pw_idle_long)
+    _line(b, "poll_waits:", pw_poll_waits)
+    _line(b, "context_switches:", sched_switches)
+    _line(b, "suspends:", pw_suspends)
+    _line(b, "suspend_ms:", pw_suspend_ms)
+    _line(b, "suspend_wakes:", pw_suspend_wakes)
+    _line(b, "last_wake:", cast[uint64](pw_last_wake))
+    _line(b, "last_suspend_ms:", pw_last_ms)
+    return pb.n
+
+
+# A line written to /proc/power.  "tickless 0" keeps the periodic tick
+# while idle, "tickless 1" stops it again: so that the two can be compared
+# on a running system (/bin/idlestat -p).  0, or -22.
+def power_ctl(msg: Ptr[uint8], n: uint64) -> int32:
+    word: Ptr[uint8] = "tickless "
+    i: uint64 = 0
+    while word[i] != 0:
+        if i >= n or msg[i] != word[i]:
+            return -22
+        i = i + 1
+    if i >= n or (msg[i] != 48 and msg[i] != 49):
+        return -22
+    SCHED_TICKLESS = cast[uint32](msg[i] - 48)
+    return 0

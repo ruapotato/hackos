@@ -30,11 +30,11 @@
 # The first eighteen words of Thread (up to and including `state`) are read
 # and written by switch.S at fixed offsets; do not move them.
 
-from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq_disable, mmio_read32, mmio_write32
+from kernel.cpu import cpu_irq_save, cpu_irq_restore, cpu_ipsr, cpu_wfi, cpu_irq_disable, cpu_irq_enable, mmio_read32, mmio_write32
 from kernel.rt import rt_memset
 from mm.slab import kmalloc_aligned, kfree, umalloc_aligned, ufree, pfree
 from kernel.mpu import mpu_switch, mpu_ctx_set, MpuCtx
-from board.board import board_tick_start
+from board.board import board_tick_start, board_tick_stop_for, board_tick_resume
 
 THREAD_MAX: uint32 = 32
 SCHED_PRIOS: uint32 = 8
@@ -61,7 +61,8 @@ PF_DIRTY: uint32 = 4               # ended by a fault; its resources are not rel
 PF_VFDONE: uint32 = 8              # has exec'ed or ended: the rfork parent may resume
 PF_CLEANING: uint32 = 16           # resources are being released right now
 PF_REAPING: uint32 = 32            # somebody is collecting this zombie
-PF_KILL: uint32 = 64               # to be ended at the next opportunity (Ctrl-C)
+PF_KILL: uint32 = 64               # to be ended at the next opportunity (Ctrl-C, a note)
+PF_WAITING: uint32 = 128           # blocked in waitpid for a child (kernel/proc.ad)
 
 KILL_EXIT_CODE: int64 = 130        # 128 + SIGINT, as a shell would show it
 KILL_KIND: uint32 = 5              # fault_kind of a thread ended this way
@@ -116,6 +117,8 @@ class Thread:
     fault_addr: uint32
     uid: uint32
     pflags: uint32
+    kill_code: uint32               # exit code when PF_KILL ends it (130 Ctrl-C, 137 kill, ...)
+    nb_idle: uint32                 # its last non-blocking read found nothing (kernel/syscall.ad)
     # ---- process (TF_PROC) ----
     ppid: uint32                    # creator's id; 0 = none (or it has ended)
     pgid: uint32                    # job-control group (recorded, not acted on)
@@ -171,6 +174,20 @@ reaper_wq: WaitQueue
 # The process group that has the terminal (tcsetpgrp); 0 = none.  Ctrl-C at
 # the console ends the processes of this group (sched_kill_group).
 tty_fg_pgid: uint32 = 0
+# Power: what the idle thread did (kernel/power.ad renders it as /proc/power).
+SCHED_TICKLESS: uint32 = 1          # 0: keep the periodic tick while idle
+IDLE_FOREVER: uint64 = 0xFFFFFFFF   # "no timer is set": sleep as long as the board allows
+pw_tick_irqs: uint64 = 0            # tick interrupts taken
+pw_idle_sleeps: uint64 = 0          # times the idle thread put the processor to sleep (WFI)
+pw_idle_long: uint64 = 0            # of them: with the periodic tick stopped
+pw_ticks_skipped: uint64 = 0        # ticks that passed without a tick interrupt
+pw_max_skip: uint64 = 0             # the longest such stretch, in ticks
+# Threads that polled for input, found none and yielded (sys_yield after an
+# empty non-blocking read) wait here instead of spinning: until console
+# input arrives, a pipe is written, a process ends, or IDLE_POLL_TICKS pass.
+idle_poll_wq: WaitQueue
+IDLE_POLL_TICKS: uint64 = 250
+pw_poll_waits: uint64 = 0
 sched_kills: uint32 = 0             # processes ended that way so far
 
 extern def sched_launch()
@@ -450,9 +467,43 @@ def sched_pick():
     sched_current = nxt
 
 
+# `n` tick periods have passed without a tick interrupt (the idle thread had
+# the tick stopped, or the system was suspended): move the clock, wake what
+# is due.  The time counts as the idle thread's.
+def sched_ticks_skipped(n: uint64):
+    if n == 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    sched_ticks = sched_ticks + n
+    pw_ticks_skipped = pw_ticks_skipped + n
+    if n > pw_max_skip:
+        pw_max_skip = n
+    threads[0].cpu_ticks = threads[0].cpu_ticks + n
+    now: uint64 = sched_ticks
+    while timer_head != 0 and thr(timer_head)[0].wake_tick <= now:
+        _wake(timer_head, WAKE_TIMEOUT)
+    cpu_irq_restore(irq)
+
+
+# Wake the threads that wait in an idle poll (see idle_poll_wq).  Safe from
+# interrupt handlers; cheap when nobody waits.
+def sched_poll_wake():
+    if idle_poll_wq.head != 0:
+        wq_wake_all(&idle_poll_wq)
+
+
+# The yield of a thread whose last non-blocking read found nothing.
+def thread_poll_wait():
+    irq: uint32 = cpu_irq_save()
+    pw_poll_waits = pw_poll_waits + 1
+    wq_wait(&idle_poll_wq, IDLE_POLL_TICKS)
+    cpu_irq_restore(irq)
+
+
 # Exception 15, once per tick.
 def systick_handler():
     irq: uint32 = cpu_irq_save()
+    pw_tick_irqs = pw_tick_irqs + 1
     sched_ticks = sched_ticks + 1
     now: uint64 = sched_ticks
     cur: uint64 = sched_current
@@ -465,7 +516,7 @@ def systick_handler():
     # when the call returns (kernel/syscall.ad).
     if (thr(cur)[0].pflags & PF_KILL) != 0 and thr(cur)[0].usp == 0 and (thr(cur)[0].flags & TF_PROC) != 0 and thr(cur)[0].state == T_RUNNING:
         sched_kills = sched_kills + 1
-        thread_kill_current_from_fault(KILL_EXIT_CODE, KILL_KIND, 0)
+        thread_kill_current_from_fault(cast[int64](thr(cur)[0].kill_code), KILL_KIND, 0)
         cpu_irq_restore(irq)
         return
     if thr(cur)[0].slice > 0:
@@ -497,10 +548,60 @@ def sched_kill_group(pgid: uint32) -> uint32:
     while i < THREAD_MAX:
         t: Ptr[Thread] = &threads[i]
         if (t[0].flags & TF_PROC) != 0 and t[0].pgid == pgid and t[0].state != T_UNUSED and t[0].state != T_ZOMBIE:
-            t[0].pflags = t[0].pflags | PF_KILL
-            if t[0].state == T_BLOCKED:
-                _wake(cast[uint64](t), WAKE_KILLED)
+            _mark_kill(t, cast[uint32](KILL_EXIT_CODE))
             n = n + 1
+        i = i + 1
+    cpu_irq_restore(irq)
+    return n
+
+
+# Critical section only.
+def _mark_kill(t: Ptr[Thread], code: uint32):
+    if (t[0].pflags & PF_KILL) == 0:
+        t[0].kill_code = code
+    t[0].pflags = t[0].pflags | PF_KILL
+    if t[0].state == T_BLOCKED:
+        _wake(cast[uint64](t), WAKE_KILLED)
+
+
+# Ask process `pid` to end with exit code `code` (a note written to
+# /proc/<pid>/note, fs/procfs.ad).  Returns 0, or -3 when there is no such
+# process.  Kernel threads cannot be ended this way.
+def sched_kill_pid(pid: uint32, code: uint32) -> int32:
+    rc: int32 = -3
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        t: Ptr[Thread] = &threads[i]
+        if t[0].tid == pid and (t[0].flags & TF_PROC) != 0 and t[0].state != T_UNUSED and t[0].state != T_ZOMBIE:
+            _mark_kill(t, code)
+            rc = 0
+        i = i + 1
+    cpu_irq_restore(irq)
+    return rc
+
+
+# Ctrl-C with no foreground group named: end the foreground JOB, found by
+# what the shell is doing.  A shell that runs a pipeline waits (waitpid) for
+# its stages without naming a group for them; so every process whose parent
+# is blocked in waitpid, and which is still in its parent's process group
+# (a background job has been given its own), is asked to end.  That covers
+# a pipeline, and a script run by a second shell together with what the
+# script runs.  Safe from interrupt handlers.  Returns how many were asked.
+def sched_kill_waited() -> uint32:
+    n: uint32 = 0
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        p: Ptr[Thread] = &threads[i]
+        if (p[0].flags & TF_PROC) != 0 and (p[0].pflags & PF_WAITING) != 0 and p[0].state == T_BLOCKED:
+            j: uint32 = 0
+            while j < THREAD_MAX:
+                c: Ptr[Thread] = &threads[j]
+                if (c[0].flags & TF_PROC) != 0 and c[0].ppid == p[0].tid and c[0].pgid == p[0].pgid and c[0].state != T_UNUSED and c[0].state != T_ZOMBIE:
+                    _mark_kill(c, cast[uint32](KILL_EXIT_CODE))
+                    n = n + 1
+                j = j + 1
         i = i + 1
     cpu_irq_restore(irq)
     return n
@@ -732,6 +833,9 @@ def _proc_release(t: uint64):
         if c[0].state != T_UNUSED and c[0].ppid == thr(t)[0].tid and cast[uint64](c) != t:
             c[0].ppid = 0
             c[0].flags = c[0].flags | TF_DETACHED
+            if c[0].state == T_ZOMBIE:      # already ended: now the reaper's to collect
+                while reaper_wq.head != 0:
+                    _wake(reaper_wq.head, WAKE_OK)
             if (c[0].pflags & PF_HELD) != 0:
                 c[0].pflags = c[0].pflags & (0xFFFFFFFF ^ PF_HELD)
                 wq_wake_all(&c[0].hold_wq)
@@ -769,6 +873,8 @@ def thread_exit(code: int64) -> int64:
     thr(t)[0].state = T_ZOMBIE
     while thr(t)[0].join_wq.head != 0:
         _wake(thr(t)[0].join_wq.head, WAKE_OK)
+    while idle_poll_wq.head != 0:           # a shell polling at its prompt reaps its jobs
+        _wake(idle_poll_wq.head, WAKE_OK)
     if (thr(t)[0].flags & TF_DETACHED) != 0:
         while reaper_wq.head != 0:
             _wake(reaper_wq.head, WAKE_OK)
@@ -796,6 +902,8 @@ def thread_kill_current_from_fault(code: int64, kind: uint32, addr: uint32):
         _wake(thr(t)[0].join_wq.head, WAKE_OK)
     while reaper_wq.head != 0:
         _wake(reaper_wq.head, WAKE_OK)
+    while idle_poll_wq.head != 0:
+        _wake(idle_poll_wq.head, WAKE_OK)
     sched_pend_switch()
     cpu_irq_restore(irq)
 
@@ -910,10 +1018,53 @@ def current_task_uid() -> uint32:
 
 
 # ---------------------------------------------------------------- idle, start
+# How long the idle thread may sleep: 0 when a thread is ready to run, else
+# the ticks until the next timer is due (IDLE_FOREVER when none is set).
+# Interrupts off.
+def _idle_ticks() -> uint64:
+    if _rq_best() < SCHED_PRIOS:
+        return 0
+    if timer_head == 0:
+        return IDLE_FOREVER
+    w: uint64 = thr(timer_head)[0].wake_tick
+    if w <= sched_ticks:
+        return 0
+    return w - sched_ticks
+
+
 # The idle thread must always be runnable, so it does nothing that can block.
+#
+# Tickless idle.  With nothing to run, the periodic tick is the only thing
+# that would wake the processor a thousand times a second for nothing.  So
+# the idle thread asks the board to stop it until the next timer is due
+# (board_tick_stop_for), sleeps, and afterwards asks how many tick periods
+# went by (board_tick_resume) and moves the clock by that.  Any interrupt
+# ends the sleep early; the clock is right either way.
+#
+# This runs with PRIMASK set, not BASEPRI: an interrupt that becomes pending
+# still ends the WFI (ARMv7-M: PRIMASK does not stop the wake-up, BASEPRI
+# would), and is taken as soon as PRIMASK is cleared, so there is no window
+# in which an interrupt arrives after the decision to sleep and is slept
+# through.  A board whose board_tick_stop_for returns 0 keeps its periodic
+# tick (teensy41).
 def _idle_main(arg: uint64) -> int64:
     while 1 == 1:
-        cpu_wfi()
+        cpu_irq_disable()
+        n: uint64 = _idle_ticks()
+        if n >= 2 and SCHED_TICKLESS != 0:
+            if n > 0xFFFFFF:
+                n = 0xFFFFFF
+            if board_tick_stop_for(cast[uint32](n)) != 0:
+                pw_idle_sleeps = pw_idle_sleeps + 1
+                pw_idle_long = pw_idle_long + 1
+                cpu_wfi()
+                sched_ticks_skipped(cast[uint64](board_tick_resume()))
+                cpu_irq_enable()
+                continue
+        if n != 0:
+            pw_idle_sleeps = pw_idle_sleeps + 1
+            cpu_wfi()                   # the next tick is at most one period away
+        cpu_irq_enable()
     return 0
 
 
@@ -922,7 +1073,7 @@ def _idle_main(arg: uint64) -> int64:
 # join.  It is woken when either appears, and looks every REAPER_PERIOD ticks
 # besides.  Releasing may block on the file-system lock, which is why this is
 # not the idle thread's job.
-REAPER_PERIOD: uint64 = 20
+REAPER_PERIOD: uint64 = 1000        # a safety net only: it is woken whenever there is work
 
 
 def _reaper_main(arg: uint64) -> int64:
@@ -959,6 +1110,7 @@ def sched_init():
     sched_current = 0
     sched_running = 0
     wq_init(&reaper_wq)
+    wq_init(&idle_poll_wq)
     thread_create("idle", cast[uint64](&_idle_main), 0, SCHED_PRIOS - 1, 2048, 0)
     thread_create("reaper", cast[uint64](&_reaper_main), 0, SCHED_PRIOS - 2, 8192, 0)
 

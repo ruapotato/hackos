@@ -37,6 +37,8 @@ from fs.hvfs import fat_mounted
 from kernel.block.blk import blkdevs
 from fs.hvfs import fs_lock
 from kernel.sync import mutex_dead_released
+from kernel.sched.core import pw_tick_irqs, pw_ticks_skipped, pw_idle_sleeps, SCHED_TICKLESS
+from kernel.power import power_suspend, pw_suspend_wakes, WAKE_TIMER, WAKE_CONSOLE
 
 from board.board import board_mpu_xram_base
 
@@ -1370,6 +1372,81 @@ def bench_proc():
     printk3("BENCH tmpfs: an empty file takes %d bytes of kernel heap, its first byte %d more; table entry %d bytes\n", cast[uint64](k1 - k0), cast[uint64](k2 - k1), sizeof(TmpfsEntry))
 
 
+# ============================================================ 14. power
+# An independent clock for these checks: the MPS2's CMSDK timer 0 (the same
+# 25 MHz as SysTick), counting down from 0xFFFFFFFF.  SysTick itself is what
+# tickless idle reprograms, so it cannot be its own witness.
+def witness_start():
+    mmio_write32(0x40000000, 0)
+    mmio_write32(0x40000008, 0xFFFFFFFF)
+    mmio_write32(0x40000004, 0xFFFFFFFF)
+    mmio_write32(0x40000000, 1)
+
+
+def witness_counts(since: uint32) -> uint64:
+    return cast[uint64](since - mmio_read32(0x40000004))
+
+
+def t_near(a: uint64, b: uint64, tol: uint64) -> uint32:
+    if a > b + tol or b > a + tol:
+        return 0
+    return 1
+
+
+def test_power():
+    printk0("-- 14. power: tickless idle, suspend\n")
+    witness_start()
+    thread_sleep(3)                     # start on a tick boundary
+    # everything else is asleep now (the reaper wakes once a second)
+    c0: uint32 = mmio_read32(0x40000004)
+    t0: uint64 = sched_now()
+    i0: uint64 = pw_tick_irqs
+    k0: uint64 = pw_ticks_skipped
+    s0: uint64 = pw_idle_sleeps
+    thread_sleep(2000)
+    cnt: uint64 = witness_counts(c0)
+    t1: uint64 = sched_now()
+    irqs: uint64 = pw_tick_irqs - i0
+    printk4("   2000-tick sleep, tickless: %d tick interrupts, %d ticks skipped, %d wake-ups, witness timer %d counts (50000000 = 2 s)\n", irqs, pw_ticks_skipped - k0, pw_idle_sleeps - s0, cnt)
+    check(cast[uint32](t1 - t0 == 2000), "power: a 2000-tick sleep is 2000 ticks of the kernel's clock with the tick stopped")
+    check(cast[uint32](irqs <= 8 and pw_ticks_skipped - k0 >= 1990 and pw_idle_sleeps - s0 <= 8), "power: ... during which the processor woke a handful of times, not 2000")
+    check(t_near(cnt, 50000000, 25000), "power: ... and an independent timer measures the same 2 s (within 1 ms)")
+    # the same with the periodic tick, for the comparison
+    SCHED_TICKLESS = 0
+    thread_sleep(3)
+    c0 = mmio_read32(0x40000004)
+    i0 = pw_tick_irqs
+    s0 = pw_idle_sleeps
+    thread_sleep(2000)
+    cnt = witness_counts(c0)
+    irqs = pw_tick_irqs - i0
+    SCHED_TICKLESS = 1
+    printk3("   2000-tick sleep, periodic tick: %d tick interrupts, %d wake-ups, witness timer %d counts\n", irqs, pw_idle_sleeps - s0, cnt)
+    check(cast[uint32](irqs >= 1999 and irqs <= 2001 and t_near(cnt, 50000000, 25000) != 0), "power: with tickless idle switched off every tick is an interrupt, same time")
+    # timers still fire on their tick when the tick is stopped in between
+    thread_sleep(1)
+    ta: uint64 = sched_now()
+    thread_sleep(7)
+    tb: uint64 = sched_now()
+    thread_sleep(123)
+    tc: uint64 = sched_now()
+    check(cast[uint32](tb - ta == 7 and tc - tb == 123), "power: sleeps of 7 and 123 ticks wake on exactly their tick")
+    # suspend: the scheduler stops too; the timer is the wake source
+    c0 = mmio_read32(0x40000004)
+    t0 = sched_now()
+    w0: uint64 = pw_suspend_wakes
+    r: int32 = power_suspend(1500, WAKE_TIMER)
+    cnt = witness_counts(c0)
+    t1 = sched_now()
+    printk4("   suspend 1500 ms (timer): reason %d, clock moved %d ticks, witness %d counts, processor woken %d times\n", cast[uint64](r), t1 - t0, cnt, pw_suspend_wakes - w0)
+    check(cast[uint32](r == 2 and t_near(t1 - t0, 1500, 1) != 0 and t_near(cnt, 37500000, 50000) != 0), "power: suspend with a timer wake lasts its time; the clock is moved by it")
+    check(cast[uint32](pw_suspend_wakes - w0 <= 4), "power: ... with the processor woken only as often as a 24-bit SysTick needs to keep the time")
+    check(cast[uint32](power_suspend(0, 0) == -22 and power_suspend(0, WAKE_TIMER) == -22 and power_suspend(10, 64) == -22), "power: a suspend that nothing could end is refused")
+    ta = sched_now()
+    thread_sleep(5)
+    check(cast[uint32](sched_now() - ta == 5), "power: the periodic tick runs again after a suspend")
+
+
 def runner(arg: uint64) -> int64:
     vfs_open_stdio()
     test_boot()
@@ -1386,6 +1463,7 @@ def runner(arg: uint64) -> int64:
     test_fat()
     bench_switch()
     bench_proc()
+    test_power()
     test_console()
     if failures == 0:
         printk0("RESULT: PASS (all checks passed)\n")

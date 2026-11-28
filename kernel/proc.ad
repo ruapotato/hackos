@@ -53,7 +53,7 @@ from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.rt import rt_memcpy, rt_memset
 from board.board import board_code_loaded, board_xip_lo, board_xip_hi
 from kernel.mpu import mpu_proc_rasr, mpu_proc_rbar
-from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, thread_killed, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, WAIT_FOREVER
+from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, thread_killed, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, PF_WAITING, WAIT_FOREVER
 from mm.slab import kmalloc, kfree, palloc_aligned, pfree
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, vfs_rom_addr, OREAD, ENOMEM, EFAULT, EINVAL
 from kernel.pipe import EAGAIN
@@ -777,7 +777,14 @@ def proc_waitpid(pid: int32, flags: uint32) -> int64:
     if _is_proc(pid) == 0:
         set_current_errstr("wait: no such child")
         return cast[int64](ECHILD)
+    # PF_WAITING tells Ctrl-C whose children the foreground job is
+    # (sched_kill_waited)
+    me: Ptr[Thread] = current_thread()
+    me[0].pflags = me[0].pflags | PF_WAITING
     rc: int32 = thread_wait(cast[uint32](pid), flags & 1, &code)
+    irqw: uint32 = cpu_irq_save()
+    me[0].pflags = me[0].pflags & (0xFFFFFFFF ^ PF_WAITING)
+    cpu_irq_restore(irqw)
     if rc == -11:
         return cast[int64](EAGAIN)
     if rc == -4:

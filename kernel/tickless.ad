@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- stopping and resuming a SysTick tick for tickless idle
+# (kernel/sched/core.ad, _idle_main), for boards whose tick is SysTick.
+#
+# SysTick is a 24-bit down-counter that reloads from RVR when it reaches 0.
+# To skip n tick periods without losing the tick's phase:
+#
+#   stop     counting is disabled; `first` = the counts left of the current
+#            period.  The counter is loaded with first + (n-1) * period: it
+#            will reach 0 exactly where the n-th tick from now would have
+#            been.  RVR is put back to period - 1 as soon as the long count
+#            has been loaded, so the count after it is an ordinary period
+#            again without anybody touching it.
+#   resume   if the long count ran out, n ticks have passed: the pending
+#            SysTick exception is cancelled (the caller moves the clock by
+#            n instead) and the counter is already running the next period.
+#            If something else ended the sleep, the counts consumed say how
+#            many tick boundaries were crossed and how far the current
+#            period has got; the counter is reloaded with the rest of it.
+#
+# What this costs in accuracy: the counter stands still for the few
+# instructions between stop and start, each time.  With SysTick on the CPU
+# clock that is well under a microsecond per sleep.  On a slow reference
+# clock a whole count can be lost each time, which is why the Teensy
+# (100 kHz reference) does not use this.
+# Everything here runs with interrupts off (PRIMASK).
+
+from kernel.cpu import mmio_read32, mmio_write32, cpu_wfi
+
+TKL_SYST_CSR: uint64 = 0xE000E010
+TKL_SYST_RVR: uint64 = 0xE000E014
+TKL_SYST_CVR: uint64 = 0xE000E018
+TKL_ICSR: uint64 = 0xE000ED04
+TKL_PENDSTSET: uint32 = 0x04000000
+TKL_PENDSTCLR: uint32 = 0x02000000
+
+st_stopped: uint32 = 0
+st_n: uint32 = 0
+st_first: uint32 = 0
+st_total: uint32 = 0
+st_period: uint32 = 0
+st_csr: uint32 = 0
+st_early: uint64 = 0                # sleeps that something other than the tick ended
+st_full: uint64 = 0                 # sleeps that ran their whole length
+
+
+def _load(counts: uint32):
+    mmio_write32(TKL_SYST_RVR, counts - 1)
+    mmio_write32(TKL_SYST_CVR, 0)
+    mmio_write32(TKL_SYST_CSR, st_csr)
+    # the counter takes the new value at its next clock: wait for that
+    # before putting the ordinary period back
+    spins: uint32 = 0
+    while mmio_read32(TKL_SYST_CVR) == 0 and spins < 100000:
+        spins = spins + 1
+    mmio_write32(TKL_SYST_RVR, st_period - 1)
+
+
+# Skip up to `n` tick periods.  Returns 1 when the tick has been stopped
+# (the counter now runs to the n-th tick, or to as many as 24 bits hold),
+# 0 when it was left alone (n too small, or a tick is already pending).
+def systick_stop_for(n: uint32) -> uint32:
+    st_csr = mmio_read32(TKL_SYST_CSR) & 7
+    if (st_csr & 1) == 0:
+        return 0
+    period: uint32 = mmio_read32(TKL_SYST_RVR) + 1
+    maxn: uint32 = 0xFFFFFF / period
+    if n > maxn:
+        n = maxn
+    if n < 2:
+        return 0
+    mmio_write32(TKL_SYST_CSR, st_csr & 6)                  # stop counting
+    if (mmio_read32(TKL_ICSR) & TKL_PENDSTSET) != 0:
+        mmio_write32(TKL_SYST_CSR, st_csr)                  # a tick is due now: take it
+        return 0
+    first: uint32 = mmio_read32(TKL_SYST_CVR)
+    if first == 0:
+        first = period
+    st_period = period
+    st_first = first
+    st_n = n
+    st_total = first + (n - 1) * period
+    _load(st_total)
+    st_stopped = 1
+    return 1
+
+
+# After the sleep: how many tick periods passed without a tick interrupt.
+def systick_resume() -> uint32:
+    if st_stopped == 0:
+        return 0
+    st_stopped = 0
+    mmio_write32(TKL_SYST_CSR, st_csr & 6)                  # stop counting
+    c: uint32 = mmio_read32(TKL_SYST_CVR)
+    if (mmio_read32(TKL_ICSR) & TKL_PENDSTSET) != 0:
+        # the long count ran out; the counter is `st_period - c` counts
+        # into the next ordinary period already
+        mmio_write32(TKL_ICSR, TKL_PENDSTCLR)
+        mmio_write32(TKL_SYST_CSR, st_csr)
+        st_full = st_full + 1
+        return st_n
+    st_early = st_early + 1
+    consumed: uint32 = st_total - c
+    e: uint32 = 0
+    left: uint32 = st_first - consumed
+    if consumed >= st_first:
+        e = 1 + (consumed - st_first) / st_period
+        left = st_period - (consumed - st_first) % st_period
+    if left < 2:
+        left = 2
+    _load(left)
+    return e
+
+
+# ---- suspend on a board whose only timer is SysTick --------------------
+# The processor sleeps with every interrupt but the wake sources disabled
+# at the NVIC.  SysTick has no low-power mode and 24 bits, so "suspended"
+# here means: it runs in the longest stretches it can count, only so that
+# the time is known afterwards (res[1] says how often that woke the
+# processor).  `wake_irqs` is the set of external interrupts (bits of NVIC
+# ISER0) that may end the suspend; `ms` (0 = none) the timer wake.
+# Interrupts off (PRIMASK).  Returns 1 (an interrupt of wake_irqs is
+# pending) or 2 (the time is up); res[0] = milliseconds that passed
+# (the tick must be 1 ms).
+def systick_suspend(ms: uint64, wake_irqs: uint32, res: Ptr[uint64]) -> int32:
+    csr: uint32 = mmio_read32(TKL_SYST_CSR) & 7
+    period: uint32 = mmio_read32(TKL_SYST_RVR) + 1
+    iser: uint32 = mmio_read32(0xE000E100)
+    mmio_write32(0xE000E180, iser & (0xFFFFFFFF ^ wake_irqs))       # ICER0: the others off
+    maxn: uint32 = 0xFFFFFF / period
+    passed: uint64 = 0
+    wakes: uint64 = 0
+    reason: int32 = 0
+    st_csr = csr
+    st_period = period
+    while reason == 0:
+        n: uint32 = maxn
+        if ms != 0 and ms - passed < cast[uint64](maxn):
+            n = cast[uint32](ms - passed)
+        if n == 0:
+            reason = 2
+            break
+        mmio_write32(TKL_SYST_CSR, csr & 6)
+        mmio_write32(TKL_ICSR, TKL_PENDSTCLR)
+        _load(n * period)
+        if (mmio_read32(0xE000E200) & wake_irqs) == 0:               # ISPR0
+            cpu_wfi()
+        wakes = wakes + 1
+        mmio_write32(TKL_SYST_CSR, csr & 6)
+        if (mmio_read32(TKL_ICSR) & TKL_PENDSTSET) != 0:
+            mmio_write32(TKL_ICSR, TKL_PENDSTCLR)
+            passed = passed + cast[uint64](n)
+        else:
+            c: uint32 = mmio_read32(TKL_SYST_CVR)
+            passed = passed + cast[uint64]((n * period - c) / period)
+        if (mmio_read32(0xE000E200) & wake_irqs) != 0:
+            reason = 1
+        elif ms != 0 and passed >= ms:
+            reason = 2
+    # the ordinary tick again, from a full period
+    mmio_write32(TKL_SYST_CSR, csr & 6)
+    mmio_write32(TKL_SYST_RVR, period - 1)
+    mmio_write32(TKL_SYST_CVR, 0)
+    mmio_write32(TKL_ICSR, TKL_PENDSTCLR)
+    mmio_write32(TKL_SYST_CSR, csr)
+    mmio_write32(0xE000E100, iser)                                  # ISER0: as before
+    res[0] = passed
+    res[1] = wakes
+    return reason

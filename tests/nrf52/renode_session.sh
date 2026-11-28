@@ -38,7 +38,7 @@ rm -f $B/stdin; mkfifo $B/stdin
 "$RENODE" --disable-gui --console -e "include @$(pwd)/$B/session.resc" < $B/stdin > $B/renode.log 2>&1 &
 RPID=$!
 exec 8>$B/stdin
-python3 -I tests/nrf52/uart_session.py 127.0.0.1:$PORT tests/nrf52/session.txt $B/console.raw 2> $B/driver.log
+python3 -I tests/nrf52/uart_session.py 127.0.0.1:$PORT "${SESSION:-tests/nrf52/session.txt}" $B/console.raw 2> $B/driver.log
 drc=$?
 kill $RPID 2>/dev/null; wait $RPID 2>/dev/null; exec 8>&-; rm -f $B/stdin
 cat $B/driver.log
@@ -87,8 +87,29 @@ if grep -q '^second shell status 0$' $S; then bad "a second shell started: the a
 else ok "a second shell does not fit and fails cleanly: $(grep -m1 '^second shell status' $S)"; fi
 n12="$(grep -cE '^1 2 [78]$' $S)"
 [ "$n12" = 12 ] && ok "a loop of 12 pipelines, 24 processes one after another" || bad "the loop of 12 pipelines printed $n12 counts"
+expect "ps: Hamnix's, reading /proc/tasks" $S '^ +[0-9]+ +[0-9]+ run +4 proc +[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+ ps$'
+expect "free and df" $S '^Mem: +[0-9]+ +[0-9]+$'
+expect "setdate and date" $S '^2026-11-27 12:00:0[0-9] UTC$'
+expect "a background job" $S '^\[1\]\+ Running ptest loop$'
+expect "> file 2>&1" $S '^err two$'
+expect "seq, sort -r | head" $S '^5$'
+expect "tr" $S '^SHOUT$'
+expect "mv" $S '^moved-n$'
+expect "Ctrl-C ends a pipeline (cat | wc: both wait, the shell names no group for them)" $S '^pipeline interrupted 130$'
+expect "kill PID ends the background job" $S '^\[1\]\+ Done ptest loop$'
+wk="$(sed -n 's/^  processor wake-ups from sleep: *\([0-9]*\)\.[0-9]* per second.*/\1/p' $S | tr '\n' ' ')"
+set -- $wk
+if [ $# = 2 ]; then
+    echo "[renode]   idle at the shell: $1 processor wake-ups per second with tickless idle (RTC1 compare), $2 with the periodic tick"
+    [ "$1" -le 20 ] && ok "idle with tickless idle: $1 processor wake-ups per second (20 or fewer)" || bad "$1 wake-ups per second with tickless idle"
+    [ "$2" -ge 900 ] && ok "the same with the periodic tick: $2 per second" || bad "$2 wake-ups per second with the periodic tick, expected about 1000"
+else
+    bad "idlestat printed '$wk'"
+fi
+expect "suspend, ended by a byte at the console" $S '^woke: console after [0-9]+ ms, processor woken [0-9]+ times in all suspends$'
+expect "suspend 2 -n (UARTE receiver off, crystal released), ended by RTC1 after 2000 ms" $S '^woke: timer after 2000 ms, processor woken [0-9]+ times in all suspends$'
 expect "a pasted block of 40 command lines (1.4 KB in one write): every line ran, in order" $S '^40 120 600$'
-expect "... with the sender held off while the shell worked, and nothing dropped" $S '^console: [0-9]+ bytes in, input ring peak [0-9]+, sender held off [1-9][0-9]* times, dropped 0, UART overruns 0, other UART errors 0$'
+expect "... with the sender held off while the shell worked, and nothing dropped" $S '^console: [0-9]+ bytes in, input ring peak [0-9]+, sender held off [1-9][0-9]* times, dropped 0, UART overruns 0, other UART errors 0, DMA guard intact$'
 grep '^console:' $S | sed 's/^/[renode]   /'
 expect "'halt 0' ends the run with status 0" $S '^\[hackos\] exit status 0$'
 expect "memory report" $S '^memory: kernel heap peak [0-9]+ of [0-9]+, program arena peak [0-9]+$'

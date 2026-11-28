@@ -12,6 +12,8 @@
 #                    "0 0 0" (the n-th one for the n-th sh): CMD is done
 #   shn CMD          type CMD without waiting
 #   raw HEX          send bytes (e.g. 03 = Ctrl-C)
+#   killbg           type `kill PID` with the PID of the last "[n] PID" the
+#                    shell printed for a background job, and wait like sh
 #   paste N TEXT     N lines of TEXT (%d = the line number) in ONE write to
 #                    the socket: a pasted block, as fast as the emulated
 #                    UART takes it
@@ -97,6 +99,17 @@ for line in script:
             fails += 1
     elif op == 'shn':
         send(arg + '\r')
+    elif op == 'killbg':
+        # `kill PID` for the background job the shell announced last ("[1] PID")
+        import re
+        with lock:
+            pids = re.findall(rb'\[\d+\] (\d+)\r?\n', bytes(buf))
+        marks += 1
+        send('kill %s\r' % (pids[-1].decode() if pids else '0'))
+        send('wc < /dev/null\r')
+        if not wait_for('0 0 0', marks, 60):
+            print("uart_session: no answer to kill", file=sys.stderr)
+            fails += 1
     elif op == 'paste':
         n, _, text = arg.partition(' ')
         s.sendall(''.join((text % i) + '\r' for i in range(1, int(n) + 1)).encode())

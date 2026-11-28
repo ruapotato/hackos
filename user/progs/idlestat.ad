@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- idlestat [SECONDS] [-p]: how often is the processor woken while
+# the system has nothing to do?
+#
+# Reads /proc/power, sleeps SECONDS (default 5), reads it again and prints
+# the differences per second.  Current cannot be measured without the
+# hardware; how often the processor leaves its sleep can, and it is what an
+# idle system's consumption follows.  With -p the periodic tick is left
+# running for the measurement (tickless idle off, by writing to
+# /proc/power) and switched back afterwards: the figure to compare with.
+
+extern def sys_sleep_ms(ms: uint64) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[uint8]) -> int32
+extern def sys_open_write(path: Ptr[uint8]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+buf: Array[1024, uint8]
+buflen: uint64 = 0
+
+
+def puts(s: Ptr[uint8]):
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    sys_write(1, s, n)
+
+
+def put_dec(v: uint64):
+    d: Array[24, uint8]
+    n: uint64 = 0
+    if v == 0:
+        d[0] = 48
+        n = 1
+    while v != 0:
+        d[n] = cast[uint8](48 + v % 10)
+        v = v / 10
+        n = n + 1
+    while n > 0:
+        n = n - 1
+        sys_write(1, &d[n], 1)
+
+
+def snapshot():
+    buflen = 0
+    fd: int32 = sys_open("/proc/power")
+    if fd < 0:
+        return
+    n: int64 = sys_read(fd, &buf[0], 1023)
+    sys_close(fd)
+    if n > 0:
+        buflen = cast[uint64](n)
+
+
+# The value of the line "label   N" in the snapshot.
+def field(label: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while i < buflen:
+        j: uint64 = 0
+        while label[j] != 0 and i + j < buflen and buf[i + j] == label[j]:
+            j = j + 1
+        if label[j] == 0:
+            i = i + j
+            while i < buflen and (buf[i] < 48 or buf[i] > 57):
+                i = i + 1
+            v: uint64 = 0
+            while i < buflen and buf[i] >= 48 and buf[i] <= 57:
+                v = v * 10 + cast[uint64](buf[i] - 48)
+                i = i + 1
+            return v
+        while i < buflen and buf[i] != 10:
+            i = i + 1
+        i = i + 1
+    return 0
+
+
+def tickless(on: uint32):
+    fd: int32 = sys_open_write("/proc/power")
+    if fd < 0:
+        return
+    if on != 0:
+        sys_write(fd, "tickless 1\n", 11)
+    else:
+        sys_write(fd, "tickless 0\n", 11)
+    sys_close(fd)
+
+
+def per_second(label: Ptr[uint8], delta: uint64, ms: uint64):
+    puts(label)
+    put_dec(delta * 1000 / ms)
+    puts(".")
+    put_dec((delta * 10000 / ms) % 10)
+    puts(" per second (")
+    put_dec(delta)
+    puts(")\n")
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    secs: uint64 = 5
+    periodic: uint32 = 0
+    a: int32 = 1
+    while a < argc:
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv[a])
+        if s[0] == 45 and s[1] == 112 and s[2] == 0:
+            periodic = 1
+        else:
+            secs = 0
+            i: uint64 = 0
+            while s[i] >= 48 and s[i] <= 57:
+                secs = secs * 10 + cast[uint64](s[i] - 48)
+                i = i + 1
+            if s[i] != 0 or secs == 0:
+                puts("usage: idlestat [SECONDS] [-p]\n")
+                return 1
+        a = a + 1
+    if periodic != 0:
+        tickless(0)
+    snapshot()
+    up0: uint64 = field("uptime_ms:")
+    idle0: uint64 = field("idle_ms:")
+    irq0: uint64 = field("tick_irqs:")
+    sl0: uint64 = field("idle_sleeps:")
+    sk0: uint64 = field("ticks_skipped:")
+    cs0: uint64 = field("context_switches:")
+    sys_sleep_ms(secs * 1000)
+    snapshot()
+    if periodic != 0:
+        tickless(1)
+    ms: uint64 = field("uptime_ms:") - up0
+    if ms == 0:
+        puts("idlestat: no /proc/power\n")
+        return 1
+    if periodic != 0:
+        puts("idlestat, periodic tick: ")
+    else:
+        puts("idlestat, tickless: ")
+    put_dec(ms)
+    puts(" ms, of them idle ")
+    put_dec(field("idle_ms:") - idle0)
+    puts("\n")
+    per_second("  processor wake-ups from sleep: ", field("idle_sleeps:") - sl0, ms)
+    per_second("  tick interrupts taken:         ", field("tick_irqs:") - irq0, ms)
+    per_second("  ticks skipped asleep:          ", field("ticks_skipped:") - sk0, ms)
+    per_second("  context switches:              ", field("context_switches:") - cs0, ms)
+    return 0

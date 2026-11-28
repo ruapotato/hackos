@@ -407,6 +407,78 @@ if wait_for "hamsh\$ "; then
     sh "echo 'exit 5' >> /tmp/s.hsh"
     shn 'hamsh /tmp/s.hsh'
     sh 'echo script status $status'
+    # ---- milestone 4: the rest of the shell, and more programs ----
+    # a background job, `jobs`, and `kill PID` (a note written to /proc/PID/note)
+    sh 'ptest loop &'
+    sh 'jobs'
+    bgpid="$(tr -d '\r' < $QLOG | sed -n 's/^\[1\] \([0-9][0-9]*\)$/\1/p' | tail -1)"
+    sh 'ps'
+    sh "kill ${bgpid:-0}"
+    sleep 0.5
+    sh 'echo job-ended-check'
+    sh 'cat /proc/tasks > /tmp/tasks'
+    sh 'grep -c ptest < /tmp/tasks'
+    # two streams into one file
+    sh 'ptest outerr > /tmp/both 2>&1'
+    sh 'cat /tmp/both'
+    sh 'wc < /tmp/both'
+    # a function
+    sh 'def greet(name) { echo hello $name from a function }'
+    sh 'greet("world")'
+    # history: up-arrow twice skips the marker command and recalls the line
+    sh 'echo history-probe'
+    say '\x1b[A\x1b[A\r'; sh 'echo after-history'
+    # completion: a command name, then a path
+    say 'ec\tcompleted-command\r'; sh 'echo after-completion'
+    say 'cat /tmp/bo\t | wc\r'; sh 'echo after-path-completion'
+    # Ctrl-C ends a whole pipeline, though the shell names no group for one
+    shn 'ptest loop | cat | wc'; sleep 1; say '\x03'
+    sh 'echo pipeline interrupted $status'
+    sh 'cat /proc/tasks > /tmp/tasks2'
+    sh 'grep -c ptest < /tmp/tasks2'
+    # there are no here-documents in this hamsh: `cat << EOF` is cat on the console
+    shn 'cat << EOF'; sleep 0.5; say 'not a here-document\r'; sleep 0.3; say '\x03'
+    sh 'echo no-heredoc $status'
+    # programs copied from Hamnix
+    sh 'seq 5 > /tmp/n'
+    sh 'cat /tmp/n | sort -r | head -2'
+    sh 'echo pear > /tmp/u'
+    sh 'echo pear >> /tmp/u'
+    sh 'echo apple >> /tmp/u'
+    sh 'sort < /tmp/u | uniq -c'
+    sh 'echo Shout | tr a-z A-Z'
+    sh 'echo abc | od'
+    sh 'tail -2 < /tmp/n'
+    sh 'echo left:mid:right > /tmp/c'
+    sh 'cut -d ":" -f 2 < /tmp/c'
+    sh 'echo through-tee | tee /tmp/teeout | wc'
+    sh 'cat /tmp/teeout'
+    sh 'mv /tmp/u /tmp/moved-u'
+    sh 'touch /tmp/touched'
+    sh 'ls /tmp'
+    sh 'free'
+    sh 'df'
+    shn 'date'
+    sh 'echo date-unset $status'
+    sh 'setdate 1795780800'
+    sh 'date'
+    sh 'sleep 2'
+    sh 'cat /proc/uptime'
+    # power: how often the processor wakes while the system idles at the
+    # prompt of a sleeping command, tickless and with the periodic tick;
+    # then suspend, ended by a key and by its timer
+    sh 'idlestat 3'
+    sh 'idlestat 3 -p'
+    shn 'suspend 30'; sleep 1.5; say '\r'
+    sh 'echo after-suspend'
+    sh 'suspend 2 -n'
+    # history survives the shell: exit, init starts another, up-arrow recalls
+    sh 'echo persistent-history-probe'
+    say 'exit\r'
+    wait_for "starting another" || bad "init did not start another shell after exit"
+    wait_for "hamsh\$ " 2 || bad "no prompt from the second shell"
+    sleep 0.5
+    say '\x1b[A\x1b[A\x1b[A\r'; sh 'echo after-reload'
     # a pasted block: 60 command lines in one write, more than the console's
     # input ring would hold if the sender were not held off
     paste=""; for i in $(seq -w 1 60); do paste="${paste}echo paste line x$i >> /tmp/paste\\r"; done
@@ -461,6 +533,46 @@ n40k="$(grep -c '^157 627 40000$' $S)"
 [ "$n40k" = 2 ] && ok "shell: cp card -> tmpfs -> card, 40000 bytes each way" || bad "shell: the 40000-byte copies were counted $n40k times, expected 2"
 expect "shell: a program run from the card" $S '^from the card 2$'
 expect "shell: rm on the card" $S '^cat: cannot open /sd/BACK.BIN: .*file does not exist'
+# milestone 4
+expect "shell: a background job is listed by jobs" $S '^\[1\]\+ Running ptest loop$'
+expect "shell: ps (Hamnix's, reading /proc/tasks) shows the job as a process" $S '^ +[0-9]+ +[0-9]+ (ready|run) +4 proc +[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+ ptest$'
+expect "shell: kill PID ends it (a note to /proc/PID/note); the shell reports the job done" $S '^\[1\]\+ Done ptest loop$'
+[ "$(grep -c '^0$' $S)" = 2 ] && ok "shell: no ptest process is left, after the kill and after Ctrl-C on the pipeline" || bad "shell: expected two '0' counts of ptest in /proc/tasks, got $(grep -c '^0$' $S)"
+expect "shell: > file 2>&1 keeps the two streams in order in one file" $S '^err two$'
+[ "$(grep -c '^3 6 26$' $S)" = 2 ] && ok "shell: ... 26 bytes, nothing overwritten; and Tab completed /tmp/bo to /tmp/both" || bad "shell: '3 6 26' seen $(grep -c '^3 6 26$' $S) times, expected 2"
+expect "shell: def and a call" $S '^hello world from a function$'
+[ "$(grep -c '^history-probe$' $S)" = 2 ] && ok "shell: up-arrow recalls an earlier line" || bad "shell: history-probe seen $(grep -c '^history-probe$' $S) times, expected 2"
+expect "shell: Tab completes a command name (ec -> echo)" $S '^completed-command$'
+expect "shell: Ctrl-C ends a three-stage pipeline (status 130)" $S '^pipeline interrupted 130$'
+expect "shell: no here-documents: cat << EOF reads the console until Ctrl-C" $S '^no-heredoc 130$'
+expect "shell: seq, sort -r, head" $S '^5$'
+expect "shell: sort | uniq -c" $S '^ *2 pear$'
+expect "shell: tr" $S '^SHOUT$'
+expect "shell: od" $S '^61 62 63 0a$'
+expect "shell: cut" $S '^mid$'
+expect "shell: tee into a file and a pipe" $S '^1 1 12$'
+expect "shell: ... the file" $S '^through-tee$'
+expect "shell: mv" $S '^moved-u$'
+expect "shell: touch" $S '^touched$'
+expect "shell: free (Hamnix's, reading /proc/meminfo)" $S '^Mem: +[0-9]+ +[0-9]+$'
+expect "shell: df (reading /proc/mounts)" $S '^sd0 +/sd +vfat +rw$'
+expect "shell: date before the clock is set says so and fails" $S '^date-unset 1$'
+expect "shell: setdate, then date" $S '^2026-11-27 12:00:0[0-9] UTC$'
+up="$(sed -n 's/^\([0-9]*\)\.[0-9]* \([0-9]*\)\.[0-9]*$/\1 \2/p' $S | tail -1)"
+if [ -n "$up" ]; then set -- $up; [ "$2" -ge 2 ] && ok "shell: sleep 2 was spent idle (/proc/uptime: up $1 s, idle $2 s)" || bad "shell: idle time $2 s after sleep 2"; else bad "shell: no /proc/uptime line"; fi
+wk="$(sed -n 's/^  processor wake-ups from sleep: *\([0-9]*\)\.[0-9]* per second.*/\1/p' $S | tr '\n' ' ')"
+set -- $wk
+if [ $# = 2 ]; then
+    echo "[test] info: idle at the shell: $1 processor wake-ups per second with tickless idle, $2 with the periodic tick"
+    [ "$1" -le 20 ] && ok "shell: idle with tickless idle: $1 wake-ups per second (20 or fewer)" || bad "shell: $1 wake-ups per second with tickless idle"
+    [ "$2" -ge 900 ] && ok "shell: the same with the periodic tick: $2 per second" || bad "shell: $2 wake-ups per second with the periodic tick, expected about 1000"
+else
+    bad "shell: idlestat printed '$wk'"
+fi
+expect "shell: idlestat: no tick interrupt was taken in 3 idle seconds" $S '^  tick interrupts taken: +0\.[0-9] per second'
+expect "shell: suspend, ended by a key after about 1.5 s" $S '^woke: console after 1[0-9][0-9][0-9] ms, processor woken [0-9]+ times in all suspends$'
+expect "shell: suspend 2 -n, ended by its timer after 2000 ms" $S '^woke: timer after 2000 ms, processor woken [0-9]+ times in all suspends$'
+[ "$(grep -c '^persistent-history-probe$' $S)" = 2 ] && ok "shell: history survives exit: the next shell recalls a line of the previous one" || bad "shell: persistent-history-probe seen $(grep -c '^persistent-history-probe$' $S) times, expected 2"
 expect "shell: a pasted block of 60 command lines (2 KB in one write): every line ran, in order" $S '^60 180 900$'
 nmark="$(grep -c '^0 0 0$' $S)"
 [ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"

@@ -15,7 +15,7 @@
 #             not a hang.
 #   receive   one byte per DMA transfer: STARTRX with MAXCNT 1; ENDRX
 #             interrupts; uarte_getc takes the byte and starts the next
-#             transfer.  Bytes that arrive in between wait in the UARTE's
+#             transfer (_rx_start has the order of that, and why).  Bytes that arrive in between wait in the UARTE's
 #             RX FIFO (product specification, UARTE reception), so a late
 #             interrupt loses nothing until that FIFO is full; when it is,
 #             ERRORSRC.OVERRUN says so and uarte_rx_overruns counts it.
@@ -40,6 +40,7 @@ UARTE_TASKS_STOPRX: uint64 = 0x004       # hdr: NRF_UARTE_Type.TASKS_STOPRX
 UARTE_TASKS_STARTTX: uint64 = 0x008      # hdr: NRF_UARTE_Type.TASKS_STARTTX
 UARTE_TASKS_STOPTX: uint64 = 0x00C       # hdr: NRF_UARTE_Type.TASKS_STOPTX
 UARTE_EVENTS_ENDRX: uint64 = 0x110       # hdr: NRF_UARTE_Type.EVENTS_ENDRX
+UARTE_EVENTS_RXTO: uint64 = 0x144        # hdr: NRF_UARTE_Type.EVENTS_RXTO
 UARTE_EVENTS_ENDTX: uint64 = 0x120       # hdr: NRF_UARTE_Type.EVENTS_ENDTX
 UARTE_EVENTS_ERROR: uint64 = 0x124       # hdr: NRF_UARTE_Type.EVENTS_ERROR
 UARTE_EVENTS_TXSTOPPED: uint64 = 0x158   # hdr: NRF_UARTE_Type.EVENTS_TXSTOPPED
@@ -74,7 +75,8 @@ UARTE_CONFIG_8N1: uint32 = 0             # unchecked: HWFC off, PARITY excluded,
 UARTE_TX_SPINS: uint32 = 200000          # unchecked: policy -- polls of ENDTX per character (>> 87 us at 64 MHz)
 
 ua_tx: Array[2, uint32]                  # one-byte DMA buffers (word-sized slots), per instance
-ua_rx: Array[2, uint32]
+ua_rx: Array[4, uint32]                  # per instance: the DMA word, then a guard word
+UARTE_RX_GUARD: uint32 = 0xC0DEC0DE      # unchecked: a value nothing writes: the word behind each receive buffer
 uarte_tx_timeouts: uint64 = 0            # characters given up on
 uarte_rx_errors: uint64 = 0              # ERROR events cleared
 uarte_last_errorsrc: uint32 = 0
@@ -167,14 +169,43 @@ def uarte_flush(base: uint64):
     return
 
 
+# Start the next one-byte transfer.  The order matters twice over.
+#
+# Hardware: the ENDRX event must be cleared BEFORE STARTRX.  A byte waiting
+# in the FIFO completes the new transfer at once, and clearing afterwards
+# would wipe that completion.
+#
+# Renode's model (the only place this has run): it keeps transferring
+# arriving bytes whenever the ENDRX event is clear, counting from where the
+# last transfer stopped, and raises ENDRX only when its count EQUALS MAXCNT.
+# A byte that arrives between the clear and the STARTRX (its terminal runs
+# on another host thread, and a pasted block arrives all at once) made the
+# count 2, never equal to 1, and every later byte was written on through
+# memory behind the buffer.  So MAXCNT is 2 while the event is being
+# cleared: such a byte then lands in the second byte of this word, completes
+# a "transfer" and raises ENDRX, and uarte_getc finds it there.  The word is
+# zeroed first so that the two cases can be told apart; a second byte that
+# is zero reads the same either way.  On hardware MAXCNT is only looked at
+# when STARTRX is triggered, so none of this changes anything there.
 def _rx_start(base: uint64, i: uint32):
-    mmio_write32(base + UARTE_RXD_PTR, cast[uint32](cast[uint64](&ua_rx[i])))
+    ua_rx[i * 2] = 0
+    mmio_write32(base + UARTE_RXD_MAXCNT, 2)
+    mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+    mmio_write32(base + UARTE_RXD_PTR, cast[uint32](cast[uint64](&ua_rx[i * 2])))
     mmio_write32(base + UARTE_RXD_MAXCNT, 1)
     mmio_write32(base + UARTE_TASKS_STARTRX, 1)
 
 
+# 1 while nothing has been written behind a receive buffer.
+def uarte_rx_guard_ok() -> uint32:
+    if ua_rx[1] == UARTE_RX_GUARD and ua_rx[3] == UARTE_RX_GUARD:
+        return 1
+    return 0
+
+
 def uarte_rx_irq_enable(base: uint64):
-    mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+    ua_rx[1] = UARTE_RX_GUARD
+    ua_rx[3] = UARTE_RX_GUARD
     mmio_write32(base + UARTE_EVENTS_ERROR, 0)
     mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX | UARTE_INT_ERROR)
     ua_rx_held[_idx(base)] = 0
@@ -194,9 +225,8 @@ def uarte_rx_hold(base: uint64, on: uint32):
     ua_rx_held[i] = on
     if on == 0 and ua_rx_idle[i] != 0:
         ua_rx_idle[i] = 0
-        mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
-        mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX)
         _rx_start(base, i)
+        mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX)
 
 
 def uarte_rx_ready(base: uint64) -> uint32:
@@ -205,22 +235,50 @@ def uarte_rx_ready(base: uint64) -> uint32:
     return 0
 
 
-# The received byte; the next transfer is started (unless held).  A transfer
-# that ended with nothing in it (AMOUNT 0: STOPRX) gives 0x100, which the
-# caller drops.  The byte is read BEFORE the event is cleared, and the
-# restart follows the clear at once: between the two nothing is in progress.
+# The received byte; the next transfer is started (unless held).  ENDRX
+# with MAXCNT 1 means one byte: the first byte of the word, or, in the
+# emulator's case described at _rx_start, the second.
 def uarte_getc(base: uint64) -> uint32:
     i: uint32 = _idx(base)
-    c: uint32 = 0x100
-    if mmio_read32(base + UARTE_RXD_AMOUNT) != 0:
-        c = ua_rx[i] & 0xFF
+    w: uint32 = ua_rx[i * 2]
+    c: uint32 = w & 0xFF
+    if ((w >> 8) & 0xFF) != 0:
+        c = (w >> 8) & 0xFF
     if ua_rx_held[i] != 0:
         mmio_write32(base + UARTE_INTENCLR, UARTE_INT_ENDRX)
         ua_rx_idle[i] = 1
     else:
-        mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
         _rx_start(base, i)
     return c
+
+
+# Switch the receiver off (suspend without the console as a wake source:
+# an enabled receiver keeps the high-frequency clock running) and on again.
+# STOPRX ends the transfer in progress (ENDRX with AMOUNT 0, then RXTO);
+# both events are discarded here, with the interrupt they raised.  Bytes
+# sent to the board meanwhile are lost, which is what "not a wake source"
+# means.  Interrupts off.
+def uarte_rx_off(base: uint64, irq_bit: uint32):
+    i: uint32 = _idx(base)
+    mmio_write32(base + UARTE_INTENCLR, UARTE_INT_ENDRX)
+    if ua_rx_idle[i] == 0:
+        mmio_write32(base + UARTE_TASKS_STOPRX, 1)
+        n: uint32 = 0
+        while mmio_read32(base + UARTE_EVENTS_RXTO) == 0 and n < UARTE_TX_SPINS:
+            n = n + 1
+        mmio_write32(base + UARTE_EVENTS_ENDRX, 0)   # stopped: nothing is transferred until STARTRX
+    mmio_write32(base + UARTE_EVENTS_RXTO, 0)
+    mmio_write32(0xE000E280, irq_bit)                # unchecked: NVIC ICPR0
+
+
+def uarte_rx_on(base: uint64):
+    i: uint32 = _idx(base)
+    if ua_rx_held[i] != 0:
+        ua_rx_idle[i] = 1
+    else:
+        ua_rx_idle[i] = 0
+        _rx_start(base, i)
+        mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX)
 
 
 def uarte_clear_errors(base: uint64):

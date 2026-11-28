@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- suspend [SECONDS] [-n]: put the whole system to sleep.
+#   suspend         until a key is pressed (a byte arrives at the console)
+#   suspend 30      until a key is pressed, at most 30 seconds
+#   suspend 30 -n   for 30 seconds; the console does NOT wake it (on the
+#                   Feather that lets the UART and the 32 MHz crystal go off)
+# Prints what ended it and how long it lasted.  System call 520
+# (kernel/power.ad); what "asleep" means is the board's business.
+
+extern def sys_suspend(ms: uint64, sources: uint32) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[uint8]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+buf: Array[1024, uint8]
+
+
+def puts(s: Ptr[uint8]):
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    sys_write(1, s, n)
+
+
+# The value of the line "label:   N" in /proc/power.
+def power_field(label: Ptr[uint8]) -> uint64:
+    fd: int32 = sys_open("/proc/power")
+    if fd < 0:
+        return 0
+    n: int64 = sys_read(fd, &buf[0], 1023)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    i: uint64 = 0
+    while i < cast[uint64](n):
+        j: uint64 = 0
+        while label[j] != 0 and i + j < cast[uint64](n) and buf[i + j] == label[j]:
+            j = j + 1
+        if label[j] == 0:
+            i = i + j
+            while i < cast[uint64](n) and (buf[i] < 48 or buf[i] > 57):
+                i = i + 1
+            v: uint64 = 0
+            while i < cast[uint64](n) and buf[i] >= 48 and buf[i] <= 57:
+                v = v * 10 + cast[uint64](buf[i] - 48)
+                i = i + 1
+            return v
+        while i < cast[uint64](n) and buf[i] != 10:
+            i = i + 1
+        i = i + 1
+    return 0
+
+
+def put_dec(v: uint64):
+    d: Array[24, uint8]
+    n: uint64 = 0
+    if v == 0:
+        d[0] = 48
+        n = 1
+    while v != 0:
+        d[n] = cast[uint8](48 + v % 10)
+        v = v / 10
+        n = n + 1
+    while n > 0:
+        n = n - 1
+        sys_write(1, &d[n], 1)
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    ms: uint64 = 0
+    sources: uint32 = 1
+    a: int32 = 1
+    while a < argc:
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv[a])
+        if s[0] == 45 and s[1] == 110 and s[2] == 0:
+            sources = sources & 2
+        else:
+            i: uint64 = 0
+            while s[i] >= 48 and s[i] <= 57:
+                ms = ms * 10 + cast[uint64](s[i] - 48)
+                i = i + 1
+            if s[i] != 0 or i == 0:
+                puts("usage: suspend [SECONDS] [-n]\n")
+                return 1
+            ms = ms * 1000
+            sources = sources | 2
+        a = a + 1
+    r: int32 = sys_suspend(ms, sources)
+    if r < 0:
+        puts("suspend: nothing could wake the system (give a time with -n), or the board cannot suspend\n")
+        return 1
+    puts("woke: ")
+    if r == 1:
+        puts("console")
+    else:
+        puts("timer")
+    puts(" after ")
+    put_dec(power_field("last_suspend_ms:"))
+    puts(" ms, processor woken ")
+    put_dec(power_field("suspend_wakes:"))
+    puts(" times in all suspends\n")
+    return 0

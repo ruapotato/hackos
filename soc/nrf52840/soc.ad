@@ -35,6 +35,7 @@ NUM_IRQS: uint32 = 48                # unchecked: SPIM3_IRQn (47) is the last; c
 
 # ---- CLOCK (NRF_CLOCK_Type) ---------------------------------------------------
 CLOCK_TASKS_HFCLKSTART: uint64 = 0x000   # hdr: NRF_CLOCK_Type.TASKS_HFCLKSTART
+CLOCK_TASKS_HFCLKSTOP: uint64 = 0x004    # hdr: NRF_CLOCK_Type.TASKS_HFCLKSTOP
 CLOCK_TASKS_LFCLKSTART: uint64 = 0x008   # hdr: NRF_CLOCK_Type.TASKS_LFCLKSTART
 CLOCK_TASKS_LFCLKSTOP: uint64 = 0x00C    # hdr: NRF_CLOCK_Type.TASKS_LFCLKSTOP
 CLOCK_EVENTS_HFCLKSTARTED: uint64 = 0x100   # hdr: NRF_CLOCK_Type.EVENTS_HFCLKSTARTED
@@ -156,6 +157,25 @@ def nrf52840_clocks_start():
     lfclk_ok = 0
     if (lst & CLOCK_LFCLKSTAT_STATE_MSK) != 0:
         lfclk_ok = 1
+
+
+# Release the 32 MHz crystal (the chip runs from HFINT, which starts in
+# microseconds and stops by itself in sleep) and ask for it again.  Used
+# around a suspend that does not need the UART.
+def nrf52840_hfxo_release():
+    mmio_write32(CLOCK_BASE + CLOCK_TASKS_HFCLKSTOP, 1)
+
+
+def nrf52840_hfxo_request():
+    mmio_write32(CLOCK_BASE + CLOCK_EVENTS_HFCLKSTARTED, 0)
+    mmio_write32(CLOCK_BASE + CLOCK_TASKS_HFCLKSTART, 1)
+    n: uint32 = 0
+    while n < WAIT_SPINS and mmio_read32(CLOCK_BASE + CLOCK_EVENTS_HFCLKSTARTED) == 0:
+        n = n + 1
+    st: uint32 = mmio_read32(CLOCK_BASE + CLOCK_HFCLKSTAT)
+    hfxo_ok = 0
+    if (st & CLOCK_HFCLKSTAT_SRC_MSK) != 0 and (st & CLOCK_HFCLKSTAT_STATE_MSK) != 0:
+        hfxo_ok = 1
 
 
 def ficr(off: uint64) -> uint32:

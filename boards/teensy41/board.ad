@@ -134,6 +134,27 @@ def board_systick_reload(hz: uint32) -> uint32:
 
 # The scheduler's tick: SysTick, `hz` times a second, calling the kernel's
 # systick_handler (exception 15) directly.
+# Tickless idle (kernel/sched/core.ad) is NOT used on this board: its
+# SysTick counts the 100 kHz reference, so stopping and restarting it
+# (kernel/tickless.ad) could lose up to 10 us each time, and whether that
+# clock keeps running in the chip's low-power modes has not been tried on a
+# board.  Returning 0 keeps the periodic tick.  A real implementation would
+# count time on a GPT and wake from its compare.
+def board_tick_stop_for(ticks: uint32) -> uint32:
+    return 0
+
+
+def board_tick_resume() -> uint32:
+    return 0
+
+
+# Suspend (kernel/power.ad) is not implemented on this board (it would be
+# the RT1062's low-power modes with a GPT or the SNVS clock as the wake
+# timer; nothing of that has been written or could be tried).
+def board_suspend(ms: uint64, sources: uint32, res: Ptr[uint64]) -> int32:
+    return 0
+
+
 def board_tick_start(hz: uint32):
     mmio_write32(0xE000E010, 0)
     mmio_write32(0xE000E014, board_systick_reload(hz))

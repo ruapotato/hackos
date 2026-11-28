@@ -8,15 +8,27 @@
 # it.  The RTC runs from LFCLK (32768 Hz) in sleep; Nordic's own and
 # Zephyr's system timers use RTC1 for the same reason.
 #
-# 32768 is not a multiple of 1000: compare event CC[0] is moved by 32 or 33
-# counts (32.768 on average, an exact remainder carried from tick to tick),
-# so `hz` ticks take exactly one second of LFCLK.  The handler delivers
-# every tick whose compare point has passed, so a late interrupt makes ticks
-# late, not lost; it never sets CC closer than 2 counts ahead of COUNTER
-# (the product specification: a CC of COUNTER or COUNTER+1 may not raise
-# COMPARE).  COUNTER is 24 bits; differences are taken modulo 2^24.
+# 32768 is not a multiple of 1000, so ticks are placed by arithmetic, not by
+# a fixed step: tick number k is due when the counter (extended to 64 bits
+# here, the hardware has 24) reaches ceil(k * 32768 / hz).  Consecutive
+# ticks are then 32 or 33 counts apart and `hz` of them take exactly one
+# second of LFCLK.  How many ticks are due is always computed from the
+# counter, so a late interrupt makes ticks late, not lost, and the compare
+# register can be set any number of ticks ahead:
+#
+#   periodic   CC[0] = the count of the next tick; the handler delivers
+#              every tick that is due and moves CC[0] on.
+#   tickless   rtc_tick_stop_for(n): CC[0] = the count of the n-th tick
+#              from now; the processor sleeps in System ON (WFI) with only
+#              the RTC running, until that compare or any other interrupt.
+#              rtc_tick_resume(): the ticks that are due by now are counted
+#              as skipped (the kernel moves its clock by them), and CC[0]
+#              goes back to the next tick.
+#
+# CC is never set closer than 2 counts ahead of COUNTER (the product
+# specification: a CC of COUNTER or COUNTER+1 may not raise COMPARE).
 
-from kernel.cpu import mmio_read32, mmio_write32
+from kernel.cpu import mmio_read32, mmio_write32, cpu_wfi
 
 RTC_TASKS_START: uint64 = 0x000          # hdr: NRF_RTC_Type.TASKS_START
 RTC_TASKS_STOP: uint64 = 0x004           # hdr: NRF_RTC_Type.TASKS_STOP
@@ -33,18 +45,42 @@ RTC_COUNTER_MASK: uint32 = 0xFFFFFF      # hdr: RTC_COUNTER_COUNTER_Msk
 LFCLK_HZ: uint32 = 32768                 # unchecked: LFCLK frequency (product specification)
 RTC_MAX_CATCHUP: uint32 = 1000           # unchecked: policy -- after a stall longer than this many ticks, the rest are dropped
 
+RTC_MAX_SLEEP_TICKS: uint32 = 60000      # unchecked: policy -- longest tickless stretch (60 s; the 24-bit counter wraps after 512 s)
+
 rtc_hz: uint32 = 1000
-rtc_next: uint32 = 0                     # COUNTER value of the next tick
-rtc_rem: uint32 = 0                      # carried remainder of 32768 / hz
+rtc_last24: uint32 = 0                   # COUNTER as last read
+rtc_count: uint64 = 0                    # the counter extended to 64 bits
+rtc_tick_no: uint64 = 0                  # ticks delivered or accounted for so far
+rtc_long: uint32 = 0                     # the tick is stopped (rtc_tick_stop_for)
 rtc_late: uint64 = 0                     # handler runs that delivered more than one tick
 rtc_dropped: uint64 = 0                  # ticks dropped after a stall
+rtc_stops: uint64 = 0                    # tickless stretches
 
 
-def _advance():
-    rtc_rem = rtc_rem + LFCLK_HZ
-    step: uint32 = rtc_rem / rtc_hz
-    rtc_rem = rtc_rem - step * rtc_hz
-    rtc_next = (rtc_next + step) & RTC_COUNTER_MASK
+# Read COUNTER and extend it.
+def _now(base: uint64) -> uint64:
+    c: uint32 = mmio_read32(base + RTC_COUNTER) & RTC_COUNTER_MASK
+    rtc_count = rtc_count + cast[uint64]((c - rtc_last24) & RTC_COUNTER_MASK)
+    rtc_last24 = c
+    return rtc_count
+
+
+# The count at which tick number k is due.
+def _due_count(k: uint64) -> uint64:
+    return (k * cast[uint64](LFCLK_HZ) + cast[uint64](rtc_hz) - 1) / cast[uint64](rtc_hz)
+
+
+# Ticks due at count `now` that have not been accounted for.
+def _due_ticks(now: uint64) -> uint64:
+    return now * cast[uint64](rtc_hz) / cast[uint64](LFCLK_HZ) - rtc_tick_no
+
+
+# Aim CC[0] at tick number k (at least 2 counts ahead).
+def _aim(base: uint64, k: uint64, now: uint64):
+    cc: uint64 = _due_count(k)
+    if cc < now + 2:
+        cc = now + 2
+    mmio_write32(base + RTC_CC0, cast[uint32](cc) & RTC_COUNTER_MASK)
 
 
 def rtc_tick_start(base: uint64, hz: uint32):
@@ -54,10 +90,11 @@ def rtc_tick_start(base: uint64, hz: uint32):
     mmio_write32(base + RTC_PRESCALER, 0)
     mmio_write32(base + RTC_TASKS_CLEAR, 1)
     rtc_hz = hz
-    rtc_rem = 0
-    rtc_next = 0
-    _advance()
-    mmio_write32(base + RTC_CC0, rtc_next)
+    rtc_last24 = 0
+    rtc_count = 0
+    rtc_tick_no = 0
+    rtc_long = 0
+    _aim(base, 1, 0)
     mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
     mmio_write32(base + RTC_INTENSET, RTC_INT_COMPARE0)
     mmio_write32(base + RTC_TASKS_START, 1)
@@ -68,21 +105,97 @@ def rtc_tick_start(base: uint64, hz: uint32):
 def rtc_tick_ack(base: uint64) -> uint32:
     mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
     mmio_read32(base + RTC_EVENTS_COMPARE0)          # the write has reached the peripheral
-    now: uint32 = mmio_read32(base + RTC_COUNTER) & RTC_COUNTER_MASK
-    n: uint32 = 0
-    # rtc_next <= now (modulo 2^24: the difference is less than half the range)
-    while ((now - rtc_next) & RTC_COUNTER_MASK) < 0x800000:
-        n = n + 1
-        _advance()
-        if n >= RTC_MAX_CATCHUP:
-            rtc_dropped = rtc_dropped + 1
-            rtc_next = now
-            _advance()
-            break
+    now: uint64 = _now(base)
+    n: uint64 = _due_ticks(now)
+    if n > cast[uint64](RTC_MAX_CATCHUP):
+        rtc_dropped = rtc_dropped + (n - cast[uint64](RTC_MAX_CATCHUP))
+        rtc_tick_no = rtc_tick_no + (n - cast[uint64](RTC_MAX_CATCHUP))
+        n = cast[uint64](RTC_MAX_CATCHUP)
     if n > 1:
         rtc_late = rtc_late + 1
-    if ((rtc_next - now) & RTC_COUNTER_MASK) < 2:
-        mmio_write32(base + RTC_CC0, (now + 2) & RTC_COUNTER_MASK)
-    else:
-        mmio_write32(base + RTC_CC0, rtc_next)
-    return n
+    rtc_tick_no = rtc_tick_no + n
+    _aim(base, rtc_tick_no + 1, now)
+    return cast[uint32](n)
+
+
+# Tickless idle: let up to `n` tick periods pass without an interrupt.
+# Interrupts off.  Returns 1 (always possible on this timer).
+def rtc_tick_stop_for(base: uint64, n: uint32) -> uint32:
+    if n > RTC_MAX_SLEEP_TICKS:
+        n = RTC_MAX_SLEEP_TICKS
+    now: uint64 = _now(base)
+    if _due_ticks(now) != 0:
+        return 0                        # a tick is due right now: take it first
+    _aim(base, rtc_tick_no + cast[uint64](n), now)
+    rtc_long = 1
+    rtc_stops = rtc_stops + 1
+    return 1
+
+
+# After the sleep: the ticks that are due are accounted for here (returned,
+# not delivered by the handler), and the compare goes back to the next tick.
+def rtc_tick_resume(base: uint64) -> uint32:
+    if rtc_long == 0:
+        return 0
+    rtc_long = 0
+    now: uint64 = _now(base)
+    n: uint64 = _due_ticks(now)
+    rtc_tick_no = rtc_tick_no + n
+    mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
+    _aim(base, rtc_tick_no + 1, now)
+    return cast[uint32](n)
+
+
+# Milliseconds since rtc_tick_start by the counter itself (for a suspend
+# that stops the kernel's clock: soc-level wall time).
+def rtc_count_ms(base: uint64) -> uint64:
+    return _now(base) * 1000 / cast[uint64](LFCLK_HZ)
+
+
+# Suspend (kernel/power.ad) on this timer: the processor sleeps until an
+# interrupt of `wake_irqs` (bits of NVIC ISER0) is pending or `ms`
+# milliseconds (0 = no limit) have passed.  Every other interrupt is
+# disabled at the NVIC meanwhile; this RTC's own (bit `rtc_irq_bit`) stays
+# enabled because its compare is what ends the wait, and with no limit it
+# still wakes the processor every 128 s so that the 24-bit counter is read
+# before it wraps.  Interrupts off (PRIMASK).  Returns 1 (a wake interrupt
+# is pending) or 2 (the time is up); res[0] = tick periods that passed (the
+# caller moves the kernel's clock by them), res[1] = times the processor
+# woke.
+def rtc_suspend(base: uint64, ms: uint64, wake_irqs: uint32, rtc_irq_bit: uint32, res: Ptr[uint64]) -> int32:
+    iser: uint32 = mmio_read32(0xE000E100)                  # unchecked: NVIC ISER0 (ARMv7-M)
+    mmio_write32(0xE000E180, iser & (0xFFFFFFFF ^ (wake_irqs | rtc_irq_bit)))     # unchecked: NVIC ICER0
+    start: uint64 = _now(base)
+    target: uint64 = start + ms * cast[uint64](LFCLK_HZ) / 1000
+    wakes: uint64 = 0
+    reason: int32 = 0
+    while reason == 0:
+        now: uint64 = _now(base)
+        if ms != 0 and now >= target:
+            reason = 2
+            break
+        nxt: uint64 = now + 0x400000
+        if ms != 0 and target < nxt:
+            nxt = target
+        if nxt < now + 2:
+            nxt = now + 2
+        mmio_write32(base + RTC_CC0, cast[uint32](nxt) & RTC_COUNTER_MASK)
+        mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
+        mmio_read32(base + RTC_EVENTS_COMPARE0)
+        mmio_write32(0xE000E280, rtc_irq_bit)               # unchecked: NVIC ICPR0 -- forget an earlier compare
+        if (mmio_read32(0xE000E200) & wake_irqs) == 0:      # unchecked: NVIC ISPR0
+            cpu_wfi()
+        wakes = wakes + 1
+        if (mmio_read32(0xE000E200) & wake_irqs) != 0:
+            reason = 1
+    end: uint64 = _now(base)
+    n: uint64 = _due_ticks(end)
+    rtc_tick_no = rtc_tick_no + n
+    mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
+    mmio_read32(base + RTC_EVENTS_COMPARE0)
+    mmio_write32(0xE000E280, rtc_irq_bit)
+    _aim(base, rtc_tick_no + 1, end)
+    mmio_write32(0xE000E100, iser)
+    res[0] = n
+    res[1] = wakes
+    return reason

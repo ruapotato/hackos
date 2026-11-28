@@ -54,6 +54,40 @@ shn hamsh /tmp/s.hsh
 sh echo second shell status $status
 sh for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] { echo loop $i | wc }
 sh ls /tmp | wc
+# milestone 4: /proc, more programs, kill, power.  Beside the shell this
+# board has one 32 KB and one 16 KB gap for programs (docs/boards/
+# feather-nrf52840.md), so the larger ones run one at a time, and a
+# pipeline starts its biggest stage first.
+sh ps
+sh free
+sh df
+sh setdate 1795780800
+sh date
+sh ptest loop &
+sh jobs
+killbg
+sleep 0.5
+sh echo job-check
+sh ptest outerr > /tmp/both 2>&1
+sh cat /tmp/both
+sh seq 5 > /tmp/n
+sh sort -r < /tmp/n | head -2
+sh echo Shout | tr a-z A-Z
+sh mv /tmp/n /tmp/moved-n
+sh ls /tmp
+shn cat | wc
+sleep 1
+raw 03
+sh echo pipeline interrupted $status
+sh idlestat 3
+sh idlestat 3 -p
+shn suspend 30
+sleep 2
+raw 0d
+sh echo after-suspend
+shn suspend 2 -n
+sleep 3
+sh echo after-timer-suspend
 # a pasted block: 40 command lines (1.4 KB) in one write to the UART
 paste 40 echo paste line x%02d >> /tmp/paste
 sh wc < /tmp/paste

@@ -19,7 +19,7 @@
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.rt import rt_memcpy
-from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, thread_killed, WAIT_FOREVER
+from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, thread_killed, sched_poll_wake, WAIT_FOREVER
 from mm.slab import kmalloc, kfree
 
 PIPE_MAX: uint32 = 16
@@ -259,6 +259,7 @@ def pipe_write(slot: int32, src: Ptr[uint8], n: uint64, noblock: uint32) -> int6
         done = done + cast[uint64](k)
         p[0].bytes = p[0].bytes + cast[uint64](k)
         wq_wake_all(&p[0].rd_wq)
+        sched_poll_wake()                       # a reader that polls instead of waiting
         cpu_irq_restore(irq)
         irq = cpu_irq_save()
     cpu_irq_restore(irq)

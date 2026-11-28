@@ -26,6 +26,7 @@
 
 from kernel.cpu import mmio_read32, mmio_write32
 from kernel.block.blk import blk_init
+from kernel.tickless import systick_stop_for, systick_resume, systick_suspend
 
 
 def board_name() -> Ptr[uint8]:
@@ -63,6 +64,27 @@ def board_tick_start(hz: uint32):
     mmio_write32(0xE000E014, board_systick_reload(hz))
     mmio_write32(0xE000E018, 0)
     mmio_write32(0xE000E010, board_systick_csr())
+
+
+# Tickless idle (kernel/sched/core.ad): stop the periodic tick for up to
+# `ticks` periods / say how many passed.  SysTick on the CPU clock:
+# kernel/tickless.ad.
+def board_tick_stop_for(ticks: uint32) -> uint32:
+    return systick_stop_for(ticks)
+
+
+def board_tick_resume() -> uint32:
+    return systick_resume()
+
+
+# Suspend (kernel/power.ad): sources bit 0 = a byte at the console (the
+# UART receive interrupt, IRQ 0), bit 1 = after `ms` milliseconds.  This
+# machine has no low-power timer: kernel/tickless.ad, systick_suspend.
+def board_suspend(ms: uint64, sources: uint32, res: Ptr[uint64]) -> int32:
+    irqs: uint32 = 0
+    if (sources & 1) != 0:
+        irqs = 1
+    return systick_suspend(ms, irqs, res)
 
 
 # Programs are copied whole into RAM here (PROG_ABI=pie): no flash window

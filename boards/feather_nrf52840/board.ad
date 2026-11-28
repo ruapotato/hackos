@@ -31,10 +31,10 @@ from mm.slab import kheap
 from drivers.tty.console import con_rx_bytes, con_rx_dropped, con_throttles, con_ring_max
 from mm.heap import heap_last_fail_size
 from mm.parena import pa_peak, pa_n_fail
-from soc.nrf52840.soc import UARTE0_BASE, UARTE0_IRQ, RTC1_BASE, RTC1_IRQ, P0_BASE, P1_BASE, FICR_INFO_PART, FICR_INFO_VARIANT, FICR_INFO_RAM, FICR_INFO_FLASH, FICR_DEVICEID0, FICR_DEVICEID1, nvic_enable, nrf52840_system_init, nrf52840_clocks_start, hfxo_ok, lfclk_ok, ficr, reset_reason, reset_reason_clear
-from soc.nrf52.uarte import uarte_init, uarte_putc, uarte_flush, uarte_rx_irq_enable, uarte_rx_ready, uarte_getc, uarte_clear_errors, uarte_rx_hold, uarte_hwfc, uarte_rx_overruns, uarte_rx_errors, UARTE_BAUD_115200
+from soc.nrf52840.soc import UARTE0_BASE, UARTE0_IRQ, RTC1_BASE, RTC1_IRQ, P0_BASE, P1_BASE, FICR_INFO_PART, FICR_INFO_VARIANT, FICR_INFO_RAM, FICR_INFO_FLASH, FICR_DEVICEID0, FICR_DEVICEID1, nvic_enable, nrf52840_system_init, nrf52840_clocks_start, nrf52840_hfxo_release, nrf52840_hfxo_request, hfxo_ok, lfclk_ok, ficr, reset_reason, reset_reason_clear
+from soc.nrf52.uarte import uarte_init, uarte_putc, uarte_flush, uarte_rx_irq_enable, uarte_rx_ready, uarte_getc, uarte_clear_errors, uarte_rx_hold, uarte_hwfc, uarte_rx_off, uarte_rx_on, uarte_rx_guard_ok, uarte_rx_overruns, uarte_rx_errors, UARTE_BAUD_115200
 from soc.nrf52.gpio import gpio_output, gpio_input, gpio_set, gpio_clear, gpio_toggle, PULL_UP, DRIVE_S0S1
-from soc.nrf52.rtc import rtc_tick_start, rtc_tick_ack
+from soc.nrf52.rtc import rtc_tick_start, rtc_tick_ack, rtc_tick_stop_for, rtc_tick_resume, rtc_suspend, rtc_stops
 from soc.nrf52.delay import delay_init, delay_us
 
 extern def __xbss_start()
@@ -180,6 +180,41 @@ def board_console_rx_irq_ack():
 def board_tick_start(hz: uint32):
     rtc_tick_start(RTC1_BASE, hz)
     nvic_enable(RTC1_IRQ, 0x80)
+
+
+# Tickless idle (kernel/sched/core.ad): RTC1's compare is set to the next
+# timer instead of the next tick, and the processor sleeps in System ON
+# with only the LFCLK and RTC1 running until then (soc/nrf52/rtc.ad).
+def board_tick_stop_for(ticks: uint32) -> uint32:
+    return rtc_tick_stop_for(RTC1_BASE, ticks)
+
+
+def board_tick_resume() -> uint32:
+    return rtc_tick_resume(RTC1_BASE)
+
+
+# Suspend (kernel/power.ad).  sources bit 0 = a byte at the console, bit 1 =
+# after `ms` milliseconds.  The processor sleeps in System ON; RTC1 on the
+# LFCLK measures the time and ends a timed suspend.
+#   console is a wake source   UARTE0 stays receiving, so the 32 MHz clock
+#                              stays on: the cheap suspend.
+#   console is not             the receiver is switched off and the crystal
+#                              released: only the LFCLK and RTC1 run.  Bytes
+#                              typed meanwhile are lost.
+# UNTESTED ON HARDWARE; in Renode the sleep, both wake sources and the time
+# accounting are exercised (tests/nrf52/), the currents cannot be.
+def board_suspend(ms: uint64, sources: uint32, res: Ptr[uint64]) -> int32:
+    irqs: uint32 = 0
+    if (sources & 1) != 0:
+        irqs = cast[uint32](1) << UARTE0_IRQ
+    else:
+        uarte_rx_off(UARTE0_BASE, cast[uint32](1) << UARTE0_IRQ)
+        nrf52840_hfxo_release()
+    r: int32 = rtc_suspend(RTC1_BASE, ms, irqs, cast[uint32](1) << RTC1_IRQ, res)
+    if (sources & 1) == 0:
+        nrf52840_hfxo_request()
+        uarte_rx_on(UARTE0_BASE)
+    return r
 
 
 # IRQ 17.  Runs the kernel's tick once per elapsed tick period.
@@ -347,7 +382,10 @@ def _mem_report():
     kput_u64(uarte_rx_overruns)
     kputs(", other UART errors ")
     kput_u64(uarte_rx_errors - uarte_rx_overruns)
-    kputs("\n")
+    if uarte_rx_guard_ok() != 0:
+        kputs(", DMA guard intact\n")
+    else:
+        kputs(", DMA GUARD OVERWRITTEN\n")
     kputs("memory: kernel heap peak ")
     kput_u64(cast[uint64](kheap.peak_bytes))
     kputs(" of ")

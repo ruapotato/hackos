@@ -19,7 +19,7 @@
 # Pointers from an unprivileged caller are checked against what the MPU lets
 # that caller touch before the kernel uses them.
 
-from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, thread_killed, tty_fg_pgid, KILL_EXIT_CODE, TF_USER, TF_PROC, T_UNUSED
+from kernel.sched.core import Thread, thr, current_thread, sched_current, sched_now, thread_create, thread_exit, thread_join, thread_yield, thread_sleep, thread_by_tid, set_current_errstr, thread_killed, thread_poll_wait, tty_fg_pgid, KILL_EXIT_CODE, TF_USER, TF_PROC, T_UNUSED
 from kernel.uaccess import uok, ustr
 from kernel.proc import proc_sys_spawn, proc_exec, proc_rfork, proc_waitpid, proc_waitpid_jc, proc_release_held
 from kernel.rt import rt_memcpy
@@ -27,6 +27,7 @@ from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
 from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
 from kernel.exit import hackos_exit
+from kernel.power import power_suspend
 
 extern def __text_end()
 extern def __vectors_start()
@@ -85,7 +86,9 @@ SYS_GETTID: uint32 = 515
 SYS_SLEEP_MS: uint32 = 516
 SYS_SPAWN: uint32 = 517             # (path, argv) -> pid: a new process, no fork involved
 SYS_HALT: uint32 = 518              # (status): report the status and reset the machine
+SYS_SUSPEND: uint32 = 520           # (ms, sources): suspend the system until a wake source fires
 
+NB_IDLE_SPINS: uint32 = 16          # empty polls in a row before a yield becomes a wait
 sys_count: uint64 = 0               # system calls dispatched so far
 sys_bad_ptr: uint64 = 0             # calls refused for a bad user pointer
 
@@ -156,6 +159,7 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         # a write to a pipe may have to wait for a child to read it
         if current_thread()[0].held_children != 0 and vfs_fd_is_pipe(cast[int32](a0)) != 0:
             proc_release_held()
+        current_thread()[0].nb_idle = 0
         return vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
     if nr == SYS_READ or nr == SYS_READ_NB:
         if uok(a1, a2, 1) == 0:
@@ -164,7 +168,17 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         nb: uint32 = 0
         if nr == SYS_READ_NB:
             nb = 1
-        return vfs_read(cast[int32](a0), cast[Ptr[uint8]](a1), a2, nb)
+        rr: int64 = vfs_read(cast[int32](a0), cast[Ptr[uint8]](a1), a2, nb)
+        # An empty non-blocking read followed by yield is how Hamnix's shell
+        # and its vi wait for a key.  Left alone, that loop keeps the
+        # processor busy for ever; the yield after an empty poll waits
+        # instead (SYS_YIELD below).  Reading or writing something ends it.
+        if nb != 0 and rr == 0:
+            if current_thread()[0].nb_idle <= NB_IDLE_SPINS:
+                current_thread()[0].nb_idle = current_thread()[0].nb_idle + 1
+        else:
+            current_thread()[0].nb_idle = 0
+        return rr
     if nr == SYS_OPEN:
         if ustr(a0) == 0:
             return _bad()
@@ -204,7 +218,16 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         return 0
     if nr == SYS_YIELD:
         proc_release_held()
-        thread_yield()
+        if current_thread()[0].nb_idle > NB_IDLE_SPINS:
+            # polled again and again, found nothing, yields: wait for
+            # input, a child ending or a pipe being written, at most
+            # IDLE_POLL_TICKS.  The first NB_IDLE_SPINS empty polls in a
+            # row are plain yields: Hamnix's shell begins every session
+            # with eight of them to throw away stale input, and that must
+            # stay as short as it was.
+            thread_poll_wait()
+        else:
+            thread_yield()
         return 0
     if nr == SYS_GETPID:
         return cast[int64](current_thread()[0].tid)
@@ -264,7 +287,15 @@ def _sys_p9(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint
         if a1 != 0 and uok(a1, 8, 1) == 0:
             return _bad()
         proc_release_held()
-        return proc_waitpid_jc(cast[int32](a0), cast[Ptr[int64]](a1))
+        wj: int64 = proc_waitpid_jc(cast[int32](a0), cast[Ptr[int64]](a1))
+        # "still running" followed by yield is how Hamnix's shell waits for
+        # a foreground job: an empty poll like the one in SYS_READ_NB
+        if wj == 0:
+            if current_thread()[0].nb_idle <= NB_IDLE_SPINS:
+                current_thread()[0].nb_idle = current_thread()[0].nb_idle + 1
+        else:
+            current_thread()[0].nb_idle = 0
+        return wj
     if nr == SYS_FDBIND:
         return cast[int64](vfs_fdbind(cast[int32](a0), cast[int32](a1), cast[int32](a2), cast[int32](a3)))
     if nr == SYS_FDSLOT_KIND:
@@ -361,6 +392,8 @@ def _sys_own(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> int6
     if nr == SYS_HALT:
         hackos_exit(cast[uint32](a0))
         return 0
+    if nr == SYS_SUSPEND:
+        return cast[int64](power_suspend(a0, cast[uint32](a1)))
     set_current_errstr("unknown syscall")
     return cast[int64](ENOSYS)
 
@@ -410,7 +443,7 @@ def _stack_args_slow(nr: uint32) -> uint32:
         return 2
     if nr == SYS_DUP2 or nr == SYS_GETCWD or nr == SYS_ERRSTR or nr == SYS_RENAME or nr == SYS_THREAD_JOIN or nr == SYS_MUNMAP or nr == SYS_NANOSLEEP:
         return 1
-    if nr == SYS_WAITPID or nr == SYS_WAITPID_JC or nr == SYS_SPAWN or nr == SYS_OPENCHAN or nr == SYS_FDSLOT_KIND or nr == SYS_FDSLOT_ARG or nr == SYS_SETPGID:
+    if nr == SYS_WAITPID or nr == SYS_WAITPID_JC or nr == SYS_SPAWN or nr == SYS_OPENCHAN or nr == SYS_FDSLOT_KIND or nr == SYS_FDSLOT_ARG or nr == SYS_SETPGID or nr == SYS_SUSPEND:
         return 1
     if nr == SYS_EXECVE:
         return 2
@@ -457,7 +490,7 @@ def syscall_dispatch(frame: uint64):
     # Asked to end (Ctrl-C) while inside the call: this is the place, with
     # every kernel lock released.
     if thread_killed() != 0 and (t[0].flags & TF_PROC) != 0:
-        thread_exit(KILL_EXIT_CODE)
+        thread_exit(cast[int64](t[0].kill_code))
     if nr == SYS_EXECVE and r == 0:
         # the caller's frame belongs to a program that no longer exists; the
         # return goes through the new program's first frame (kernel/proc.ad)
