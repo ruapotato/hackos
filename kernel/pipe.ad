@@ -91,6 +91,12 @@ def pipe_alloc_chan(owner: uint32) -> int32:
     return cast[int32](i)
 
 
+def pipe_owner(slot: int32) -> uint32:
+    if pipe_valid(slot) == 0:
+        return 0
+    return pipe_table[slot].owner
+
+
 def _pipe_free(slot: int32):
     irq: uint32 = cpu_irq_save()
     b: uint64 = 0

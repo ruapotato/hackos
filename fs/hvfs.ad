@@ -49,6 +49,7 @@
 # process is one thread); a new thread gets copies of its creator's.
 
 from board.board import board_storage_init
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.sched.core import Thread, thr, threads, current_thread, thread_by_tid, sched_current, set_current_errstr, sched_exit_hook, sched_exit_hook_set, sched_spawn_hook, sched_spawn_hook_set, T_UNUSED, THREAD_MAX, TF_PROC, PF_VFORK
 from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock, memcpy, memset, spinlock_lock, spinlock_unlock
 from kernel.rt import rt_memcpy, rt_memset
@@ -57,7 +58,7 @@ from drivers.tty.console import console_read, console_write
 from fs.vfs_mount import vfs_mount, vfs_umount, vfs_fs_kind, vfs_fs_rel, FS_KIND_TMPFS, FS_KIND_DEVFS, FS_KIND_CPIO, FS_KIND_PROCFS, FS_KIND_FAT
 from fs.fat import fat_init, fat_lookup, fat_read, fat_listdir, fat_create, fat_write, fat_delete
 from kernel.block.blk import blk_init
-from kernel.pipe import pipe_init, pipe_alloc_chan, pipe_valid, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_release_unbound
+from kernel.pipe import pipe_init, pipe_alloc_chan, pipe_valid, pipe_owner, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_release_unbound
 from fs.tmpfs import tmpfs_lookup, tmpfs_open_for_write_t, tmpfs_read, tmpfs_write, tmpfs_size, tmpfs_ftruncate, tmpfs_unlink, tmpfs_rename, tmpfs_mkdir, tmpfs_listdir, tmpfs_path_is_dir, tmpfs_path_exists, tmpfs_mtime, tmpfs_is_dir, tmpfs_table, TmpfsEntry, TMPFS_MAX_FILES
 
 # errno values (Linux numbering, as Hamnix returns them)
@@ -702,6 +703,109 @@ def vfs_fd_is_pipe(fd: int32) -> uint32:
     return 0
 
 
+# ---- who may bind what ------------------------------------------------
+# fdbind takes slot numbers, and a number can be guessed.  So a process may
+# bind only what it holds:
+#   a pipe    it created with pipechan, or has bound at one of its own names
+#             (that is how a child comes by one: the names are inherited);
+#   a file    it opened with openchan (a grant, below), or has bound already.
+# A child of rfork that has not exec'ed counts as its parent: it is the
+# parent's program running on the parent's memory.  Kernel threads and the
+# unprivileged threads of the kernel image (the tests) are not restricted.
+#
+# A grant is (process, tmpfs slot).  It lasts until the process ends or the
+# file is removed; the table is small and the oldest entry is overwritten
+# when it is full, so a grant should be used soon (the shell binds right
+# after openchan).
+class ChanGrant:
+    tid: uint32
+    slot: int32
+
+
+GRANT_MAX: uint32 = 32
+grants: Array[32, ChanGrant]
+grant_next: uint32 = 0
+fdbind_refused: uint64 = 0          # binds refused by these rules (statistics)
+
+
+def _grant_add(tid: uint32, slot: int32):
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    free: uint32 = GRANT_MAX
+    while i < GRANT_MAX:
+        if grants[i].tid == tid and grants[i].slot == slot:
+            cpu_irq_restore(irq)
+            return
+        if grants[i].tid == 0 and free == GRANT_MAX:
+            free = i
+        i = i + 1
+    if free == GRANT_MAX:
+        free = grant_next
+        grant_next = (grant_next + 1) % GRANT_MAX
+    grants[free].tid = tid
+    grants[free].slot = slot
+    cpu_irq_restore(irq)
+
+
+def _grant_has(tid: uint32, slot: int32) -> uint32:
+    i: uint32 = 0
+    while i < GRANT_MAX:
+        if grants[i].tid == tid and grants[i].slot == slot:
+            return 1
+        i = i + 1
+    return 0
+
+
+# Forget the grants of a process that has ended (slot < 0), or every grant
+# for a file that has been removed (tid 0).
+def _grant_drop(tid: uint32, slot: int32):
+    irq: uint32 = cpu_irq_save()
+    i: uint32 = 0
+    while i < GRANT_MAX:
+        if (slot < 0 and grants[i].tid == tid) or (slot >= 0 and grants[i].slot == slot):
+            grants[i].tid = 0
+        i = i + 1
+    cpu_irq_restore(irq)
+
+
+def _fdn_holds(t: Ptr[Thread], pipe: uint32, arg: int32) -> uint32:
+    n: uint32 = 0
+    while n < DEVFD_SLOTS:
+        k: int32 = t[0].fdn_kind[n]
+        if t[0].fdn_arg[n] == arg:
+            if pipe != 0 and (k == DEVFD_PIPE_R or k == DEVFD_PIPE_W):
+                return 1
+            if pipe == 0 and (k == DEVFD_FILE or k == DEVFD_FILE_APPEND):
+                return 1
+        n = n + 1
+    return 0
+
+
+# May `me` bind pipe slot / tmpfs slot `arg`?
+def _may_bind(me: Ptr[Thread], pipe: uint32, arg: int32) -> uint32:
+    if (me[0].flags & TF_PROC) == 0:
+        return 1
+    who: uint32 = me[0].tid
+    alt: uint32 = 0
+    if (me[0].pflags & PF_VFORK) != 0:
+        alt = me[0].ppid
+    if pipe != 0:
+        o: uint32 = pipe_owner(arg)
+        if o != 0 and (o == who or o == alt):
+            return 1
+    else:
+        if _grant_has(who, arg) != 0 or (alt != 0 and _grant_has(alt, arg) != 0):
+            return 1
+    if _fdn_holds(me, pipe, arg) != 0:
+        return 1
+    if alt != 0:
+        par: Ptr[Thread] = thread_by_tid(alt)
+        if par != cast[Ptr[Thread]](0) and _fdn_holds(par, pipe, arg) != 0:
+            return 1
+    fdbind_refused = fdbind_refused + 1
+    return 0
+
+
 # Drop what /fd/<n> of `t` is bound to.
 def _fdn_release(t: Ptr[Thread], n: uint32):
     kind: int32 = t[0].fdn_kind[n]
@@ -728,7 +832,9 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
             return _err(ESRCH, "fdbind: not a child of the caller")
     n: uint32 = cast[uint32](fdnum)
     pos: uint64 = 0
+    dup: uint32 = 0                     # a dup copies what the target already holds
     if kind == DEVFD_DUP:
+        dup = 1
         if arg < 0 or arg >= cast[int32](DEVFD_SLOTS):
             return _err(EINVAL, "fdbind: no such /fd name to duplicate")
         if arg == fdnum:
@@ -741,9 +847,13 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
     if kind == DEVFD_PIPE_R or kind == DEVFD_PIPE_W:
         if pipe_valid(arg) == 0:
             return _err(EBADF, "fdbind: no such pipe")
+        if dup == 0 and _may_bind(me, 1, arg) == 0:
+            return _err(EPERM, "fdbind: not a pipe of the caller")
     elif kind == DEVFD_FILE or kind == DEVFD_FILE_APPEND:
         if arg < 0 or arg >= cast[int32](TMPFS_MAX_FILES) or tmpfs_table[arg].used == 0 or tmpfs_is_dir(arg) != 0:
             return _err(EBADF, "fdbind: not an open file channel")
+        if dup == 0 and _may_bind(me, 0, arg) == 0:
+            return _err(EPERM, "fdbind: not a file the caller has opened")
     elif kind == DEVFD_CHAN:
         # exactly the values vfs_openchan hands out, nothing a caller made up
         cok: uint32 = 0
@@ -842,6 +952,8 @@ def vfs_openchan(path: Ptr[uint8], mode: int32) -> int32:
         if slot < 0:
             slot = _err(slot, "cannot truncate file")
     mutex_unlock(&fs_lock)
+    if slot >= 0:
+        _grant_add(current_thread()[0].tid, slot)       # the caller may bind it
     return slot
 
 
@@ -1059,6 +1171,8 @@ def vfs_unlink(path: Ptr[uint8]) -> int32:
     else:
         isdir: int32 = tmpfs_is_dir(slot)
         rc = tmpfs_unlink(_pc(&tk[0]))
+        if rc == 0:
+            _grant_drop(0, slot)        # the slot may become another file
         if rc == EEXIST and isdir != 0:
             rc = _err(ENOTEMPTY, "directory not empty")
     mutex_unlock(&fs_lock)
@@ -1324,6 +1438,7 @@ def _vfs_thread_exit(tp: uint64) -> int64:
         _fdn_release(t, n)
         n = n + 1
     pipe_release_unbound(t[0].tid)
+    _grant_drop(t[0].tid, -1)
     return 0
 
 

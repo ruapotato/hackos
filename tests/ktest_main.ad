@@ -1196,6 +1196,18 @@ def test_pipes():
     printk1("   ptest redir -> %d\n", cast[uint64](code))
     check(cast[uint32](code == 15), "/fd: the parent binds its child's /fd/1 to a file after the spawn; the child was held until then")
     vfs_unlink("/tmp/redir.out")
+    # a process cannot bind what it was not given, by guessing slot numbers
+    pargv[0] = cast[uint64]("/bin/ptest")
+    pargv[1] = cast[uint64]("hold")
+    hpid: int32 = proc_spawn("/bin/ptest", 2, &pargv[0], 3)
+    thread_sleep(20)
+    code = run_prog("/bin/ptest", "steal", nul, nul)
+    printk1("   ptest steal -> %d\n", cast[uint64](code))
+    proc_waitpid(hpid, 0)
+    check(cast[uint32]((code & 3) == 3), "fdbind: a process cannot bind another process's pipe or a file it has not opened, whatever slot number it tries")
+    check(cast[uint32]((code & 60) == 60), "fdbind: its own pipe, a file it opened, a dup, a pipe it already holds, and its rfork child binding the parent's pipe all still work")
+    vfs_unlink("/tmp/held.txt")
+    vfs_unlink("/tmp/mine.txt")
     check(cast[uint32](kheap.n_live == klive0 and vfs_open_count() == open0 and pipe_live == 0 and heap_check(&kheap) == 0), "pipe: nothing left allocated or open")
 
 
