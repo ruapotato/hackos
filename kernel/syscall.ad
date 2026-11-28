@@ -141,7 +141,15 @@ def _sys_nanosleep(req: uint64) -> int64:
     return 0
 
 
+# Dispatch.  The numbers come in three ranges (Hamnix's classic calls below
+# 256, its Plan 9 style ones from 256, HackOS's own from 512); each range
+# has its own chain of comparisons, so no call is found after more than the
+# calls of its own range.  read and write are first.
 def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64:
+    if nr >= 512:
+        return _sys_own(nr, a0, a1, a2, a3)
+    if nr >= 256:
+        return _sys_p9(nr, a0, a1, a2, a3, a4)
     if nr == SYS_WRITE:
         if uok(a1, a2, 0) == 0:
             return _bad()
@@ -165,12 +173,6 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_open(cast[Ptr[uint8]](a0), OWRITE | OTRUNC | OCREATE))
-    if nr == SYS_CREATE:
-        if ustr(a0) == 0:
-            return _bad()
-        if (a2 & cast[uint64](DMDIR)) != 0:
-            return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
-        return cast[int64](vfs_open(cast[Ptr[uint8]](a0), ORDWR | OTRUNC | OCREATE))
     if nr == SYS_CLOSE:
         return cast[int64](vfs_close(cast[int32](a0)))
     if nr == SYS_LSEEK:
@@ -181,7 +183,7 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         if cast[int32](a1) < 0:
             return cast[int64](EINVAL)
         return cast[int64](vfs_dup2(cast[int32](a0), cast[int32](a1)))
-    if nr == SYS_UNLINK or nr == SYS_REMOVE:
+    if nr == SYS_UNLINK:
         if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_unlink(cast[Ptr[uint8]](a0)))
@@ -189,18 +191,6 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         if ustr(a0) == 0:
             return _bad()
         return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
-    if nr == SYS_RENAME:
-        if ustr(a0) == 0 or ustr(a1) == 0:
-            return _bad()
-        return cast[int64](vfs_rename(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1)))
-    if nr == SYS_STAT_P9:
-        if ustr(a0) == 0 or uok(a1, a2, 1) == 0:
-            return _bad()
-        return vfs_stat(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1), a2)
-    if nr == SYS_FSTAT_P9:
-        if uok(a1, a2, 1) == 0:
-            return _bad()
-        return vfs_fstat(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
     if nr == SYS_CHDIR:
         if ustr(a0) == 0:
             return _bad()
@@ -209,10 +199,6 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         if uok(a0, a1, 1) == 0:
             return _bad()
         return vfs_getcwd(cast[Ptr[uint8]](a0), a1)
-    if nr == SYS_ERRSTR:
-        if uok(a0, a1, 1) == 0:
-            return _bad()
-        return _sys_errstr(a0, a1)
     if nr == SYS_EXIT:
         thread_exit(cast[int64](a0))
         return 0
@@ -220,14 +206,49 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
         proc_release_held()
         thread_yield()
         return 0
-    if nr == SYS_GETPID or nr == SYS_GETTID:
+    if nr == SYS_GETPID:
         return cast[int64](current_thread()[0].tid)
     if nr == SYS_GET_JIFFIES:
         return cast[int64](sched_now() / 10)        # 100 Hz, as in Hamnix
-    if nr == SYS_SLEEP_MS:
-        proc_release_held()
-        thread_sleep(a0)
+    if nr == SYS_PUTC:
+        ch: Array[8, uint8]
+        ch[0] = cast[uint8](a0)
+        console_write(&ch[0], 1)
         return 0
+    if nr == SYS_EXECVE:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](proc_exec(cast[Ptr[uint8]](a0), a1, a2))
+    if nr == SYS_WAITPID:
+        proc_release_held()
+        return proc_waitpid(cast[int32](a0), cast[uint32](a1))
+    set_current_errstr("unknown syscall")
+    return cast[int64](ENOSYS)
+
+
+def _sys_p9(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64) -> int64:
+    if nr == SYS_CREATE:
+        if ustr(a0) == 0:
+            return _bad()
+        if (a2 & cast[uint64](DMDIR)) != 0:
+            return cast[int64](vfs_mkdir(cast[Ptr[uint8]](a0)))
+        return cast[int64](vfs_open(cast[Ptr[uint8]](a0), ORDWR | OTRUNC | OCREATE))
+    if nr == SYS_REMOVE:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_unlink(cast[Ptr[uint8]](a0)))
+    if nr == SYS_STAT_P9:
+        if ustr(a0) == 0 or uok(a1, a2, 1) == 0:
+            return _bad()
+        return vfs_stat(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1), a2)
+    if nr == SYS_FSTAT_P9:
+        if uok(a1, a2, 1) == 0:
+            return _bad()
+        return vfs_fstat(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    if nr == SYS_ERRSTR:
+        if uok(a0, a1, 1) == 0:
+            return _bad()
+        return _sys_errstr(a0, a1)
     if nr == SYS_NANOSLEEP:
         if uok(a0, 16, 0) == 0 or (a1 != 0 and uok(a1, 16, 1) == 0):
             return _bad()
@@ -237,36 +258,8 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
             cast[Ptr[int64]](a1)[0] = 0     # never interrupted: nothing remains
             cast[Ptr[int64]](a1)[1] = 0
         return rs
-    if nr == SYS_PUTC:
-        ch: Array[8, uint8]
-        ch[0] = cast[uint8](a0)
-        console_write(&ch[0], 1)
-        return 0
-    if nr == SYS_THREAD_SPAWN:
-        return _sys_thread_spawn(a0, a1, a2, a3)
-    if nr == SYS_THREAD_JOIN:
-        if (current_thread()[0].flags & TF_PROC) != 0:
-            set_current_errstr("thread_join: a process has one thread; use waitpid")
-            return cast[int64](ENOSYS)
-        if a1 != 0 and uok(a1, 8, 1) == 0:
-            return _bad()
-        return cast[int64](thread_join(cast[uint32](a0), cast[Ptr[int64]](a1)))
-    if nr == SYS_EXECVE:
-        if ustr(a0) == 0:
-            return _bad()
-        return cast[int64](proc_exec(cast[Ptr[uint8]](a0), a1, a2))
-    if nr == SYS_SPAWN:
-        if ustr(a0) == 0:
-            return _bad()
-        return cast[int64](proc_sys_spawn(cast[Ptr[uint8]](a0), a1))
     if nr == SYS_RFORK:
         return cast[int64](proc_rfork(cast[uint32](a0)))
-    if nr == SYS_HALT:
-        hackos_exit(cast[uint32](a0))
-        return 0
-    if nr == SYS_WAITPID:
-        proc_release_held()
-        return proc_waitpid(cast[int32](a0), cast[uint32](a1))
     if nr == SYS_WAITPID_JC:
         if a1 != 0 and uok(a1, 8, 1) == 0:
             return _bad()
@@ -341,8 +334,78 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
     return cast[int64](ENOSYS)
 
 
+def _sys_own(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> int64:
+    if nr == SYS_GETTID:
+        return cast[int64](current_thread()[0].tid)
+    if nr == SYS_RENAME:
+        if ustr(a0) == 0 or ustr(a1) == 0:
+            return _bad()
+        return cast[int64](vfs_rename(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1)))
+    if nr == SYS_SLEEP_MS:
+        proc_release_held()
+        thread_sleep(a0)
+        return 0
+    if nr == SYS_THREAD_SPAWN:
+        return _sys_thread_spawn(a0, a1, a2, a3)
+    if nr == SYS_THREAD_JOIN:
+        if (current_thread()[0].flags & TF_PROC) != 0:
+            set_current_errstr("thread_join: a process has one thread; use waitpid")
+            return cast[int64](ENOSYS)
+        if a1 != 0 and uok(a1, 8, 1) == 0:
+            return _bad()
+        return cast[int64](thread_join(cast[uint32](a0), cast[Ptr[int64]](a1)))
+    if nr == SYS_SPAWN:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](proc_sys_spawn(cast[Ptr[uint8]](a0), a1))
+    if nr == SYS_HALT:
+        hackos_exit(cast[uint32](a0))
+        return 0
+    set_current_errstr("unknown syscall")
+    return cast[int64](ENOSYS)
+
+
 # Number of arguments passed on the caller's stack (a1 and up) per call.
+# Looked up in a table that syscall_init() fills from _stack_args_slow(), so
+# the chain below is walked once per number at boot, not at every call.
+sys_nargs: Array[160, uint8]        # 0..31, 256..351 at 32.., 512..543 at 128..
+sys_nargs_ready: uint32 = 0
+
+
+def _nargs_index(nr: uint32) -> uint32:
+    if nr < 32:
+        return nr
+    if nr >= 256 and nr < 352:
+        return nr - 256 + 32
+    if nr >= 512 and nr < 544:
+        return nr - 512 + 128
+    return 160
+
+
+def syscall_init():
+    i: uint32 = 0
+    while i < 32:
+        sys_nargs[i] = cast[uint8](_stack_args_slow(i))
+        i = i + 1
+    i = 0
+    while i < 96:
+        sys_nargs[32 + i] = cast[uint8](_stack_args_slow(256 + i))
+        i = i + 1
+    i = 0
+    while i < 32:
+        sys_nargs[128 + i] = cast[uint8](_stack_args_slow(512 + i))
+        i = i + 1
+    sys_nargs_ready = 1
+
+
 def _stack_args(nr: uint32) -> uint32:
+    i: uint32 = _nargs_index(nr)
+    if i < 160 and sys_nargs_ready != 0:
+        return cast[uint32](sys_nargs[i])
+    return _stack_args_slow(nr)
+
+
+def _stack_args_slow(nr: uint32) -> uint32:
     if nr == SYS_WRITE or nr == SYS_READ or nr == SYS_READ_NB or nr == SYS_LSEEK or nr == SYS_CREATE or nr == SYS_STAT_P9 or nr == SYS_FSTAT_P9:
         return 2
     if nr == SYS_DUP2 or nr == SYS_GETCWD or nr == SYS_ERRSTR or nr == SYS_RENAME or nr == SYS_THREAD_JOIN or nr == SYS_MUNMAP or nr == SYS_NANOSLEEP:

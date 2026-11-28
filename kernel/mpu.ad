@@ -151,26 +151,48 @@ def mpu_proc_rbar(base: uint32) -> uint32:
     return (base & 0xFFFFFFE0) | 0x15           # VALID | region 5
 
 
+# What the MPU needs to know about a thread, precomputed when the thread is
+# made so that the context switch only copies words into registers.
+class MpuCtx:
+    r6: uint32                      # RBAR of the user-stack guard (VALID | region 6); 0 = none
+    r7: uint32                      # RBAR of the kernel-stack guard (VALID | region 7)
+    kind: uint32                    # 0 kernel thread, 1 in-image unprivileged thread, 2 process
+    rbar: uint32                    # region 5 of a process (mpu_proc_rbar/_rasr)
+    rasr: uint32
+    pad: uint32
+
+
+mpu_r6_on: uint32 = 0               # region 6 is programmed (a user-stack guard is in place)
+
+
+def mpu_ctx_set(c: Ptr[MpuCtx], ustack_base: uint64, kstack_base: uint64, kind: uint32):
+    c[0].r6 = 0
+    if ustack_base != 0:
+        c[0].r6 = (cast[uint32](ustack_base) & 0xFFFFFFE0) | 0x16
+    c[0].r7 = (cast[uint32](kstack_base) & 0xFFFFFFE0) | 0x17
+    c[0].kind = kind
+
+
 # Set up the MPU for the thread about to run.  Called at every context
 # switch (and by exec for the running thread) with kernel interrupts masked.
-#   ustack_base, kstack_base   stack guards (0 = that stack has no guard)
-#   kind                       0 kernel thread, 1 in-image unprivileged
-#                              thread, 2 process
-#   rbar, rasr                 region 5 of a process (mpu_proc_rbar/_rasr)
-def mpu_switch(ustack_base: uint64, kstack_base: uint64, kind: uint32, rbar: uint32, rasr: uint32):
+# Between kernel threads this is two register writes: the kernel-stack guard.
+def mpu_switch(c: Ptr[MpuCtx]):
     if mpu_enabled == 0:
         return
-    if ustack_base != 0:
-        mmio_write32(MPU_RBAR, (cast[uint32](ustack_base) & 0xFFFFFFE0) | 0x16)     # VALID | region 6
+    if c[0].r6 != 0:
+        mmio_write32(MPU_RBAR, c[0].r6)
         mmio_write32(MPU_RASR, MPU_XN | 0x00020000 | (9 << 1) | 1)                    # 1 KB, no access
-    else:
+        mpu_r6_on = 1
+    elif mpu_r6_on != 0:
         mmio_write32(MPU_RNR, 6)
         mmio_write32(MPU_RASR, 0)
-    mmio_write32(MPU_RBAR, (cast[uint32](kstack_base) & 0xFFFFFFE0) | 0x17)
+        mpu_r6_on = 0
+    mmio_write32(MPU_RBAR, c[0].r7)
     mmio_write32(MPU_RASR, MPU_XN | 0x00020000 | (9 << 1) | 1)
+    kind: uint32 = c[0].kind
     if kind == 2:
-        mmio_write32(MPU_RBAR, rbar)
-        mmio_write32(MPU_RASR, rasr)
+        mmio_write32(MPU_RBAR, c[0].rbar)
+        mmio_write32(MPU_RASR, c[0].rasr)
         if mpu_mode != MPU_MODE_PROC:
             mmio_write32(MPU_RNR, 4)
             mmio_write32(MPU_RASR, 0)
