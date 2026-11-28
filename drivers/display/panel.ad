@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the display driver model, shaped by e-paper.
+#
+# An e-paper panel is not a frame buffer that is simply written to:
+#   * A refresh takes a long time (a third of a second to seconds) and the
+#     panel is BUSY for all of it; nothing may be sent meanwhile.
+#   * There are kinds of refresh.  A FULL refresh flashes the whole panel
+#     and leaves a clean image.  A PARTIAL refresh redraws one rectangle
+#     quickly, without the flash, but leaves a little of the old image
+#     behind each time (ghosting), so after some number of them a full
+#     refresh is due.  Grey levels (2 bits per pixel) need the full
+#     waveform on the controllers in question (SSD1677 and its relatives).
+#   * Between refreshes the image stays without power; the driver can put
+#     the controller to sleep.
+#
+# So a panel driver is four functions and a few numbers:
+#     init()                        bring the controller up; 0 or an error
+#     refresh(fb, x, y, w, h, kind) send that rectangle and start a refresh
+#                                   of that kind; returns the time in ms the
+#                                   panel will be busy, or a negative error
+#     busy()                        1 while the last refresh is running
+#     sleep()                       controller to deep sleep
+# and what it can do: size, bits per pixel, whether it has partial refresh,
+# after how many partial refreshes a full one is due.
+#
+# display_flush() is the policy on top: nothing to do when the buffer is
+# clean; a full refresh when the buffer is grey, when the panel has no
+# partial mode, when the ghosting limit is reached or when most of the
+# screen changed; otherwise a partial refresh of the dirty rectangle
+# (aligned to whole bytes, as the controllers' RAM windows are).  It never
+# talks to a busy panel: it reports DISPLAY_BUSY and the caller comes back
+# (the console's display thread sleeps the time the driver gave).
+#
+# Function pointers are kept in arrays beside the table, as in
+# kernel/block/blk.ad (a call through a class field is outside the
+# compiler's subset on this target).
+
+from drivers.display.fb import Fb, fb_is_dirty, fb_clean, fb_dirty
+
+PANEL_MAX: uint32 = 2
+REFRESH_FULL: uint32 = 1
+REFRESH_PARTIAL: uint32 = 2
+DISPLAY_CLEAN: int32 = 0            # nothing had changed
+DISPLAY_BUSY: int32 = -16           # the panel is still refreshing
+DISPLAY_ERR: int32 = -5
+
+
+class Panel:
+    used: uint32
+    w: uint32
+    h: uint32
+    bpp: uint32
+    partial: uint32                 # 1: has a partial refresh
+    max_partials: uint32            # partial refreshes allowed between two full ones
+    since_full: uint32              # partial refreshes since the last full one
+    n_full: uint64
+    n_partial: uint64
+    busy_ms: uint64                 # refresh time asked of the panel so far
+    last_ms: uint32                 # ... by the last refresh
+    pixels_sent: uint64
+    force_full: uint32              # the next flush is a full refresh whatever changed
+
+
+panels: Array[2, Panel]
+panel_init_fn: Array[2, Fn[int32]]
+panel_refresh_fn: Array[2, Fn[int32, uint64, uint32, uint32, uint32, uint32, uint32]]
+panel_busy_fn: Array[2, Fn[uint32]]
+panel_sleep_fn: Array[2, Fn[int32]]
+
+
+# Returns the panel's number, or -1.
+def panel_register(w: uint32, h: uint32, bpp: uint32, partial: uint32, max_partials: uint32, init: Fn[int32], refresh: Fn[int32, uint64, uint32, uint32, uint32, uint32, uint32], busy: Fn[uint32], sleep: Fn[int32]) -> int32:
+    i: uint32 = 0
+    while i < PANEL_MAX and panels[i].used != 0:
+        i = i + 1
+    if i == PANEL_MAX:
+        return -1
+    p: Ptr[Panel] = &panels[i]
+    p[0].w = w
+    p[0].h = h
+    p[0].bpp = bpp
+    p[0].partial = partial
+    p[0].max_partials = max_partials
+    p[0].since_full = 0
+    p[0].n_full = 0
+    p[0].n_partial = 0
+    p[0].busy_ms = 0
+    p[0].last_ms = 0
+    p[0].pixels_sent = 0
+    p[0].force_full = 1             # the first refresh of a panel is a full one
+    panel_init_fn[i] = init
+    panel_refresh_fn[i] = refresh
+    panel_busy_fn[i] = busy
+    panel_sleep_fn[i] = sleep
+    p[0].used = 1
+    if init() != 0:
+        p[0].used = 0
+        return -1
+    return cast[int32](i)
+
+
+# (A function pointer is copied into a local before the call: a call
+# straight through an array element is outside the compiler's subset.)
+def panel_busy(id: int32) -> uint32:
+    f: Fn[uint32] = panel_busy_fn[id]
+    return f()
+
+
+def panel_sleep(id: int32) -> int32:
+    f: Fn[int32] = panel_sleep_fn[id]
+    return f()
+
+
+def _send(id: int32, f: Ptr[Fb], x: uint32, y: uint32, w: uint32, h: uint32, kind: uint32) -> int32:
+    p: Ptr[Panel] = &panels[id]
+    # Clean BEFORE sending: what is drawn while the rectangle goes out (the
+    # console writes from interrupt handlers too) makes the buffer dirty
+    # again and is sent next time, instead of being forgotten.
+    fb_clean(f)
+    rf: Fn[int32, uint64, uint32, uint32, uint32, uint32, uint32] = panel_refresh_fn[id]
+    ms: int32 = rf(cast[uint64](f), x, y, w, h, kind)
+    if ms < 0:
+        fb_dirty(f, x, y, w, h)
+        return DISPLAY_ERR
+    if kind == REFRESH_FULL:
+        p[0].n_full = p[0].n_full + 1
+        p[0].since_full = 0
+        p[0].force_full = 0
+    else:
+        p[0].n_partial = p[0].n_partial + 1
+        p[0].since_full = p[0].since_full + 1
+    p[0].busy_ms = p[0].busy_ms + cast[uint64](ms)
+    p[0].last_ms = cast[uint32](ms)
+    p[0].pixels_sent = p[0].pixels_sent + cast[uint64](w) * cast[uint64](h)
+    return ms
+
+
+# Send what has changed.  Returns the kind of refresh started (REFRESH_FULL
+# or REFRESH_PARTIAL; panels[id].last_ms says how long the panel is busy
+# now), DISPLAY_CLEAN, DISPLAY_BUSY or DISPLAY_ERR.
+def display_flush(id: int32, f: Ptr[Fb]) -> int32:
+    p: Ptr[Panel] = &panels[id]
+    if p[0].used == 0 or f[0].w != p[0].w or f[0].h != p[0].h or f[0].bpp != p[0].bpp:
+        return DISPLAY_ERR
+    if fb_is_dirty(f) == 0 and p[0].force_full == 0:
+        return DISPLAY_CLEAN
+    if panel_busy(id) != 0:
+        return DISPLAY_BUSY
+    full: uint32 = p[0].force_full
+    if p[0].partial == 0 or f[0].bpp != 1 or p[0].since_full >= p[0].max_partials:
+        full = 1
+    # whole bytes in x: the controller's RAM window is set in bytes
+    x0: uint32 = f[0].dx0 & 0xFFFFFFF8
+    x1: uint32 = (f[0].dx1 + 7) & 0xFFFFFFF8
+    if x1 > f[0].w:
+        x1 = f[0].w
+    area: uint64 = cast[uint64](x1 - x0) * cast[uint64](f[0].dy1 - f[0].dy0)
+    if area * 2 > cast[uint64](f[0].w) * cast[uint64](f[0].h):
+        full = 1                    # most of the screen: the flash is worth the clean image
+    if full != 0:
+        if _send(id, f, 0, 0, f[0].w, f[0].h, REFRESH_FULL) < 0:
+            return DISPLAY_ERR
+        return cast[int32](REFRESH_FULL)
+    if _send(id, f, x0, f[0].dy0, x1 - x0, f[0].dy1 - f[0].dy0, REFRESH_PARTIAL) < 0:
+        return DISPLAY_ERR
+    return cast[int32](REFRESH_PARTIAL)
+
+
+# The next flush is a full refresh (after wake-up, or to clear ghosting).
+def display_want_full(id: int32):
+    panels[id].force_full = 1

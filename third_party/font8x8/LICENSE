@@ -1,0 +1,10 @@
+font8x8 by Daniel Hepper <daniel@hepper.net> is in the public domain.
+
+The upstream repository has no separate licence file; its README (copied
+here unmodified as README) and the header of every file say:
+
+    Author: Daniel Hepper <daniel@hepper.net>
+    License: Public Domain
+
+and font8x8_basic.h names its sources: Marcel Sondaar, and International
+Business Machines (public domain VGA fonts).

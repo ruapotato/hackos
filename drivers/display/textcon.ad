@@ -1,0 +1,303 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- a character-cell text screen on a frame buffer.
+#
+# cols x rows cells of 8 x 8 or 8 x 16 pixels (the 8 x 8 font drawn with
+# every row doubled), black on white, with the part of VT100 that the shell
+# and the editor use:
+#     CR LF BS TAB
+#     ESC [ r ; c H   (and f)    cursor to row r, column c (from 1)
+#     ESC [ n A B C D            cursor up, down, right, left
+#     ESC [ J, ESC [ 2 J         clear to the end of the screen, or all of it
+#     ESC [ K, ESC [ 2 K         clear to the end of the line, or all of it
+#     ESC [ 7 m, ESC [ 0 m       inverse on, attributes off
+#     ESC [ ? 25 h, ESC [ ? 25 l cursor shown, hidden
+# Anything else that starts with ESC is swallowed up to its final byte.
+# A cell is only drawn when its content changes, so a shell that repaints
+# its whole input line at every key dirties one cell, and the panel gets a
+# partial refresh of that cell.
+#
+# One screen: this is the console's.  The cell array comes from the kernel
+# heap, so a board without a display pays nothing for it.
+
+from drivers.display.fb import Fb, fb_glyph, fb_fill, fb_scroll_up, fb_dirty
+from mm.slab import kmalloc
+
+extern "C" def hackos_font8x8(c: uint32) -> Ptr[uint8]
+
+TC_INV: uint32 = 0x80               # cell attribute: inverse
+
+tc_fb: uint64 = 0                   # Ptr[Fb]
+tc_cols: uint32 = 0
+tc_rows: uint32 = 0
+tc_ch: uint32 = 16                  # cell height in pixels (8 x yscale)
+tc_yscale: uint32 = 2
+tc_cells: uint64 = 0                # cols * rows bytes: character | TC_INV
+tc_x: uint32 = 0                    # cursor
+tc_y: uint32 = 0
+tc_attr: uint32 = 0
+tc_state: uint32 = 0                # 0 text, 1 after ESC, 2 in a CSI sequence
+tc_priv: uint32 = 0                 # the CSI sequence began with '?'
+tc_par: Array[4, uint32]
+tc_npar: uint32 = 0
+tc_cursor_on: uint32 = 1
+tc_cursor_drawn: uint32 = 0
+tc_chars: uint64 = 0                # characters written (statistics)
+tc_scrolls: uint64 = 0
+
+
+def _fb() -> Ptr[Fb]:
+    return cast[Ptr[Fb]](tc_fb)
+
+
+def _cell(x: uint32, y: uint32) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](tc_cells + cast[uint64](y * tc_cols + x))
+
+
+def _draw(x: uint32, y: uint32, v: uint32, flip: uint32):
+    inv: uint32 = (v & TC_INV) >> 7
+    if flip != 0:
+        inv = inv ^ 1
+    fg: uint32 = 1
+    bg: uint32 = 0
+    if _fb()[0].bpp == 2:
+        fg = 3
+    if inv != 0:
+        bg = fg
+        fg = 0
+    fb_glyph(_fb(), x * 8, y * tc_ch, hackos_font8x8(v & 0x7F), 8, tc_yscale, fg, bg)
+
+
+def _set(x: uint32, y: uint32, v: uint32):
+    p: Ptr[uint8] = _cell(x, y)
+    if cast[uint32](p[0]) == v:
+        return
+    p[0] = cast[uint8](v)
+    _draw(x, y, v, 0)
+
+
+def _hide_cursor():
+    if tc_cursor_drawn != 0:
+        tc_cursor_drawn = 0
+        _draw(tc_x, tc_y, cast[uint32](_cell(tc_x, tc_y)[0]), 0)
+
+
+# Called right before the screen is sent to the panel: the cursor is a
+# block (the cell under it, inverted) that exists only in sent frames.
+def textcon_show_cursor():
+    if tc_fb == 0 or tc_cursor_on == 0 or tc_cursor_drawn != 0:
+        return
+    tc_cursor_drawn = 1
+    _draw(tc_x, tc_y, cast[uint32](_cell(tc_x, tc_y)[0]), 1)
+
+
+def _clear_cells(x0: uint32, y0: uint32, x1: uint32, y1: uint32):
+    y: uint32 = y0
+    while y < y1:
+        x: uint32 = x0
+        while x < x1:
+            _set(x, y, 32)
+            x = x + 1
+        y = y + 1
+
+
+def _scroll():
+    n: uint64 = cast[uint64]((tc_rows - 1) * tc_cols)
+    i: uint64 = 0
+    while i < n:
+        cast[Ptr[uint8]](tc_cells + i)[0] = cast[Ptr[uint8]](tc_cells + i + cast[uint64](tc_cols))[0]
+        i = i + 1
+    i = 0
+    while i < cast[uint64](tc_cols):
+        cast[Ptr[uint8]](tc_cells + n + i)[0] = 32
+        i = i + 1
+    fb_scroll_up(_fb(), tc_ch, 0)
+    tc_scrolls = tc_scrolls + 1
+
+
+def _newline():
+    if tc_y + 1 < tc_rows:
+        tc_y = tc_y + 1
+    else:
+        _scroll()
+
+
+def _par(i: uint32, dflt: uint32) -> uint32:
+    if i >= tc_npar or tc_par[i] == 0:
+        return dflt
+    return tc_par[i]
+
+
+def _csi(final: uint32):
+    if tc_priv != 0:
+        if _par(0, 0) == 25:
+            if final == 104:                    # h
+                tc_cursor_on = 1
+            elif final == 108:                  # l
+                tc_cursor_on = 0
+        return
+    n: uint32 = _par(0, 1)
+    if final == 72 or final == 102:             # H f
+        r: uint32 = _par(0, 1)
+        c: uint32 = _par(1, 1)
+        if r > tc_rows:
+            r = tc_rows
+        if c > tc_cols:
+            c = tc_cols
+        tc_y = r - 1
+        tc_x = c - 1
+    elif final == 65:                           # A
+        if n > tc_y:
+            n = tc_y
+        tc_y = tc_y - n
+    elif final == 66:                           # B
+        tc_y = tc_y + n
+        if tc_y >= tc_rows:
+            tc_y = tc_rows - 1
+    elif final == 67:                           # C
+        tc_x = tc_x + n
+        if tc_x >= tc_cols:
+            tc_x = tc_cols - 1
+    elif final == 68:                           # D
+        if n > tc_x:
+            n = tc_x
+        tc_x = tc_x - n
+    elif final == 74:                           # J
+        if _par(0, 0) == 2:
+            _clear_cells(0, 0, tc_cols, tc_rows)
+        else:
+            _clear_cells(tc_x, tc_y, tc_cols, tc_y + 1)
+            _clear_cells(0, tc_y + 1, tc_cols, tc_rows)
+    elif final == 75:                           # K
+        if _par(0, 0) == 2:
+            _clear_cells(0, tc_y, tc_cols, tc_y + 1)
+        else:
+            _clear_cells(tc_x, tc_y, tc_cols, tc_y + 1)
+    elif final == 109:                          # m
+        i: uint32 = 0
+        if tc_npar == 0:
+            tc_attr = 0
+        while i < tc_npar:
+            if tc_par[i] == 7:
+                tc_attr = TC_INV
+            elif tc_par[i] == 0 or tc_par[i] == 27:
+                tc_attr = 0
+            i = i + 1
+
+
+# One byte of console output.  Any context.
+def textcon_putc(ch: uint32):
+    if tc_fb == 0:
+        return
+    c: uint32 = ch & 0xFF
+    _hide_cursor()
+    if tc_state == 1:
+        if c == 91:                             # [
+            tc_state = 2
+            tc_npar = 0
+            tc_priv = 0
+            tc_par[0] = 0
+            tc_par[1] = 0
+        else:
+            tc_state = 0
+        return
+    if tc_state == 2:
+        if c == 63 and tc_npar == 0:            # ?
+            tc_priv = 1
+            return
+        if c >= 48 and c <= 57:
+            if tc_npar == 0:
+                tc_npar = 1
+            if tc_npar <= 4:
+                tc_par[tc_npar - 1] = tc_par[tc_npar - 1] * 10 + (c - 48)
+            return
+        if c == 59:                             # ;
+            if tc_npar == 0:
+                tc_npar = 1
+            if tc_npar < 4:
+                tc_npar = tc_npar + 1
+                tc_par[tc_npar - 1] = 0
+            return
+        tc_state = 0
+        if c >= 64 and c <= 126:
+            _csi(c)
+        return
+    if c == 27:
+        tc_state = 1
+        return
+    if c == 13:
+        tc_x = 0
+        return
+    if c == 10:
+        _newline()
+        return
+    if c == 8:
+        if tc_x > 0:
+            tc_x = tc_x - 1
+        return
+    if c == 9:
+        tc_x = (tc_x + 8) & 0xFFFFFFF8
+        if tc_x >= tc_cols:
+            tc_x = tc_cols - 1
+        return
+    if c < 32 or c > 126:
+        return
+    if tc_x >= tc_cols:
+        tc_x = 0
+        _newline()
+    _set(tc_x, tc_y, c | tc_attr)
+    tc_x = tc_x + 1
+    tc_chars = tc_chars + 1
+
+
+# The screen as text: each row without its trailing blanks, then a newline.
+# Returns the length.
+def textcon_text(out: Ptr[uint8], cap: uint64) -> uint64:
+    n: uint64 = 0
+    if tc_fb == 0:
+        return 0
+    y: uint32 = 0
+    while y < tc_rows:
+        last: uint32 = 0
+        x: uint32 = 0
+        while x < tc_cols:
+            if (cast[uint32](_cell(x, y)[0]) & 0x7F) != 32:
+                last = x + 1
+            x = x + 1
+        x = 0
+        while x < last and n + 1 < cap:
+            out[n] = cast[uint8](cast[uint32](_cell(x, y)[0]) & 0x7F)
+            n = n + 1
+            x = x + 1
+        if n < cap:
+            out[n] = 10
+            n = n + 1
+        y = y + 1
+    return n
+
+
+# Use frame buffer `f` as the text screen, with cells 8 pixels wide and
+# 8 * yscale high.  0, or -1 when out of memory.
+def textcon_init(f: Ptr[Fb], yscale: uint32) -> int32:
+    cols: uint32 = f[0].w / 8
+    rows: uint32 = f[0].h / (8 * yscale)
+    cells: uint64 = kmalloc(cast[uint64](cols * rows))
+    if cells == 0:
+        return -1
+    i: uint64 = 0
+    while i < cast[uint64](cols * rows):
+        cast[Ptr[uint8]](cells + i)[0] = 32
+        i = i + 1
+    tc_cells = cells
+    tc_cols = cols
+    tc_rows = rows
+    tc_yscale = yscale
+    tc_ch = 8 * yscale
+    tc_x = 0
+    tc_y = 0
+    tc_attr = 0
+    tc_state = 0
+    tc_cursor_on = 1
+    tc_cursor_drawn = 0
+    tc_fb = cast[uint64](f)
+    return 0

@@ -17,6 +17,7 @@
 #                       seconds since 1970 sets the clock (/bin/setdate)
 #   /proc/power         idle and wake-up statistics (kernel/power.ad); writing
 #                       "tickless 0" or "tickless 1" switches tickless idle
+#   /proc/screen        the text on the display's character cells, or "no display"
 #   /proc/<pid>/note    write-only: "kill", "interrupt", "hangup" or "term"
 #                       ends process <pid> with exit code 137, 130, 129 or 143
 #                       (Plan 9's notes as far as HackOS has them: nothing
@@ -43,6 +44,12 @@ PROC_MEMINFO: uint32 = 4
 PROC_MOUNTS: uint32 = 5
 PROC_REALTIME: uint32 = 6
 PROC_POWER: uint32 = 7
+PROC_SCREEN: uint32 = 8
+
+# /proc/screen: the text on the display, when a board has put the console on
+# one (drivers/display/dispcon.ad sets the function).
+proc_screen_fn: Fn[uint64, Ptr[uint8], uint64]
+proc_screen_set: uint32 = 0
 
 proc_fat_mounted: uint32 = 0        # set by fs/hvfs.ad: /sd exists
 proc_flash_mounted: uint32 = 0      # ... /flash exists
@@ -123,6 +130,8 @@ def proc_lookup(rel: Ptr[uint8]) -> uint32:
         return PROC_REALTIME
     if _streq(rel, "power") != 0:
         return PROC_POWER
+    if _streq(rel, "screen") != 0:
+        return PROC_SCREEN
     return 0
 
 
@@ -314,6 +323,11 @@ def proc_render(which: uint32, buf: Ptr[uint8], cap: uint64) -> uint64:
         _render_realtime(b)
     elif which == PROC_POWER:
         pb.n = power_render(buf, cap)
+    elif which == PROC_SCREEN:
+        if proc_screen_set != 0:
+            pb.n = proc_screen_fn(buf, cap)
+        else:
+            pb_s(b, "no display\n")
     return pb.n
 
 
@@ -323,7 +337,7 @@ def proc_listdir(buf: Ptr[uint8], cap: uint64) -> uint64:
     pb.p = buf
     pb.n = 0
     pb.cap = cap
-    pb_s(&pb, "version\nuptime\ntasks\nmeminfo\nmounts\nrealtime\npower\n")
+    pb_s(&pb, "version\nuptime\ntasks\nmeminfo\nmounts\nrealtime\npower\nscreen\n")
     i: uint32 = 0
     while i < THREAD_MAX:
         if threads[i].state != T_UNUSED and (threads[i].flags & TF_PROC) != 0:

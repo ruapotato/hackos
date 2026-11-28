@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- the console on a display: text screen, panel, and the thread
+# between them.
+#
+# Console output is written into the text screen at once (it is only memory)
+# and the panel follows when it can: a thread waits until something has
+# changed, lets DC_SETTLE_MS pass so that a burst of output becomes one
+# refresh, sends what changed (drivers/display/panel.ad decides between a
+# partial and a full refresh), and sleeps while the panel is busy.  Typing
+# at 0.4 s per partial refresh feels like e-paper; nothing is lost, the
+# screen simply shows the newest state each time it is free.
+#
+# A board with a display calls dispcon_start() and forwards the console's
+# bytes to dispcon_putc() from its board_console_tee(); a board without one
+# links none of this.
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, thread_create, thread_sleep, sched_in_handler, sched_running, WAIT_FOREVER
+from mm.slab import kmalloc
+from drivers.display.fb import Fb, fb_init, fb_bytes, fb_is_dirty
+from drivers.display.panel import Panel, panels, display_flush, panel_busy, DISPLAY_BUSY, DISPLAY_CLEAN
+from fs.procfs import proc_screen_fn, proc_screen_set
+from drivers.display.textcon import textcon_init, textcon_putc, textcon_show_cursor, textcon_text
+
+DC_SETTLE_MS: uint64 = 30
+
+dc_fb: Fb
+dc_panel: int32 = -1
+dc_wq: WaitQueue
+dc_pending: uint32 = 0
+dc_flushes: uint64 = 0              # refreshes the thread started
+dc_coalesced: uint64 = 0            # output bytes per refresh, summed (statistics)
+dc_bytes: uint64 = 0
+
+
+# One byte of console output.  Any context.
+def dispcon_putc(c: uint32):
+    if dc_panel < 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    textcon_putc(c)
+    dc_bytes = dc_bytes + 1
+    if dc_pending == 0:
+        dc_pending = 1
+        if sched_running != 0:
+            wq_wake_all(&dc_wq)
+    cpu_irq_restore(irq)
+
+
+def _dc_flush_once() -> int32:
+    irq: uint32 = cpu_irq_save()
+    textcon_show_cursor()
+    cpu_irq_restore(irq)
+    r: int32 = display_flush(dc_panel, &dc_fb)
+    if r > 0:
+        dc_flushes = dc_flushes + 1
+    return r
+
+
+def _dc_main(arg: uint64) -> int64:
+    while 1 == 1:
+        irq: uint32 = cpu_irq_save()
+        while dc_pending == 0:
+            wq_wait(&dc_wq, WAIT_FOREVER)
+        cpu_irq_restore(irq)
+        thread_sleep(DC_SETTLE_MS)
+        irq = cpu_irq_save()
+        dc_pending = 0
+        cpu_irq_restore(irq)
+        r: int32 = _dc_flush_once()
+        while r == DISPLAY_BUSY:
+            thread_sleep(20)
+            r = _dc_flush_once()
+        if r > 0:
+            thread_sleep(cast[uint64](panels[dc_panel].last_ms))
+    return 0
+
+
+# Bring everything that was written onto the panel before the system stops
+# (thread context; waits for the panel).
+def dispcon_sync():
+    if dc_panel < 0:
+        return
+    n: uint32 = 0
+    while n < 400:
+        if panel_busy(dc_panel) != 0:
+            thread_sleep(20)
+        else:
+            r: int32 = _dc_flush_once()
+            if r == DISPLAY_CLEAN:
+                return
+        n = n + 1
+
+
+# The screen as text (/proc/screen).
+def dispcon_text(out: Ptr[uint8], cap: uint64) -> uint64:
+    return textcon_text(out, cap)
+
+
+# Make panel `id` (already registered) the console's screen, with text cells
+# of 8 x (8 * yscale) pixels.  0, or -1.
+def dispcon_start(id: int32, yscale: uint32) -> int32:
+    if id < 0:
+        return -1
+    p: Ptr[Panel] = &panels[id]
+    buf: uint64 = kmalloc(cast[uint64](fb_bytes(p[0].w, p[0].h, p[0].bpp)))
+    if buf == 0:
+        return -1
+    fb_init(&dc_fb, p[0].w, p[0].h, p[0].bpp, buf)
+    if textcon_init(&dc_fb, yscale) != 0:
+        return -1
+    wq_init(&dc_wq)
+    dc_pending = 1
+    dc_panel = id
+    proc_screen_fn = dispcon_text
+    proc_screen_set = 1
+    # above the processes (priority 4): a busy shell must not keep the
+    # screen from following; the thread's own work is short
+    thread_create("display", cast[uint64](&_dc_main), 0, 3, 2048, 0)
+    return 0

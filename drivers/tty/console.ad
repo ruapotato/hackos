@@ -31,7 +31,7 @@
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, mmio_read32, mmio_write32, mmio_write8
 from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, sched_running, sched_in_handler, sched_kill_group, sched_kill_waited, sched_poll_wake, thread_killed, tty_fg_pgid, WAIT_FOREVER
 from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock
-from board.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack, board_console_rx_throttle
+from board.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack, board_console_rx_throttle, board_console_tee
 
 CON_RING: uint32 = 1024
 CON_LINE: uint32 = 256
@@ -83,7 +83,9 @@ def console_set_mode(mode: uint32):
 def _con_out(c: uint32):
     if c == 10:
         board_console_putc(13)
+        board_console_tee(13)
     board_console_putc(c)
+    board_console_tee(c)                # a display, where the board has one
 
 
 # Write from any context.

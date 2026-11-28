@@ -79,6 +79,10 @@ def board_name() -> Ptr[uint8]:
     return "Adafruit Feather nRF52840 Express (Nordic nRF52840)"
 
 
+def board_cpu_name() -> Ptr[uint8]:
+    return "ARM Cortex-M4F"
+
+
 def board_cpu_hz() -> uint32:
     return 64000000
 
@@ -133,6 +137,18 @@ def board_init_early():
 
 
 # ---- console: UARTE0 on TX (P0.25) and RX (P0.24) ------------------------
+# No display driver on this board yet: the console is the UART alone
+# (drivers/display/ has the frame buffer, the panel driver model and the
+# text screen; a board with a panel calls dispcon_start and forwards the
+# console's bytes here, as boards/mps2_an500 does for its fake panel).
+def board_display_start() -> int32:
+    return -1
+
+
+def board_console_tee(c: uint32):
+    return
+
+
 def board_console_init():
     nrf52840_clocks_start()
     gpio_output(P0_BASE, PIN_TX, 1, DRIVE_S0S1)         # idle high before ENABLE

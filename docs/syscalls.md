@@ -2,7 +2,7 @@
 <!-- Copyright (C) 2026 David Hamner -->
 # HackOS system calls
 
-Status: milestone 3, emulator only. This is the interface between unprivileged
+Status: milestone 4, emulators only (QEMU's Cortex-M7 and Cortex-M4 machines, Renode's nRF52840). This is the interface between unprivileged
 code and the kernel: programs loaded from the file system (processes), and
 the unprivileged threads that the kernel test image carries inside itself.
 
@@ -89,7 +89,7 @@ Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
 | 4 | `sys_getpid()` | the process id (a process is one thread; the ids are the same numbers) | same |
 | 10 | `sys_execve_env(path, argv, envp)` | replaces the caller's program; returns only on failure (`-ENOENT`, `-ENOEXEC` -8, `-ENOMEM`, `-E2BIG` -7) | same; the program must be a position-independent ELF for this machine |
 | 12 | `sys_waitpid(pid)`, `sys_waitpid_nb_raw(pid, flags)` | the exit code of process `pid` once it has ended, and the process is gone; `flags` bit 0: `-EAGAIN` (-11) instead of waiting; `-ECHILD` (-10) for an unknown pid | same |
-| 24 | `sys_yield()` | give up the rest of the time slice | Hamnix schedules cooperatively; HackOS also preempts |
+| 24 | `sys_yield()` | give up the rest of the time slice. **After 16 empty polls in a row** (a `read_nb` that found nothing, or a `waitpid_jc` that found its process still running) **it waits instead**: until console input arrives, a pipe is written, a process ends, or 250 ms pass. A read that returns data, or any write, ends the streak | Hamnix schedules cooperatively; HackOS also preempts. The wait exists because Hamnix's shell and editor wait for a key, and the shell for its foreground job, by polling and yielding; left alone that keeps the processor awake for ever |
 | 256 | `sys_rfork(flags)` | **vfork**: needs `RFPROC`; the child runs on the parent's memory with its own descriptors and `/fd` names, and the parent is suspended until the child calls `exec` or `exit`. `RFNOWAIT` (0x100) detaches the child. Other flag bits are ignored | Hamnix copies the address space (copy on write) and can also change namespaces; see below |
 | 288, 289 | `sys_getuid()`, `sys_getgid()` | 1: there is one user, the owner | same value for Hamnix's hostowner |
 | 290 | `sys_setuid(uid)` | succeeds for the current uid only | |
@@ -100,6 +100,16 @@ Hamnix's `sys_*` stubs keeps its meaning. HackOS-only calls start at 512.
 | 516 | `sys_sleep_ms(ms)` | | HackOS only |
 | 517 | `sys_spawn(path, argv)` | a new process running `path` with the caller's descriptors, `/fd` names and directory; returns its id. No fork involved: the native way to start a program | HackOS only (Hamnix retired its `spawn` call in favour of `rfork` + `exec`) |
 | 518 | `halt(status)` | prints `[hackos] exit status N` and resets the machine | HackOS only |
+| 520 | `sys_suspend(ms, sources)` | stops the whole system until a wake source fires: `sources` bit 0 = a byte at the console, bit 1 = after `ms` milliseconds. Returns the source that fired (1 or 2); `-EINVAL` when nothing could end it or the board cannot suspend. The clock is moved by the time spent. See [`power.md`](power.md) | HackOS only |
+
+A new program starts with every register zero that the kernel does not use
+to pass something in (argc and argv in `r0`-`r3`, the static base in `r9` of
+an RWPI program): the callee-saved core registers and all floating-point
+registers and FPSCR, after `spawn` and after `exec`. A process never sees
+floating-point values another process computed.
+
+A process ended by Ctrl-C has exit code 130; by a note (below) 137 (`kill`),
+130 (`interrupt`), 129 (`hangup`) or 143 (`term`).
 
 A process ended by a fault has exit code 139 (memory access, including a stack
 overflow), 135 (bus fault) or 132 (undefined instruction and other usage
@@ -117,9 +127,9 @@ Hamnix's namespace model and nothing else of it.
 
 | Nr | Wrapper | Behaviour |
 |--|--|--|
-| 278 | `sys_fdbind(pid, n, kind, arg)` | bind `/fd/n` of process `pid` (0 = the caller; otherwise a child of the caller). `kind`: 0 nothing, 1 console, 2 read end of pipe `arg`, 3 write end of pipe `arg`, 4 file channel `arg`, 5 whatever `/fd/arg` is bound to (dup), 6 file channel written at its end (append), 7 device or ROM-file channel `arg` |
+| 278 | `sys_fdbind(pid, n, kind, arg)` | bind `/fd/n` of process `pid` (0 = the caller; otherwise a child of the caller). `kind`: 0 nothing, 1 console, 2 read end of pipe `arg`, 3 write end of pipe `arg`, 4 file channel `arg`, 5 whatever `/fd/arg` is bound to (dup), 6 file channel written at its end (append), 7 device or ROM-file channel `arg`. **A process can bind only what it holds** (`-EPERM` otherwise): a pipe it created with `pipechan` or already has at one of its names; a file it opened with `openchan` or already has bound. A child of `rfork` that has not exec'ed counts as its parent. A dup (5) of a file makes both names write at the end of the file, so `> file 2>&1` keeps the two streams in order |
 | 280 | `sys_pipechan()` | a new pipe (4 KiB), as a slot number for `fdbind`; it lives while a name is bound to either end |
-| 281 | `sys_openchan(path, mode)` | open a file as a channel for `fdbind`: mode 0 existing, 1 create or truncate, 2 create and keep. tmpfs files, devices, and (mode 0) the programs under `/bin` |
+| 281 | `sys_openchan(path, mode)` | open a file as a channel for `fdbind`: mode 0 existing, 1 create or truncate, 2 create and keep. tmpfs files, devices, and (mode 0) the programs under `/bin`. The caller is granted the right to bind the result (until it ends or the file is removed; the kernel remembers 32 grants and overwrites the oldest) |
 | 282 | `sys_nsid()` | 1 |
 | 287, 324 | `sys_fdslot_kind(pid, n)`, `sys_fdslot_arg(pid, n)` | what a name is bound to |
 
@@ -133,6 +143,24 @@ not to run the child before the parent gives up the processor. HackOS
 preempts, so a child that came from `rfork` is **held after `exec`** until its
 parent next yields, waits, sleeps, reads or forks again. `sys_spawn` children
 are not held.
+
+### /proc
+
+Text files rendered by the kernel when they are opened (`fs/procfs.ad`). They
+are what Hamnix's `ps`, `free`, `df` and `date` read, with HackOS's content.
+
+| File | Content |
+|--|--|
+| `/proc/version` | system and board |
+| `/proc/uptime` | seconds up, seconds idle |
+| `/proc/tasks` | every thread and process: id, parent, state, priority, kind, memory block, kernel and user stack used, CPU time, name |
+| `/proc/meminfo` | `MemTotal` and `MemFree` (kernel heap plus program arena), then both separately with their peaks |
+| `/proc/mounts` | the mount table |
+| `/proc/realtime` | `YYYY-MM-DDTHH:MM:SSZ <seconds since 1970>`, or `unavailable 0` until the clock has been set. **Writing** a number of seconds sets it (`/bin/setdate`) |
+| `/proc/power` | idle and wake-up counters ([`power.md`](power.md)). Writing `tickless 0` or `tickless 1` switches tickless idle |
+| `/proc/screen` | the text on the display's character cells, or `no display` |
+| `/proc/keys` | write-only, on a board with the emulated keyboard: the text written is typed through the key matrix model |
+| `/proc/<pid>/note` | write-only: `kill`, `interrupt`, `hangup` or `term` ends process `<pid>`. This is all there is of Plan 9's notes: nothing can be caught. Hamnix's shell built-in `kill PID` writes `kill` here |
 
 ### Memory and threads
 
@@ -174,16 +202,22 @@ the error string `unknown syscall` (Hamnix returns -1).
 * **Open modes.** As in Hamnix, `open` is read-only and `open_write` creates or
   truncates. The kernel-internal `vfs_open(path, mode)` also has read-write
   and append; only `create` exposes read-write to programs so far.
-* **No signals or notes.** The one way to end another process is Ctrl-C at
-  the console, which ends the foreground group outright (a process running
-  its own code is ended at the next timer tick, one inside a system call when
-  the call returns; a wait on the console, a pipe or a child gives up at
-  once). A program cannot catch it. With no foreground group, or an empty
-  one, Ctrl-C is a byte for whoever reads the console (the shell's editor).
+* **No signals; notes only end a process.** Ctrl-C at the console ends the
+  foreground group outright (a process running its own code is ended at the
+  next timer tick, one inside a system call when the call returns; a wait on
+  the console, a pipe or a child gives up at once). Hamnix's shell names a
+  group for a single foreground command but not for a pipeline, so with no
+  group (or an empty one) Ctrl-C ends **the processes that a waiting process
+  is waiting for** and that are still in its group: the stages of a pipeline,
+  or a script's shell together with what it runs; a background job has its
+  own group and is spared. Only when that finds nobody is Ctrl-C a byte for
+  whoever reads the console (the shell's editor). A note written to
+  `/proc/<pid>/note` ends that process the same way. A program can catch
+  neither.
 
 ## Not implemented (Hamnix has them)
 
-`pipe` (14; use `pipechan` + `fdbind`), `kill` (15) and `/proc/<pid>/note`,
+`pipe` (14; use `pipechan` + `fdbind`), `kill` (15; write to `/proc/<pid>/note`),
 `fd2path` (264), `wstat`/`fwstat` (266-267), `srv_open` (276), `nslabel`
 (285), `svc_publish` (291), `setuid_auth` (300), `clock_gettime` (307),
 `waitfds` (313), `listdir_records` (318), `chan_dir_mode` (319: `ls -l` falls

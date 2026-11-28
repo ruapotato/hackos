@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- a frame buffer for small monochrome and grey displays.
+#
+# 1 or 2 bits per pixel, packed most-significant-bit first, each row padded
+# to a whole byte: the layout e-paper controllers take, and the one a PNG
+# of the same bit depth uses, so a frame can be sent or saved row by row
+# without repacking.  Pixel values count ink: 0 is paper (white), the
+# largest value (1, or 3) is black.
+#
+# The buffer remembers what has changed since it was last sent to a panel
+# as one rectangle (the smallest that holds every change).  That is what an
+# e-paper partial refresh takes, and one rectangle is all the bookkeeping a
+# microcontroller should spend on it.
+
+from kernel.rt import rt_memset, rt_memmove
+
+
+class Fb:
+    w: uint32
+    h: uint32
+    bpp: uint32                     # 1 or 2
+    stride: uint32                  # bytes per row
+    buf: uint64
+    size: uint32                    # bytes in all
+    dx0: uint32                     # dirty rectangle [dx0, dx1) x [dy0, dy1); dx1 == 0: clean
+    dy0: uint32
+    dx1: uint32
+    dy1: uint32
+    changes: uint64                 # pixels written with a new value (statistics)
+
+
+def fb_bytes(w: uint32, h: uint32, bpp: uint32) -> uint32:
+    return ((w * bpp + 7) / 8) * h
+
+
+# `buf` must hold fb_bytes(w, h, bpp) bytes.
+def fb_init(f: Ptr[Fb], w: uint32, h: uint32, bpp: uint32, buf: uint64):
+    f[0].w = w
+    f[0].h = h
+    f[0].bpp = bpp
+    f[0].stride = (w * bpp + 7) / 8
+    f[0].buf = buf
+    f[0].size = f[0].stride * h
+    f[0].changes = 0
+    rt_memset(buf, 0, cast[uint64](f[0].size))
+    fb_dirty(f, 0, 0, w, h)
+
+
+def fb_clean(f: Ptr[Fb]):
+    f[0].dx0 = 0
+    f[0].dy0 = 0
+    f[0].dx1 = 0
+    f[0].dy1 = 0
+
+
+def fb_is_dirty(f: Ptr[Fb]) -> uint32:
+    if f[0].dx1 != 0:
+        return 1
+    return 0
+
+
+# Add a rectangle (clipped to the buffer) to the dirty rectangle.
+def fb_dirty(f: Ptr[Fb], x: uint32, y: uint32, w: uint32, h: uint32):
+    if w == 0 or h == 0 or x >= f[0].w or y >= f[0].h:
+        return
+    x1: uint32 = x + w
+    y1: uint32 = y + h
+    if x1 > f[0].w:
+        x1 = f[0].w
+    if y1 > f[0].h:
+        y1 = f[0].h
+    if f[0].dx1 == 0:
+        f[0].dx0 = x
+        f[0].dy0 = y
+        f[0].dx1 = x1
+        f[0].dy1 = y1
+        return
+    if x < f[0].dx0:
+        f[0].dx0 = x
+    if y < f[0].dy0:
+        f[0].dy0 = y
+    if x1 > f[0].dx1:
+        f[0].dx1 = x1
+    if y1 > f[0].dy1:
+        f[0].dy1 = y1
+
+
+def fb_max(f: Ptr[Fb]) -> uint32:
+    return (cast[uint32](1) << f[0].bpp) - 1
+
+
+def fb_get(f: Ptr[Fb], x: uint32, y: uint32) -> uint32:
+    if x >= f[0].w or y >= f[0].h:
+        return 0
+    p: Ptr[uint8] = cast[Ptr[uint8]](f[0].buf + cast[uint64](y * f[0].stride))
+    if f[0].bpp == 1:
+        return (cast[uint32](p[x >> 3]) >> (7 - (x & 7))) & 1
+    return (cast[uint32](p[x >> 2]) >> (6 - ((x & 3) << 1))) & 3
+
+
+# Write one pixel without touching the dirty rectangle (the callers below
+# add the rectangle they drew once).
+def _put(f: Ptr[Fb], x: uint32, y: uint32, v: uint32):
+    p: Ptr[uint8] = cast[Ptr[uint8]](f[0].buf + cast[uint64](y * f[0].stride))
+    if f[0].bpp == 1:
+        m: uint32 = cast[uint32](0x80) >> (x & 7)
+        old: uint32 = cast[uint32](p[x >> 3])
+        nw: uint32 = old & (0xFF ^ m)
+        if (v & 1) != 0:
+            nw = nw | m
+        if nw != old:
+            p[x >> 3] = cast[uint8](nw)
+            f[0].changes = f[0].changes + 1
+        return
+    sh: uint32 = 6 - ((x & 3) << 1)
+    o2: uint32 = cast[uint32](p[x >> 2])
+    n2: uint32 = (o2 & (0xFF ^ (cast[uint32](3) << sh))) | ((v & 3) << sh)
+    if n2 != o2:
+        p[x >> 2] = cast[uint8](n2)
+        f[0].changes = f[0].changes + 1
+
+
+def fb_set(f: Ptr[Fb], x: uint32, y: uint32, v: uint32):
+    if x >= f[0].w or y >= f[0].h:
+        return
+    _put(f, x, y, v)
+    fb_dirty(f, x, y, 1, 1)
+
+
+def fb_fill(f: Ptr[Fb], x: uint32, y: uint32, w: uint32, h: uint32, v: uint32):
+    if x >= f[0].w or y >= f[0].h:
+        return
+    if x + w > f[0].w:
+        w = f[0].w - x
+    if y + h > f[0].h:
+        h = f[0].h - y
+    j: uint32 = 0
+    while j < h:
+        i: uint32 = 0
+        while i < w:
+            _put(f, x + i, y + j, v)
+            i = i + 1
+        j = j + 1
+    fb_dirty(f, x, y, w, h)
+
+
+def fb_clear(f: Ptr[Fb], v: uint32):
+    fill: uint64 = 0
+    if f[0].bpp == 1 and (v & 1) != 0:
+        fill = 0xFF
+    elif f[0].bpp == 2:
+        fill = cast[uint64]((v & 3) * 0x55)
+    rt_memset(f[0].buf, fill, cast[uint64](f[0].size))
+    fb_dirty(f, 0, 0, f[0].w, f[0].h)
+
+
+# An 8-pixel-wide glyph of `rows` rows (one byte each, bit 0 = the LEFT
+# pixel: the layout of the font8x8 tables), each row drawn `yscale` times,
+# with ink `fg` on `bg`.
+def fb_glyph(f: Ptr[Fb], x: uint32, y: uint32, glyph: Ptr[uint8], rows: uint32, yscale: uint32, fg: uint32, bg: uint32):
+    if x + 8 > f[0].w or y + rows * yscale > f[0].h:
+        return
+    r: uint32 = 0
+    while r < rows:
+        bits: uint32 = cast[uint32](glyph[r])
+        s: uint32 = 0
+        while s < yscale:
+            i: uint32 = 0
+            while i < 8:
+                if ((bits >> i) & 1) != 0:
+                    _put(f, x + i, y + r * yscale + s, fg)
+                else:
+                    _put(f, x + i, y + r * yscale + s, bg)
+                i = i + 1
+            s = s + 1
+        r = r + 1
+    fb_dirty(f, x, y, 8, rows * yscale)
+
+
+# Move the rows [y0, h) up by `dy` rows of pixels and fill the freed rows at
+# the bottom with `bg`: scrolling a text screen.
+def fb_scroll_up(f: Ptr[Fb], dy: uint32, bg: uint32):
+    if dy == 0 or dy >= f[0].h:
+        fb_clear(f, bg)
+        return
+    rt_memmove(f[0].buf, f[0].buf + cast[uint64](dy * f[0].stride), cast[uint64]((f[0].h - dy) * f[0].stride))
+    fill: uint64 = 0
+    if f[0].bpp == 1 and (bg & 1) != 0:
+        fill = 0xFF
+    elif f[0].bpp == 2:
+        fill = cast[uint64]((bg & 3) * 0x55)
+    rt_memset(f[0].buf + cast[uint64]((f[0].h - dy) * f[0].stride), fill, cast[uint64](dy * f[0].stride))
+    fb_dirty(f, 0, 0, f[0].w, f[0].h)

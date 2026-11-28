@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- a fake e-paper panel, for developing against before the real one
+# is on the bench.
+#
+# It behaves like the panel side of the driver model (drivers/display/
+# panel.ad): it has a size, a partial and a full refresh, it is BUSY for a
+# while after each, and it counts every way a driver can treat it wrong
+# (data sent while busy, a rectangle outside the panel, a partial window not
+# on a byte boundary).  What it "shows" leaves the machine as a stream of
+# records on a byte sink the board provides (QEMU: the second UART, which
+# the test harness connects to a file):
+#
+#     1B 'P' 'N' 'L'   kind ('F' full, 'P' partial, 'S' sleep)   bits per pixel
+#     x y w h          four 16-bit little-endian numbers
+#     h rows of ceil(w * bpp / 8) bytes, packed as in the frame buffer
+#     16-bit little-endian sum of the row bytes
+#
+# tests/display/panel2png.py replays the records into the image a panel
+# would hold and writes it as a PNG after every refresh.
+#
+# The size is that of the display chosen for the HackerSlide hack pad (Good
+# Display GDEY0426T82: 800 x 480, SSD1677).  The refresh times are
+# PLACEHOLDERS, not that panel's: they only have to be long enough that
+# code which ignores BUSY gets caught.
+
+from kernel.sched.core import sched_now
+from drivers.display.fb import Fb
+from drivers.display.panel import panel_register, REFRESH_FULL
+
+FAKE_FULL_MS: uint32 = 1500         # placeholder
+FAKE_PARTIAL_MS: uint32 = 400       # placeholder ("redraws every 0.4 s" in the device's decision record)
+FAKE_GREY_MS: uint32 = 3000         # placeholder: a 4-grey refresh is the slow one
+FAKE_MAX_PARTIALS: uint32 = 20      # partial refreshes before a full one is due
+
+fake_w: uint32 = 0
+fake_h: uint32 = 0
+fake_bpp: uint32 = 1
+fake_busy_until: uint64 = 0
+fake_asleep: uint32 = 0
+fake_records: uint64 = 0            # records emitted
+fake_bytes: uint64 = 0              # bytes emitted
+fake_violations: uint64 = 0         # things a real panel would not have forgiven
+fake_out: Fn[int32, uint32]         # the byte sink
+fake_out_set: uint32 = 0
+
+
+def _o(c: uint32):
+    if fake_out_set != 0:
+        fake_out(c & 0xFF)
+    fake_bytes = fake_bytes + 1
+
+
+def _o16(v: uint32):
+    _o(v)
+    _o(v >> 8)
+
+
+def _header(kind: uint32, x: uint32, y: uint32, w: uint32, h: uint32):
+    _o(0x1B)
+    _o(80)
+    _o(78)
+    _o(76)
+    _o(kind)
+    _o(fake_bpp)
+    _o16(x)
+    _o16(y)
+    _o16(w)
+    _o16(h)
+    fake_records = fake_records + 1
+
+
+def _fake_init() -> int32:
+    fake_busy_until = 0
+    fake_asleep = 0
+    return 0
+
+
+def _fake_busy() -> uint32:
+    if sched_now() < fake_busy_until:
+        return 1
+    return 0
+
+
+def _fake_refresh(fbp: uint64, x: uint32, y: uint32, w: uint32, h: uint32, kind: uint32) -> int32:
+    f: Ptr[Fb] = cast[Ptr[Fb]](fbp)
+    if _fake_busy() != 0:
+        fake_violations = fake_violations + 1
+        return -1
+    if w == 0 or h == 0 or x + w > fake_w or y + h > fake_h or f[0].bpp != fake_bpp or (x & 7) != 0 or ((w & 7) != 0 and x + w != fake_w):
+        fake_violations = fake_violations + 1
+        return -1
+    fake_asleep = 0
+    k: uint32 = 80                              # 'P'
+    ms: uint32 = FAKE_PARTIAL_MS
+    if kind == REFRESH_FULL:
+        k = 70                                  # 'F'
+        ms = FAKE_FULL_MS
+        if fake_bpp == 2:
+            ms = FAKE_GREY_MS
+        if x != 0 or y != 0 or w != fake_w or h != fake_h:
+            fake_violations = fake_violations + 1
+            return -1
+    _header(k, x, y, w, h)
+    rowbytes: uint32 = (w * fake_bpp + 7) / 8
+    off: uint32 = (x * fake_bpp) / 8
+    sum: uint32 = 0
+    j: uint32 = 0
+    while j < h:
+        row: Ptr[uint8] = cast[Ptr[uint8]](f[0].buf + cast[uint64]((y + j) * f[0].stride + off))
+        i: uint32 = 0
+        while i < rowbytes:
+            _o(cast[uint32](row[i]))
+            sum = sum + cast[uint32](row[i])
+            i = i + 1
+        j = j + 1
+    _o16(sum & 0xFFFF)
+    fake_busy_until = sched_now() + cast[uint64](ms)
+    return cast[int32](ms)
+
+
+def _fake_sleep() -> int32:
+    if _fake_busy() != 0:
+        fake_violations = fake_violations + 1
+        return -1
+    _header(83, 0, 0, 0, 0)                     # 'S'
+    _o16(0)
+    fake_asleep = 1
+    return 0
+
+
+# Register a fake panel of w x h pixels, `bpp` bits each, that writes its
+# records to `out`.  Returns the panel number, or -1.
+def fakepanel_setup(w: uint32, h: uint32, bpp: uint32, out: Fn[int32, uint32]) -> int32:
+    fake_w = w
+    fake_h = h
+    fake_bpp = bpp
+    fake_out = out
+    fake_out_set = 1
+    partial: uint32 = 1
+    if bpp != 1:
+        partial = 0
+    return panel_register(w, h, bpp, partial, FAKE_MAX_PARTIALS, _fake_init, _fake_refresh, _fake_busy, _fake_sleep)

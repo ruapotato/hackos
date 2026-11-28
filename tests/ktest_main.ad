@@ -40,7 +40,11 @@ from kernel.sync import mutex_dead_released
 from kernel.sched.core import pw_tick_irqs, pw_ticks_skipped, pw_idle_sleeps, SCHED_TICKLESS
 from kernel.power import power_suspend, pw_suspend_wakes, WAKE_TIMER, WAKE_CONSOLE
 
-from board.board import board_mpu_xram_base
+from board.board import board_mpu_xram_base, board_panel_out, board_panel_port_init
+from drivers.display.fb import Fb, fb_init, fb_bytes, fb_set, fb_get, fb_fill, fb_clear, fb_clean, fb_is_dirty
+from drivers.display.panel import panels, display_flush, panel_sleep, REFRESH_FULL, REFRESH_PARTIAL, DISPLAY_BUSY, DISPLAY_CLEAN
+from drivers.display.fakepanel import fakepanel_setup, fake_violations, fake_records, fake_bytes, fake_asleep, FAKE_FULL_MS, FAKE_PARTIAL_MS, FAKE_GREY_MS, FAKE_MAX_PARTIALS
+from drivers.display.textcon import textcon_init, textcon_putc, textcon_text, textcon_show_cursor, tc_cols, tc_rows, tc_fb, tc_cells
 
 extern def fp_hold(seed: uint64, loops: uint64) -> uint64
 extern def __prog_start()
@@ -1447,6 +1451,158 @@ def test_power():
     check(cast[uint32](sched_now() - ta == 5), "power: the periodic tick runs again after a suspend")
 
 
+# ============================================================ 15. display
+tfb: Fb
+gfb: Fb
+
+
+def tc_puts(s: Ptr[uint8]):
+    i: uint32 = 0
+    while s[i] != 0:
+        textcon_putc(cast[uint32](s[i]))
+        i = i + 1
+
+
+# Does the text screen's row `row` (0-based) read exactly `want`?
+def screen_row_is(row: uint32, want: Ptr[uint8]) -> uint32:
+    buf: Array[4096, uint8]
+    n: uint64 = textcon_text(&buf[0], 4096)
+    i: uint64 = 0
+    r: uint32 = 0
+    while r < row and i < n:
+        if buf[i] == 10:
+            r = r + 1
+        i = i + 1
+    k: uint32 = 0
+    while want[k] != 0:
+        if i >= n or buf[i] != want[k]:
+            return 0
+        i = i + 1
+        k = k + 1
+    if i < n and buf[i] == 10:
+        return 1
+    return 0
+
+
+def test_display():
+    printk0("-- 15. display: frame buffer, e-paper driver model, fake panel, text screen\n")
+    board_panel_port_init()
+    klive0: uint32 = kheap.n_live
+    # ---- a 2-bit grey buffer and panel first (the stream's last frame is the text screen)
+    gbuf: uint64 = kmalloc(cast[uint64](fb_bytes(400, 300, 2)))
+    fb_init(&gfb, 400, 300, 2, gbuf)
+    fb_clean(&gfb)
+    fb_set(&gfb, 5, 7, 3)
+    fb_set(&gfb, 6, 7, 2)
+    fb_set(&gfb, 7, 7, 1)
+    fb_set(&gfb, 400, 7, 3)             # outside: ignored
+    fb_set(&gfb, 9, 300, 3)
+    check(cast[uint32](fb_bytes(400, 300, 2) == 30000 and fb_get(&gfb, 5, 7) == 3 and fb_get(&gfb, 6, 7) == 2 and fb_get(&gfb, 7, 7) == 1 and fb_get(&gfb, 8, 7) == 0 and gfb.dx0 == 5 and gfb.dx1 == 8 and gfb.dy0 == 7 and gfb.dy1 == 8), "fb: 2 bits per pixel: values read back, neighbours untouched, clipping, the dirty rectangle is exactly what changed")
+    bar: uint32 = 0
+    while bar < 4:
+        fb_fill(&gfb, bar * 100, 0, 100, 300, bar)
+        bar = bar + 1
+    gp: int32 = fakepanel_setup(400, 300, 2, board_panel_out)
+    r1: int32 = display_flush(gp, &gfb)
+    fb_set(&gfb, 1, 1, 3)
+    r2: int32 = display_flush(gp, &gfb)
+    thread_sleep(cast[uint64](FAKE_GREY_MS) + 5)
+    r3: int32 = display_flush(gp, &gfb)
+    thread_sleep(cast[uint64](FAKE_GREY_MS) + 5)
+    check(cast[uint32](gp == 0 and r1 == cast[int32](REFRESH_FULL) and r2 == DISPLAY_BUSY and r3 == cast[int32](REFRESH_FULL) and panels[gp].n_full == 2 and panels[gp].n_partial == 0 and fake_violations == 0), "panel: a grey buffer is always refreshed in full; a flush while the panel is busy is refused, not sent")
+    # ---- the 1-bit panel of the device's size
+    tbuf: uint64 = kmalloc(cast[uint64](fb_bytes(800, 480, 1)))
+    fb_init(&tfb, 800, 480, 1, tbuf)
+    check(cast[uint32](tfb.stride == 100 and tfb.size == 48000 and tfb.dx0 == 0 and tfb.dx1 == 800 and tfb.dy1 == 480 and fb_get(&tfb, 799, 479) == 0), "fb: 800 x 480 at 1 bit per pixel is 48000 bytes, starts white and all dirty")
+    tp: int32 = fakepanel_setup(800, 480, 1, board_panel_out)
+    f1: int32 = display_flush(tp, &tfb)
+    c0: int32 = display_flush(tp, &tfb)
+    thread_sleep(cast[uint64](FAKE_FULL_MS) + 5)
+    fb_fill(&tfb, 13, 40, 30, 10, 1)    # x 13..42: the window sent is 8..48
+    px0: uint64 = panels[tp].pixels_sent
+    p1: int32 = display_flush(tp, &tfb)
+    check(cast[uint32](tp == 1 and f1 == cast[int32](REFRESH_FULL) and c0 == DISPLAY_CLEAN and p1 == cast[int32](REFRESH_PARTIAL) and panels[tp].pixels_sent - px0 == 400 and fb_is_dirty(&tfb) == 0), "panel: the first refresh is full, a clean buffer sends nothing, a small change is a partial refresh of a byte-aligned window (40 x 10)")
+    # ghosting: FAKE_MAX_PARTIALS partial refreshes, then a full one is due
+    np: uint32 = 1
+    kinds_ok: uint32 = 1
+    while np < FAKE_MAX_PARTIALS:
+        thread_sleep(cast[uint64](FAKE_PARTIAL_MS) + 2)
+        fb_set(&tfb, 100 + np, 100, 1)
+        if display_flush(tp, &tfb) != cast[int32](REFRESH_PARTIAL):
+            kinds_ok = 0
+        np = np + 1
+    thread_sleep(cast[uint64](FAKE_PARTIAL_MS) + 2)
+    fb_set(&tfb, 300, 100, 1)
+    due: int32 = display_flush(tp, &tfb)
+    thread_sleep(cast[uint64](FAKE_FULL_MS) + 5)
+    fb_fill(&tfb, 0, 0, 800, 300, 1)    # most of the screen
+    big: int32 = display_flush(tp, &tfb)
+    thread_sleep(cast[uint64](FAKE_FULL_MS) + 5)
+    check(cast[uint32](kinds_ok == 1 and due == cast[int32](REFRESH_FULL) and big == cast[int32](REFRESH_FULL) and panels[tp].n_partial == cast[uint64](FAKE_MAX_PARTIALS) and panels[tp].n_full == 3), "panel: after 20 partial refreshes the next one is full (ghosting); a change of most of the screen is full too")
+    # ---- the text screen
+    fb_clear(&tfb, 0)
+    tcr: int32 = textcon_init(&tfb, 2)
+    tc_puts("HackOS display test\r\n")
+    tc_puts("0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n")
+    tc_puts("abcdefghijklmnopqrstuvwxyz !\"#$%&'()*+,-./:;<=>?@[]^_`{|}~\r\n")
+    tc_puts("\x1b[6;11Hplaced at row 6, column 11")
+    tc_puts("\x1b[8;1Hplain \x1b[7minverse\x1b[0m plain")
+    tc_puts("\x1b[10;1Hto be erased\x1b[10;7H\x1b[K")
+    tc_puts("\x1b[12;1Habc\x08\x08X\x1b[2C!\x1b[1A^\x1b[2Bv")
+    tc_puts("\x1b[14;1Htab\tstop")
+    check(cast[uint32](tcr == 0 and tc_cols == 100 and tc_rows == 30 and screen_row_is(0, "HackOS display test") != 0 and screen_row_is(5, "          placed at row 6, column 11") != 0 and screen_row_is(7, "plain inverse plain") != 0 and screen_row_is(9, "to be") != 0), "textcon: 100 x 30 cells; text, cursor addressing, inverse, erase to end of line")
+    check(cast[uint32](screen_row_is(11, "aXc !") != 0 and screen_row_is(10, "     ^") != 0 and screen_row_is(12, "      v") != 0 and screen_row_is(13, "tab     stop") != 0), "textcon: backspace, cursor right, up and down, tab stops")
+    textcon_show_cursor()
+    t1: int32 = display_flush(tp, &tfb)
+    thread_sleep(cast[uint64](FAKE_FULL_MS) + 5)
+    # one more character: only its cell and the cursor's next one change
+    tc_puts("\x1b[16;1H")
+    textcon_show_cursor()
+    display_flush(tp, &tfb)             # the cursor's move, by itself
+    thread_sleep(cast[uint64](FAKE_PARTIAL_MS) + 2)
+    ch0: uint64 = tfb.changes
+    tc_puts("x")
+    textcon_show_cursor()
+    px0 = panels[tp].pixels_sent
+    t2: int32 = display_flush(tp, &tfb)
+    thread_sleep(cast[uint64](FAKE_PARTIAL_MS) + 2)
+    tc_puts("\x1b[16;1Hx")              # the same character again: nothing to draw but the cursor move
+    ch1: uint64 = tfb.changes
+    tc_puts("\x1b[16;1Hx\x1b[16;1Hx")
+    check(cast[uint32](t1 == cast[int32](REFRESH_FULL) and t2 == cast[int32](REFRESH_PARTIAL) and panels[tp].pixels_sent - px0 == 16 * 16 and tfb.changes == ch1 and ch1 > ch0), "textcon: a typed character costs a partial refresh of two cells (16 x 16 pixels); rewriting the same text draws nothing")
+    # scrolling: 40 more lines on a 30-line screen
+    tc_puts("\x1b[2J\x1b[1;1H")
+    ln: uint32 = 0
+    while ln < 40:
+        tc_puts("line ")
+        textcon_putc(48 + ln / 10)
+        textcon_putc(48 + ln % 10)
+        tc_puts("\r\n")
+        ln = ln + 1
+    check(cast[uint32](screen_row_is(0, "line 11") != 0 and screen_row_is(28, "line 39") != 0 and screen_row_is(29, "") != 0), "textcon: 40 lines on 30 rows scroll; the last 29 and an empty line remain")
+    # the frame the host will read back
+    tc_puts("\x1b[2J\x1b[1;1HHackOS display test\r\n")
+    tc_puts("0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n")
+    tc_puts("abcdefghijklmnopqrstuvwxyz !\"#$%&'()*+,-./:;<=>?@[]^_`{|}~\r\n")
+    tc_puts("\x1b[6;11Hplaced at row 6, column 11")
+    tc_puts("\x1b[8;1Hplain \x1b[7minverse\x1b[0m plain\x1b[30;90Hend")
+    tc_puts("\x1b[?25l")
+    thread_sleep(cast[uint64](FAKE_FULL_MS) + 5)
+    t3: int32 = display_flush(tp, &tfb)
+    thread_sleep(cast[uint64](FAKE_FULL_MS) + 5)
+    sl: int32 = panel_sleep(tp)
+    printk4("   fake panel: %d records, %d bytes, %d violations; 1-bit panel: %d full", fake_records, fake_bytes, fake_violations, panels[tp].n_full)
+    printk2(" and %d partial refreshes, %d ms of refresh time asked\n", panels[tp].n_partial, panels[tp].busy_ms)
+    check(cast[uint32](t3 > 0 and sl == 0 and fake_violations == 0 and fake_asleep == 1), "panel: the final frame is sent, the panel put to sleep, and the fake panel saw nothing a real one would not forgive")
+    panels[0].used = 0
+    panels[1].used = 0
+    tc_fb = 0
+    kfree(tc_cells)
+    kfree(gbuf)
+    kfree(tbuf)
+    check(cast[uint32](kheap.n_live == klive0 and heap_check(&kheap) == 0), "display: nothing left allocated")
+
+
 def runner(arg: uint64) -> int64:
     vfs_open_stdio()
     test_boot()
@@ -1464,6 +1620,7 @@ def runner(arg: uint64) -> int64:
     bench_switch()
     bench_proc()
     test_power()
+    test_display()
     test_console()
     if failures == 0:
         printk0("RESULT: PASS (all checks passed)\n")

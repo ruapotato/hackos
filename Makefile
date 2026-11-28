@@ -73,6 +73,7 @@ FPU           := fpv5-d16
 SOFT_DOUBLE   := 0
 PROG_ABI      := pie
 PROGS_SKIP    :=
+BOARD_COBJS   :=
 include boards/$(BOARD_DIR)/board.mk
 
 CPUFLAGS := --target=$(TRIPLE) -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=hard -mthumb
@@ -93,8 +94,11 @@ CFLAGS  := $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fno-pic -ffu
            -Wall -Wextra -isystem lib/cshim/include -include lib/cshim/include/hackos_libc_rename.h
 C_SHT4X := third_party/sensirion-sht4x
 COBJS_ktest := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common.o $(B)/c/interop.o $(B)/c/libc.o
+# C objects every image of a board links (BOARD_COBJS in board.mk): the
+# glyph table of a board that has a display (drivers/display/font8x8.c).
+C_FONT := third_party/font8x8
 
-SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/*/*.ad soc/*/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
+SRC_AD := $(wildcard drivers/display/*.c kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.ad drivers/*/*.ad init/*.ad user/*.ad boards/*/*.ad soc/*/*.ad demo/*.ad tests/*.ad tests/*/*.ad)
 
 # ---- user programs -----------------------------------------------------------
 # Each is its own Adder translation unit, compiled position-independent and
@@ -251,6 +255,10 @@ $(B)/c/%.o: $(C_SHT4X)/%.c | $(B)
 	@mkdir -p $(B)/c
 	$(CLANG) $(CFLAGS) -I$(C_SHT4X) -c $< -o $@
 
+$(B)/c/font8x8.o: drivers/display/font8x8.c $(C_FONT)/font8x8_basic.h | $(B)
+	@mkdir -p $(B)/c
+	$(CLANG) $(CFLAGS) -I$(C_FONT) -c $< -o $@
+
 $(B)/c/%.o: tests/c/%.c | $(B)
 	@mkdir -p $(B)/c
 	$(CLANG) $(CFLAGS) -c $< -o $@
@@ -262,8 +270,8 @@ $(B)/c/%.o: lib/cshim/%.c | $(B)
 $(B)/%.o: tests/arch/%.S | $(B)
 	$(CLANG) $(ASFLAGS) -c $< -o $@
 
-$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/romfs.o $(KRT_OBJS) $(foreach i,$(IMAGES),$(KOBJS_$(i)) $(COBJS_$(i))) $(LINK_LD)
-	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(B)/romfs.o $(KRT_OBJS) $<
+$(B)/%.elf: $(B)/%.o $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(B)/switch.o $(B)/romfs.o $(KRT_OBJS) $(foreach i,$(IMAGES),$(KOBJS_$(i)) $(COBJS_$(i))) $(BOARD_COBJS) $(LINK_LD)
+	$(LLD) $(LDFLAGS) -Map=$(B)/$*.map -o $@ $(B)/startup.o $(B)/aeabi.o $(B)/cpu.o $(KOBJS_$*) $(COBJS_$*) $(BOARD_COBJS) $(B)/romfs.o $(KRT_OBJS) $<
 	$(OBJDUMP) -d --mcpu=$(CPU) --no-show-raw-insn $@ > $(B)/$*.lst
 
 # The "card": a 2 MiB FAT32 image made with mtools, loaded by QEMU into the

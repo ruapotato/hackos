@@ -59,6 +59,10 @@ def board_name() -> Ptr[uint8]:
     return "Teensy 4.1 (NXP i.MX RT1062)"
 
 
+def board_cpu_name() -> Ptr[uint8]:
+    return "ARM Cortex-M7"
+
+
 def board_cpu_hz() -> uint32:
     if core_hz_measured != 0:
         return core_hz_measured
@@ -85,6 +89,18 @@ def board_init_early():
 
 
 # ---- console: LPUART6 on pins 0 (RX) and 1 (TX) ---------------------------
+# No display driver on this board yet: the console is the UART alone
+# (drivers/display/ has the frame buffer, the panel driver model and the
+# text screen; a board with a panel calls dispcon_start and forwards the
+# console's bytes here, as boards/mps2_an500 does for its fake panel).
+def board_display_start() -> int32:
+    return -1
+
+
+def board_console_tee(c: uint32):
+    return
+
+
 def board_console_init():
     hz: uint32 = clk_uart_root_osc()
     ccm_gate_on(CCM_GATE_LPUART6)

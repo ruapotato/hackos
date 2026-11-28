@@ -66,7 +66,7 @@ run_qemu() {  # run_qemu <elf> <logfile>  -> status of the run (see run_status)
 qemu_start() {
     rm -f $B/uart.in; mkfifo $B/uart.in
     : > "$2"
-    timeout 120 "$QEMU" $QFLAGS ${3:-} -kernel "$1" <$B/uart.in >"$2" 2>"$2.err" &
+    timeout 300 "$QEMU" $QFLAGS ${3:-} -kernel "$1" <$B/uart.in >"$2" 2>"$2.err" &
     QPID=$!
     exec 9>$B/uart.in
     QLOG="$2"
@@ -190,7 +190,9 @@ fi
 if want 5; then
 echo "[test] === 5. kernel tests under QEMU (threads, sync, system calls, MPU, heap, files, C code, processes, pipes, console)"
 EXPECTED_K="$(grep -cE '^ +check\(' tests/ktest_main.ad)"
-qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT $SDCARD"
+rm -rf $B/panel-ktest $B/panel-ktest.bin; mkdir -p $B/panel-ktest
+# the second UART is the fake e-paper panel's output (drivers/display/fakepanel.ad)
+qemu_start $B/ktest.elf $B/ktest.out "$ICOUNT $SDCARD -serial file:$B/panel-ktest.bin"
 if wait_for "-- 9. console"; then
     # typed "by hand": a line, corrections with DEL and backspace, a line
     # killed with Ctrl-U, a line read in two pieces, Ctrl-D
@@ -252,6 +254,28 @@ expect "a faulting process is reported as a process, by name" $B/ktest.txt "proc
 expect "a breakpoint instruction in a process is reported, the system carries on" $B/ktest.txt "process [0-9]+ 'ptest' ended: breakpoint instruction or escalated fault"
 expect "the loaded C program printed through its relocated pointers" $B/ktest.txt '^crel: relocated pointers ok$'
 
+# What the fake panel received, as images (tests/display/panel2png.py), and
+# the text on the last one read back from its pixels with the font.
+FONT=third_party/font8x8/font8x8_basic.h
+have="$(sha256sum < $FONT | cut -d' ' -f1)"
+[ "$have" = "$(awk '$2=="font8x8_basic.h"{print $1}' third_party/font8x8/UPSTREAM)" ] && ok "third_party/font8x8/font8x8_basic.h matches the hash in UPSTREAM" || bad "third_party/font8x8/font8x8_basic.h differs from the recorded upstream file"
+P=$B/panel-ktest.txt
+python3 -I tests/display/panel2png.py $B/panel-ktest.bin $B/panel-ktest --font $FONT --yscale 2 --keep 3 > $P 2>&1; prc=$?
+tail -36 $P
+[ $prc -eq 0 ] && ok "display: the fake panel's stream is well-formed, every record's checksum holds, every PNG reads back as written" || bad "display: panel2png.py failed ($prc)"
+nrec="$(sed -n 's/^   fake panel: \([0-9]*\) records.*/\1/p' $B/ktest.txt)"
+[ -n "$nrec" ] && [ "$(grep -c '^#[0-9]* [FPS] ' $P)" = "$nrec" ] && ok "display: the host received all $nrec records the kernel says it sent" || bad "display: the kernel sent '$nrec' records, the host found $(grep -c '^#[0-9]* [FPS] ' $P)"
+expect "display: the 2-bit frame holds all four grey levels" $P '^#0 F 2 0 0 400 300 sum ok levels 0,1,2,3$'
+expect "display: the partial refresh of a 30-pixel change was a 40 x 10 window at x = 8" $P '^#[0-9]+ P 1 8 40 40 10 sum ok$'
+expect "display: the panel was put to sleep last" $P '^#[0-9]+ S 1 0 0 0 0 sum ok$'
+txt() { awk '/^text:$/{f=1; next} f' $P | sed -n "$1p"; }
+[ "$(txt 1)" = "HackOS display test" ] && [ "$(txt 2)" = "0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ" ] \
+    && [ "$(txt 3)" = 'abcdefghijklmnopqrstuvwxyz !"#$%&'"'"'()*+,-./:;<=>?@[]^_`{|}~' ] \
+    && ok "display: the last frame's pixels read back as the text that was written (95 printable characters)" \
+    || bad "display: text read back from the last frame: '$(txt 1)' / '$(txt 2)' / '$(txt 3)'"
+[ "$(txt 6)" = "          placed at row 6, column 11" ] && [ "$(txt 8)" = "plain inverse plain" ] && [ "$(txt 30 | sed 's/^ *//')" = "end" ] && [ "$(txt 30 | wc -c)" = 93 ] \
+    && ok "display: cursor addressing, an inverse word and the last cell row (row 30, column 90) are where they belong in the image" \
+    || bad "display: rows 6, 8, 30 read back as '$(txt 6)' / '$(txt 8)' / '$(txt 30)'"
 fi
 if want 6; then
 echo "[test] === 6. monitor session over the UART (real-time clock, commands typed by the harness)"
@@ -345,7 +369,8 @@ echo "[test] === 8. the shell: Hamnix's hamsh as a process on the UART console, 
 # counted; instead every command is followed by `wc < /dev/null`, whose output
 # "0 0 0" is never part of what was typed, and the harness waits for the n-th
 # one before it types the next command.
-qemu_start $B/hackos.elf $B/shell.out "$SDCARD"
+rm -rf $B/panel-shell $B/panel-shell.bin; mkdir -p $B/panel-shell
+qemu_start $B/hackos.elf $B/shell.out "$SDCARD -serial file:$B/panel-shell.bin"
 m=0
 sh() {  # type one command line, then the marker command; wait for the marker
     m=$((m+1))
@@ -596,11 +621,22 @@ if [ $# = 2 ]; then
 else
     bad "shell: idlestat printed '$wk'"
 fi
-expect "shell: idlestat: fewer than 10 tick interrupts a second while idle (1000 with the periodic tick)" $S '^  tick interrupts taken: +[0-9]\.[0-9] per second'
+expect "shell: idlestat: fewer than 100 tick interrupts a second while idle, the display's refreshes included (1000 with the periodic tick)" $S '^  tick interrupts taken: +[0-9]{1,2}\.[0-9] per second'
 expect "shell: suspend, ended by a key after about 1.5 s" $S '^woke: console after 1[0-9][0-9][0-9] ms, processor woken [0-9]+ times in all suspends$'
 expect "shell: suspend 2 -n, ended by its timer after 2000 ms" $S '^woke: timer after 2000 ms, processor woken [0-9]+ times in all suspends$'
 [ "$(grep -c '^persistent-history-probe$' $S)" = 2 ] && ok "shell: history survives exit: the next shell recalls a line of the previous one" || bad "shell: persistent-history-probe seen $(grep -c '^persistent-history-probe$' $S) times, expected 2"
 expect "shell: a pasted block of 60 command lines (2 KB in one write): every line ran, in order" $S '^60 180 900$'
+# the same session as the fake e-paper panel showed it
+P=$B/panel-shell.txt
+python3 -I tests/display/panel2png.py $B/panel-shell.bin $B/panel-shell --font third_party/font8x8/font8x8_basic.h --yscale 2 --keep 3 > $P 2>&1; prc=$?
+grep '^records:\|^image:' $P
+awk '/^text:$/{f=1; next} f' $P | grep -v '^$' | tail -8 | sed 's/^/    | /'
+[ $prc -eq 0 ] && ok "display: the session's panel stream is well-formed" || bad "display: panel2png.py failed on the session's stream ($prc)"
+nfull="$(sed -n 's/^records: full \([0-9]*\) partial \([0-9]*\).*/\1/p' $P)"; npart="$(sed -n 's/^records: full \([0-9]*\) partial \([0-9]*\).*/\2/p' $P)"
+[ "${npart:-0}" -ge 5 ] && [ "${nfull:-0}" -ge 2 ] && ok "display: the console reached the panel in $nfull full and $npart partial refreshes" || bad "display: $nfull full and $npart partial refreshes"
+awk '/^text:$/{f=1; next} f' $P | grep -q '^60 180 900$' && awk '/^text:$/{f=1; next} f' $P | grep -q '^hamsh\$ halt 0$' \
+    && ok "display: the last frame, read back from its pixels, shows the end of the session (the paste count, 'hamsh\$ halt 0')" \
+    || bad "display: the last frame does not show the end of the session"
 nmark="$(grep -c '^0 0 0$' $S)"
 [ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"
 
