@@ -427,8 +427,9 @@ device and channel tables are static data), 7,440 in use at boot, 42,032
 at the test session's peak. Each mounted 9P server takes a 1,048-byte
 message buffer from it; `exportfs` runs in a 12 KB block of the program
 arena. Beside the shell and a running `exportfs` there is room for the
-small programs (`cat`, `ls`, `echo`, `wc`, `seq`, `ps`), not for `grep`,
-`cp`, `sort` or `vi`. Stacks in the Renode session: init 1,648 of 3,072;
+small programs (`cat`, `ls`, `echo`, `wc`, `seq`, `ps`); `cp` and a
+pipeline with `grep` failed for lack of memory, and `sort` and `vi`, which
+need blocks at least as large, were not tried beside it. Stacks in the Renode session: init 1,648 of 3,072;
 hamsh user 1,672 of 8,192, kernel 1,872 of 4,096; the largest kernel stack
 of any process 1,904; largest user stack 7,140 of 8,192 (grep).
 
