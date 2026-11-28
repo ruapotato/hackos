@@ -54,7 +54,7 @@ CFG_MAGIC1: uint32 = 0x20227A79      # unchecked: same
 CFG_BOARD_ID: uint32 = 208           # unchecked: CFG_BOOTLOADER_BOARD_ID, same
 ID_EXPRESS: uint32 = 0x239A0029      # unchecked: USB VID 0x239A, UF2 PID 0x0029 (board.h, Express)
 ID_SENSE: uint32 = 0x239A0087        # unchecked: UF2 PID 0x0087 (board.h, Sense)
-XIP_WINDOW: uint32 = 0x00080000      # unchecked: = __romfs_window in link.ld (asserted by check_image.py)
+XIP_WINDOW: uint32 = 0x00060000      # unchecked: = __romfs_window in link.ld (asserted by check_image.py)
 
 # Flow control of the console, for input faster than the shell takes it (a
 # pasted block).  Two ways, both optional on the other side:
@@ -273,9 +273,12 @@ def board_mpu_extra():
     return
 
 
-# The /bin window: the ROM table at 0x80000 (link.ld), covered by the
-# smallest power-of-two region S aligned at 0x80000 with k of its eight
-# sub-regions enabled.  Read-only for everyone, executable, normal memory.
+# The /bin window: the ROM table at __romfs_window (link.ld), read-only for
+# everyone, executable, normal memory.  Its MPU region is the smallest
+# power-of-two region whose base is a multiple of its size, in which the
+# table starts on a sub-region boundary and ends inside; the sub-regions
+# outside the table are disabled, so nothing else (the kernel's code below
+# it in particular) is opened to processes.
 def board_xip_lo() -> uint64:
     return cast[uint64](&__romfs_start)
 
@@ -285,22 +288,36 @@ def board_xip_hi() -> uint64:
 
 
 def _xip_size() -> uint32:
-    size: uint32 = cast[uint32](board_xip_hi() - board_xip_lo())
+    lo: uint32 = cast[uint32](board_xip_lo())
+    hi: uint32 = cast[uint32](board_xip_hi())
     s: uint32 = 256
-    while s < size:
+    while s < 0x80000000:
+        base: uint32 = lo & ~(s - 1)
+        if ((lo - base) % (s / 8)) == 0 and hi <= base + s:
+            return s
         s = s << 1
     return s
 
 
 def board_mpu_xip_rbar() -> uint32:
-    return XIP_WINDOW | 0x14            # VALID | region 4
+    s: uint32 = _xip_size()
+    return (cast[uint32](board_xip_lo()) & ~(s - 1)) | 0x14     # VALID | region 4
 
 
 def board_mpu_xip_rasr() -> uint32:
     s: uint32 = _xip_size()
-    size: uint32 = cast[uint32](board_xip_hi() - board_xip_lo())
-    k: uint32 = (size + s / 8 - 1) / (s / 8)
-    srd: uint32 = (0xFF << k) & 0xFF
+    lo: uint32 = cast[uint32](board_xip_lo())
+    hi: uint32 = cast[uint32](board_xip_hi())
+    base: uint32 = lo & ~(s - 1)
+    sub: uint32 = s / 8
+    first: uint32 = (lo - base) / sub
+    last: uint32 = (hi - base + sub - 1) / sub          # one past the last sub-region in use
+    srd: uint32 = 0
+    k: uint32 = 0
+    while k < 8:
+        if k < first or k >= last:
+            srd = srd | (cast[uint32](1) << k)
+        k = k + 1
     n: uint32 = 0
     while (cast[uint32](1) << n) < s:
         n = n + 1

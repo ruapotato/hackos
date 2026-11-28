@@ -84,13 +84,18 @@ others = [w(app + 4 * i) for i in range(16, 64) if i not in (18, 33)]
 check(all(x == syms['irq_default_handler'] | 1 for x in others), "the other 46 interrupt vectors are the default handler")
 magic, off = facts['BL_SINGLE_TAP_MAGIC'].split('@')
 check(w(app + int(off, 0)) != int(magic, 0), f"no {magic} at 0x{app + int(off, 0):x} (it would make one reset enter the bootloader)")
-check(syms['__romfs_start'] == 0x80000 and syms['__romfs_start'] % (syms['__romfs_end'] - syms['__romfs_start'] - 1).bit_length() ** 0 == 0,
-      "the ROM table (/bin) at 0x80000")
+rlo, rhi = syms['__romfs_start'], syms['__romfs_end']
+check(rlo == 0x60000, f"the ROM table (/bin) at 0x{rlo:x}")
 win = 256
-while win < syms['__romfs_end'] - syms['__romfs_start']:
+while not ((rlo - (rlo & ~(win - 1))) % (win // 8) == 0 and rhi <= (rlo & ~(win - 1)) + win):
     win <<= 1
-check(0x80000 % win == 0 and 0x80000 + win <= 0x100000, f"its MPU window: {win // 1024} KB at 0x80000, aligned to its size")
-check(syms['__text_end'] <= 0x80000, f"kernel code ends at 0x{syms['__text_end']:x}, below the /bin window")
+wbase = rlo & ~(win - 1)
+first, last = (rlo - wbase) // (win // 8), -(-(rhi - wbase) // (win // 8))
+check(wbase % win == 0 and wbase + win <= 0x100000,
+      f"its MPU region: {win // 1024} KB at 0x{wbase:x}, sub-regions {first}..{last - 1} of 8 enabled (0x{wbase + first * win // 8:x}..0x{wbase + last * win // 8:x})")
+check(syms['__text_end'] <= wbase + first * (win // 8), f"kernel code ends at 0x{syms['__text_end']:x}, below the part of the region open to processes")
+check(syms['__flash_end'] <= 0xAD000,
+      f"the image ends at 0x{syms['__flash_end']:x}, below 0xAD000 (Adafruit bootloader 0.2.6 silently drops UF2 blocks from there on); {(0xAD000 - syms['__flash_end']) // 1024} KB to spare")
 check(syms['__prog_end'] == 0x20040000 and syms['__heap_end'] <= syms['__prog_start'], "the program arena ends at the end of RAM, after the kernel heap")
 check(syms['__prog_start'] <= 0x20020000 <= syms['__prog_end'] - 0x1C000, "a 112 KB shell block fits at 0x20020000 (its 128 KB boundary)")
 

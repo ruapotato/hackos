@@ -10,12 +10,19 @@
  *   0x00001000  SoftDevice S140 6.1.1           kept: HackOS does not use it,
  *                                               the bootloader's BLE DFU does
  *   0x00026000  APPLICATION = this image        __app_start (board.mk)
+ *   0x000AD000  __uf2_limit: Adafruit's bootloader 0.2.6 (2018, shipped on
+ *               early boards) SILENTLY DROPS UF2 blocks at or above this
+ *               address.  Found on the first real board: the image then
+ *               ended at 0xBD000, so the end of /bin and all of .data's
+ *               initial values stayed erased flash (0xFF) and the first
+ *               use of an initialised global faulted.  The whole image
+ *               must end below it (asserted below, and check_image.py).
  *   0x000EA000  application data (40 KB, CircuitPython/Arduino file system;
- *               USER_FLASH_END: the bootloader refuses UF2 blocks above it)
+ *               USER_FLASH_END of later bootloaders)
  *   0x000F4000  bootloader, 0x000FE000 MBR parameters, 0x000FF000 settings
  * In the application area:
  *   __app_start  vector table, kernel code and constants
- *   0x00080000   /bin: the ROM file table, in its own power-of-two window
+ *   0x00060000   /bin: the ROM file table, on a 128 KB boundary
  *                (programs' code runs from here in place, so the MPU opens
  *                this window, and only this, read-only to processes;
  *                board.ad board_mpu_xip_*)
@@ -45,7 +52,8 @@ MEMORY
     RAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 256K
 }
 
-__romfs_window = 0x00080000;
+__romfs_window = 0x00060000;
+__uf2_limit = 0x000AD000;             /* bootloader 0.2.6 drops UF2 blocks from here on */
 __prog_start = 0x20018000;
 __stack_size = 0x2000;               /* handler-mode (MSP) stack */
 __user_size  = 0x100;                /* shared arena of in-image unprivileged
@@ -142,7 +150,8 @@ SECTIONS
     ASSERT(__app_start == ORIGIN(FLASH), "NRF_APP_START (board.mk) and the FLASH origin differ")
     ASSERT(ADDR(.text) == ORIGIN(FLASH) && __vectors_start == ORIGIN(FLASH), "the vector table must be the first word of the application")
     ASSERT(__vectors_start % 256 == 0, "the vector table must be 256-byte aligned")
-    ASSERT(__text_end <= __romfs_window, "kernel code runs into the /bin window at 0x80000")
+    ASSERT(__text_end <= __romfs_window, "kernel code runs into the /bin window (__romfs_window)")
+    ASSERT(__flash_end <= __uf2_limit, "image ends at or above 0xAD000: Adafruit bootloader 0.2.6 would silently not write the rest (see the comment at the top)")
     ASSERT(__flash_end <= ORIGIN(FLASH) + LENGTH(FLASH), "image runs into the bootloader's application-data area (0xEA000)")
     ASSERT(__heap_end > __heap_start + 0x4000, "less than 16 KB of RAM left for the kernel heap")
     ASSERT(__user_start % __user_size == 0, "the shared user arena is not aligned to its size")

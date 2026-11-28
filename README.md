@@ -119,7 +119,7 @@ register models, and the Teensy's programs in QEMU in the Teensy's memory
 map. How to flash it, what the first power-up should show, and the order in
 which to check the untested parts: [`docs/boards/teensy41.md`](docs/boards/teensy41.md).
 
-## A third board: the Adafruit Feather nRF52840 Express (UNTESTED ON HARDWARE)
+## A third board: the Adafruit Feather nRF52840 Express (first run on hardware 2026-11-28; see its doc for what was and was not tried)
 
 `make BOARD=feather-nrf52840` builds it for Adafruit's Feather nRF52840
 Express (Nordic nRF52840: Cortex-M4F at 64 MHz, single-precision FPU,

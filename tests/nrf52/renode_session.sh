@@ -49,7 +49,7 @@ sed 's/^/    /' $S
 NPROG=$(ls build/feather-nrf52840/user | grep -cv '\.')
 expect "boot banner names the board and the M4F" $S '^HackOS 0\.[0-9]+ \(milestone [0-9]+\) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express'
 expect "the clocks report" $S '^clocks: HFCLK from the 32 MHz crystal, LFCLK from the RC oscillator$'
-expect "/bin runs in place from its flash window" $S '^/bin in place at 0x00080000\.\.'
+expect "/bin runs in place from its flash window" $S '^/bin in place at 0x00060000\.\.'
 expect "hamsh runs as a process (its banner)" $S "^hamsh . Hamnix shell"
 expect "a built-in" $S '^hello from hamsh$'
 expect "ls /bin" $S '^hamsh$'

@@ -29,6 +29,44 @@ and is even less tested than the Express.
 - On the PC: `make BOARD=feather-nrf52840` output, and `picocom` or `screen`.
 - Optional: a Raspberry Pi Pico as an SWD probe (section 7).
 
+## First run on a real board (2026-11-28) and the old-bootloader limit
+
+A Feather nRF52840 Express with **Adafruit bootloader 0.2.6** (2018,
+`INFO_UF2.TXT`: "UF2 Bootloader 0.2.6 ... s140 6.1.1") did not start the
+first images: the chip reset in a loop. The cause was not in the kernel.
+Bootloader 0.2.6 has `USER_FLASH_END 0xAD000` (its `src/usb/uf2/uf2cfg.h`)
+and **silently drops every UF2 block at or above 0xAD000**. The image then
+ended at 0xBD000 with `/bin` at 0x80000, so the end of `/bin` and all of
+`.data`'s initial values were never written: every initialised global read
+as erased flash (0xFFFFFFFF) and the first register write through one
+(`CLOCK_BASE + CLOCK_INTENCLR`) was a bus fault at 0xFFFFFFFE, then a CPU
+lock-up reset. Renode loads the ELF, so it could not show this.
+
+Fix: `/bin` moved to 0x60000 and the whole image must end below 0xAD000
+(`__uf2_limit`: an ASSERT in `link.ld` and a check in
+`tests/nrf52/check_image.py`). The MPU region for `/bin` is now computed
+from where the table lies (`board_mpu_xip_*`), with the sub-regions outside
+it disabled.
+
+Run on that board with this layout, **milestone-3 image only** (console on
+TX/RX at 115200 through a USB-serial cable): the boot report (`part
+0x00052840`, 256 KB RAM, HFCLK from the crystal), the shell, typing and
+echo, `ls /bin`, `echo one two three | wc`, a four-program pipeline,
+`echo saved > /tmp/f` and `cat`, and `ptest peek 20000000` ending with
+status 139 (the MPU on the real Cortex-M4). Not yet run on the board:
+anything added in milestone 4 (the editor, the extra programs, tickless
+idle and suspend, pasted input), Ctrl-C, timing accuracy, current draw.
+
+How it was found without a debugger, for the next board: the bootloader's
+drive exposes the application flash as `CURRENT.UF2`, so a build that
+writes words into a reserved erased page (NVMC) at each start-up stage and
+in the fault handler (exception number, CFSR, BFAR, stacked PC) can be read
+back over USB after a double-tap.
+
+Size is now a constraint on such boards: this image ends at 0xaa288, 11 KB below the limit (kernel code to 0x504b8, /bin 0x60000..0xa9b20). Newer Adafruit bootloaders
+raise the limit to 0xED000; updating the bootloader is the board owner's
+decision.
+
 ## 2. Console wiring
 
 The console is UARTE0 at **115200 baud, 8N1**, 3.3 V logic, no flow control:
@@ -144,7 +182,7 @@ bootloader.
    chip: part 0x00000000 variant 0x00000000, 0 KB RAM, 0 KB flash, device id 0x00000000 0x00000000
    reset reason 0x00000000, bootloader board id 0x00000000 (unknown: assuming the Express, red LED P1.15)
    clocks: HFCLK from the 32 MHz crystal, LFCLK from the RC oscillator
-   /bin in place at 0x00080000..0x000bc8a8, MPU window 256 KB
+   /bin in place at 0x00060000..0x0009c8a8, MPU window 1024 KB
    memory: kernel heap 7216 of 50640 bytes in use at boot; program arena 0x20018000..0x20040000
    hamsh — Hamnix shell. Type 'help'.
    hamsh$
@@ -257,7 +295,7 @@ restored over SWD from Adafruit's `*_bootloader-*_s140_6.1.1.hex`.
 ## 7a. Memory
 
 256 KB of RAM holds everything. Programs' **code stays in flash** (the
-ROM table at 0x80000, run in place). Only their data and stacks are in RAM.
+ROM table at 0x60000, run in place). Only their data and stacks are in RAM.
 Figures from `make BOARD=feather-nrf52840` and the Renode session's memory
 report (printed at `halt`):
 
