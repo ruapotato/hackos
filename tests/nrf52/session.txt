@@ -79,6 +79,48 @@ shn cat | wc
 sleep 1
 raw 03
 sh echo pipeline interrupted $status
+# milestone 5: namespaces.  Every file in / is kernel heap here (2 KB and
+# more each), so the files of the session so far go first, and this part's
+# own files when it is done.
+sh rm /tmp/h
+sh rm /tmp/found
+sh rm /tmp/both
+sh rm /tmp/count
+sh rm /tmp/moved-n
+sh rm /tmp/s.hsh
+sh free
+sh mkdir /tmp/ua
+sh mkdir /tmp/ub
+sh mkdir /tmp/un
+sh echo from-a > /tmp/ua/shared
+sh echo only-a > /tmp/ua/afile
+sh echo from-b > /tmp/ub/shared
+sh echo only-b > /tmp/ub/bfile
+sh cat /proc/self/ns | wc
+sh ns { bind /tmp/ua /tmp/un ; cat /tmp/un/afile ; cat /proc/self/ns | wc }
+sh cat /tmp/un/afile
+sh bind /tmp/ua /tmp/un
+sh bind -a /tmp/ub /tmp/un
+sh ls /tmp/un | wc
+sh cat /tmp/un/shared
+sh cat /tmp/un/bfile
+sh cat /proc/self/ns
+sh unmount /tmp/un
+sh cat /tmp/un/shared
+sh rm /tmp/ub/shared
+sh rm /tmp/ub/bfile
+sh cp /bin/hello /tmp/ub/seq
+sh ns { bind -b /tmp/ub /bin ; seq 7 }
+sh seq 7 | tail -1
+sh rm /tmp/ub/seq
+sh box = ns clean { bind '#t/tmp/ua' / ; bind '#r' /bin }
+sh enter box { ls / | wc }
+sh rm /tmp/ua/shared
+sh rm /tmp/ua/afile
+sh rm /tmp/ua
+sh rm /tmp/ub
+sh rm /tmp/un
+sh free
 # the editor (200 lines of 79 characters on this board)
 shn vi /tmp/edit.txt
 sleep 1

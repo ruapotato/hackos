@@ -52,7 +52,7 @@ def init_main(arg: uint64) -> int64:
 
 
 def main() -> int32:
-    kputs("\nHamnix Micro 0.4 (milestone 4) -- ")
+    kputs("\nHamnix Micro 0.5 (milestone 5) -- ")
     kputs(board_cpu_name())
     kputs(", ")
     kputs(board_name())

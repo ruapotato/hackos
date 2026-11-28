@@ -55,7 +55,7 @@ from board.board import board_code_loaded, board_xip_lo, board_xip_hi
 from kernel.mpu import mpu_proc_rasr, mpu_proc_rbar
 from kernel.sched.core import Thread, thr, threads, current_thread, sched_current, sched_mpu_apply, thread_create_proc, thread_start, thread_set_name, thread_by_tid, thread_wait, thread_exit, set_current_errstr, wq_wait, wq_wake_all, thread_killed, T_UNUSED, T_ZOMBIE, THREAD_MAX, TF_PROC, TF_DETACHED, PF_VFORK, PF_HELD, PF_VFDONE, PF_WAITING, WAIT_FOREVER
 from mm.slab import kmalloc, kfree, palloc_aligned, pfree
-from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, vfs_rom_addr, OREAD, ENOMEM, EFAULT, EINVAL
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_lseek, vfs_rom_addr, vfs_ns_split, vfs_ns_prepare, vfs_ns_adopt, vfs_ns_discard, OREAD, ENOMEM, EFAULT, EINVAL
 from kernel.pipe import EAGAIN
 from kernel.uaccess import uok, ustr
 
@@ -65,6 +65,8 @@ ECHILD: int32 = -10
 
 RFPROC: uint32 = 0x001
 RFNOWAIT: uint32 = 0x100
+RFNAMEG: uint32 = 0x008             # the child (or, without RFPROC, the caller) gets its own copy of the namespace
+RFCNAMEG: uint32 = 0x080            # ... an empty namespace
 
 PROC_STACK_DEFAULT: uint32 = 8192
 PROC_STACK_MIN: uint32 = 1024
@@ -697,12 +699,16 @@ def proc_release_held():
 # are what Hamnix's callers pass; sharing them is not offered).
 def proc_rfork(flags: uint32) -> int32:
     p: Ptr[Thread] = current_thread()
+    clean: uint32 = 0
+    if (flags & RFCNAMEG) != 0:         # RFCNAMEG wins over RFNAMEG, as in Plan 9 and Hamnix
+        clean = 1
     if (flags & RFPROC) == 0:
-        return _fail(EINVAL, "rfork: only RFPROC is supported (no namespace to change)")
+        # no new process: the caller itself leaves its namespace group
+        if (flags & (RFNAMEG | RFCNAMEG)) == 0:
+            return _fail(EINVAL, "rfork: without RFPROC only RFNAMEG and RFCNAMEG are supported")
+        return vfs_ns_split(p, clean)
     if (p[0].flags & TF_PROC) == 0 or p[0].svc_ctrl == 0 or p[0].usp == 0:
         return _fail(EINVAL, "rfork: only a process can fork")
-    if (p[0].pflags & PF_VFORK) != 0:
-        return _fail(EAGAIN, "rfork: a child that has not exec'ed cannot fork")
     proc_release_held()
     frame: uint32 = p[0].usp
     fp: uint32 = 0
@@ -725,10 +731,20 @@ def proc_rfork(flags: uint32) -> int32:
     dflag: uint32 = 0
     if (flags & RFNOWAIT) != 0:
         dflag = TF_DETACHED
+    ng: int32 = -1
+    if (flags & (RFNAMEG | RFCNAMEG)) != 0:
+        ng = vfs_ns_prepare(clean)
+        if ng < 0:
+            kfree(snap)
+            return ng
     c: Ptr[Thread] = thread_create_proc(&p[0].name[0], p[0].base_prio, dflag)
     if c == cast[Ptr[Thread]](0):
         kfree(snap)
+        if ng >= 0:
+            vfs_ns_discard(cast[uint32](ng))
         return _fail(EAGAIN, "rfork: out of process slots or memory")
+    if ng >= 0:
+        vfs_ns_adopt(c, cast[uint32](ng))
     rt_memcpy(snap, cast[uint64](frame), cast[uint64](slen))
     c[0].mem_base = 0                   # borrowed, never freed by the child
     c[0].mem_lo = p[0].mem_lo

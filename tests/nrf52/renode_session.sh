@@ -97,6 +97,18 @@ expect "tr" $S '^SHOUT$'
 expect "mv" $S '^moved-n$'
 expect "Ctrl-C ends a pipeline (cat | wc: both wait, the shell names no group for them)" $S '^pipeline interrupted 130$'
 expect "kill PID ends the background job" $S '^\[1\]\+ Done ptest loop$'
+# milestone 5: namespaces
+[ "$(grep -c '^5 15 72$' $S)" = 1 ] && ok "ns: the boot namespace has five binds (no /sd)" || bad "ns: '5 15 72' seen $(grep -c '^5 15 72$' $S) times, expected 1"
+expect "ns: a bind made inside \`ns { }\` (rfork RFNAMEG, a nested vfork) works there" $S '^6 18 97$'
+expect "ns: ... and is invisible to the shell" $S '^cat: cannot open /tmp/un/afile: .*file does not exist'
+expect "union: merged listing of two directories" $S '^3 3 19$'
+expect "union: lookup order" $S '^from-a$'
+expect "union: a name only the second directory has" $S '^only-b$'
+expect "ns: /proc/self/ns" $S "^bind -a '#t/tmp/ub' /tmp/un\$"
+expect "ns: unmount" $S '^cat: cannot open /tmp/un/shared: .*file does not exist'
+expect "ns: bind -b over /bin replaces a program inside the block" $S '^  arg: 7$'
+expect "ns: ... and only there" $S '^7$'
+expect "ns: a clean namespace entered from a template (root = /tmp/ua, /bin, /fd)" $S '^4 4 20$'
 expect "vi: scripted keystrokes, left with :wq" $S '^vi-status 0$'
 expect "vi: the file it wrote is 4 lines, 36 bytes" $S '^4 7 36$'
 expect "vi: insert with a correction, dd, O, G \$ x x, o" $S '^appended via o$'

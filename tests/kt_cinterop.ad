@@ -151,7 +151,7 @@ def ci_callback() -> uint32:
 def ci_structs() -> uint32:
     sz: uint32 = hk_c_fill(&ci_rec, "hmicro")
     ok: uint32 = 0
-    if sz == sizeof(CRec) and sz == 40 and ci_rec.tag == 0xA7 and ci_rec.len == 6 and ci_rec.crc == 0xC0FFEE06 and ci_rec.big == 0x0123456789ABCDEF and ci_rec.ratio == 0.375 and ci_rec.name[0] == 104 and ci_rec.name[5] == 111 and ci_rec.name[6] == 0:
+    if sz == sizeof(CRec) and sz == 40 and ci_rec.tag == 0xA7 and ci_rec.len == 6 and ci_rec.crc == 0xC0FFEE06 and ci_rec.big == 0x0123456789ABCDEF and ci_rec.ratio == 0.375 and ci_rec.name[0] == 104 and ci_rec.name[5] == 115 and ci_rec.name[6] == 0:
         ok = 1
     ci_rec.tag = 0x5A
     ci_rec.len = 4660

@@ -221,15 +221,15 @@ def sys_nsid() -> uint64:
 # They reach the kernel so that the error string says why (or, for svc_ctl's
 # poll, so that the answer is "nothing pending").
 def sys_bind(new: Ptr[uint8], old: Ptr[uint8], flag: int32) -> int32:
-    return cast[int32](hmicro_syscall(257, cast[uint64](new), 0, 0, 0, 0, 0))
+    return cast[int32](hmicro_syscall(257, cast[uint64](new), cast[uint64](old), cast[uint64](cast[uint32](flag)), 0, 0, 0))
 
 
 def sys_mount(srvfd: int32, afd: int32, old: Ptr[uint8], flag: int32, spec: Ptr[uint8]) -> int32:
-    return cast[int32](hmicro_syscall(258, cast[uint64](srvfd), 0, 0, 0, 0, 0))
+    return cast[int32](hmicro_syscall(258, cast[uint64](cast[uint32](srvfd)), cast[uint64](cast[uint32](afd)), cast[uint64](old), cast[uint64](cast[uint32](flag)), cast[uint64](spec), 0))
 
 
 def sys_unmount(new: Ptr[uint8], old: Ptr[uint8]) -> int32:
-    return cast[int32](hmicro_syscall(259, cast[uint64](new), 0, 0, 0, 0, 0))
+    return cast[int32](hmicro_syscall(259, cast[uint64](new), cast[uint64](old), 0, 0, 0, 0))
 
 
 def sys_svc_ctl(verb: int32, name: Ptr[uint8], cap: uint64) -> int64:
@@ -241,7 +241,7 @@ def sys_svc_publish(name: Ptr[uint8], payload: Ptr[uint8]) -> int32:
 
 
 def sys_nslabel(op: int32, label: Ptr[uint8], to_path: Ptr[uint8], from_path: Ptr[uint8]) -> int32:
-    return cast[int32](hmicro_syscall(285, 0, 0, 0, 0, 0, 0))
+    return cast[int32](hmicro_syscall(285, cast[uint64](cast[uint32](op)), cast[uint64](label), cast[uint64](to_path), cast[uint64](from_path), 0, 0))
 
 
 def sys_srv_open(name: Ptr[uint8]) -> int32:

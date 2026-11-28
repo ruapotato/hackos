@@ -140,6 +140,7 @@ class Thread:
     fdn_pos: Array[16, uint64]
     # ---- per-thread kernel state used by other subsystems ----
     fd: Array[16, int32]            # open-file table indices, -1 = closed (fs/hvfs.ad)
+    nsg: uint32                     # namespace group (fs/ns.ad); 0 = the boot namespace
     cwd: Array[128, uint8]
     errstr: Array[64, uint8]
     name: Array[16, uint8]

@@ -24,7 +24,7 @@ from kernel.uaccess import uok, ustr
 from kernel.proc import proc_sys_spawn, proc_exec, proc_rfork, proc_waitpid, proc_waitpid_jc, proc_release_held
 from kernel.rt import rt_memcpy
 from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
-from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, vfs_bind, vfs_unmount, vfs_nslabel, vfs_nsid, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
 from kernel.exit import hmicro_exit
 from kernel.power import power_suspend
@@ -54,9 +54,10 @@ SYS_MKDIR: uint32 = 22
 SYS_READ_NB: uint32 = 23
 SYS_YIELD: uint32 = 24
 SYS_RFORK: uint32 = 256             # (flags); vfork semantics, see kernel/proc.ad
-SYS_BIND: uint32 = 257              # not implemented: no namespaces
-SYS_MOUNT: uint32 = 258             # not implemented
-SYS_UNMOUNT: uint32 = 259           # not implemented
+SYS_BIND: uint32 = 257              # (new, old, flag)
+SYS_MOUNT: uint32 = 258             # (srvfd, afd, old, flag, spec)
+SYS_UNMOUNT: uint32 = 259           # (new or 0, old)
+SYS_NSLABEL: uint32 = 285           # (op, label, to, from)
 SYS_CREATE: uint32 = 260
 SYS_STAT_P9: uint32 = 261
 SYS_FSTAT_P9: uint32 = 262
@@ -65,7 +66,7 @@ SYS_ERRSTR: uint32 = 265
 SYS_FDBIND: uint32 = 278            # (pid, fdnum, kind, arg): bind an /fd name
 SYS_PIPECHAN: uint32 = 280          # () -> pipe slot
 SYS_OPENCHAN: uint32 = 281          # (path, mode) -> channel for fdbind
-SYS_NSID: uint32 = 282              # () -> 1: there is one namespace
+SYS_NSID: uint32 = 282              # () -> the caller's namespace group, counted from 1
 SYS_FDSLOT_KIND: uint32 = 287       # (pid, fdnum)
 SYS_GETUID: uint32 = 288
 SYS_GETGID: uint32 = 289
@@ -309,7 +310,7 @@ def _sys_p9(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint
             return _bad()
         return cast[int64](vfs_openchan(cast[Ptr[uint8]](a0), cast[int32](a1)))
     if nr == SYS_NSID:
-        return 1
+        return cast[int64](vfs_nsid())
     if nr == SYS_GETUID or nr == SYS_GETGID:
         return cast[int64](current_thread()[0].uid)
     if nr == SYS_SETUID:
@@ -336,8 +337,20 @@ def _sys_p9(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint
             return 0
         set_current_errstr("svc: no service supervisor")
         return cast[int64](ENOSYS)
-    if nr == SYS_BIND or nr == SYS_MOUNT or nr == SYS_UNMOUNT:
-        set_current_errstr("no namespaces on this system: bind and mount are not available")
+    if nr == SYS_BIND:
+        if ustr(a0) == 0 or ustr(a1) == 0:
+            return _bad()
+        return cast[int64](vfs_bind(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1), cast[uint32](a2)))
+    if nr == SYS_UNMOUNT:
+        if (a0 != 0 and ustr(a0) == 0) or ustr(a1) == 0:
+            return _bad()
+        return cast[int64](vfs_unmount(cast[Ptr[uint8]](a0), cast[Ptr[uint8]](a1)))
+    if nr == SYS_NSLABEL:
+        if ustr(a1) == 0 or (a2 != 0 and ustr(a2) == 0):
+            return _bad()
+        return cast[int64](vfs_nslabel(cast[uint32](a0), cast[Ptr[uint8]](a1), cast[Ptr[uint8]](a2)))
+    if nr == SYS_MOUNT:
+        set_current_errstr("mount: no 9P client yet")
         return cast[int64](ENOSYS)
     if nr == SYS_MMAP:
         # anonymous memory only: (addr ignored, len, prot, flags, fd, off)
@@ -441,8 +454,14 @@ def _stack_args(nr: uint32) -> uint32:
 def _stack_args_slow(nr: uint32) -> uint32:
     if nr == SYS_WRITE or nr == SYS_READ or nr == SYS_READ_NB or nr == SYS_LSEEK or nr == SYS_CREATE or nr == SYS_STAT_P9 or nr == SYS_FSTAT_P9:
         return 2
-    if nr == SYS_DUP2 or nr == SYS_GETCWD or nr == SYS_ERRSTR or nr == SYS_RENAME or nr == SYS_THREAD_JOIN or nr == SYS_MUNMAP or nr == SYS_NANOSLEEP:
+    if nr == SYS_DUP2 or nr == SYS_GETCWD or nr == SYS_ERRSTR or nr == SYS_RENAME or nr == SYS_THREAD_JOIN or nr == SYS_MUNMAP or nr == SYS_NANOSLEEP or nr == SYS_UNMOUNT:
         return 1
+    if nr == SYS_BIND:
+        return 2
+    if nr == SYS_NSLABEL:
+        return 3
+    if nr == SYS_MOUNT:
+        return 4
     if nr == SYS_WAITPID or nr == SYS_WAITPID_JC or nr == SYS_SPAWN or nr == SYS_OPENCHAN or nr == SYS_FDSLOT_KIND or nr == SYS_FDSLOT_ARG or nr == SYS_SETPGID or nr == SYS_SUSPEND:
         return 1
     if nr == SYS_EXECVE:

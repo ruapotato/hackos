@@ -2,7 +2,7 @@
 <!-- Copyright (C) 2026 David Hamner -->
 # Hamnix Micro system calls
 
-Status: milestone 4, emulators only (QEMU's Cortex-M7 and Cortex-M4 machines, Renode's nRF52840). This is the interface between unprivileged
+Status: milestone 5, emulators only (QEMU's Cortex-M7 and Cortex-M4 machines, Renode's nRF52840). This is the interface between unprivileged
 code and the kernel: programs loaded from the file system (processes), and
 the unprivileged threads that the kernel test image carries inside itself.
 
@@ -61,7 +61,7 @@ Hamnix's `sys_*` stubs keeps its meaning. Hamnix Micro-only calls start at 512.
 |--|--|--|--|
 | 0 | `sys_putc(c)` | one byte to the console | same |
 | 2 | `sys_get_jiffies()` | 100 Hz ticks since boot | same |
-| 5 | `sys_open(path)` | open for reading; a directory reads as `NAME\n` lines | same |
+| 5 | `sys_open(path)` | open for reading; a directory reads as `NAME\n` lines. Every path is looked up in the caller's namespace ([`namespaces.md`](namespaces.md)); a path that starts with `#` names a server directly (`#c/console`) | same; a union directory lists all its members (Hamnix: the first) |
 | 6 | `sys_read(fd, buf, n)` | bytes read, 0 at end of file; blocks on the console and on an empty pipe | same |
 | 7 | `sys_close(fd)` | | same |
 | 8 | `sys_write(fd, buf, n)` | bytes written; blocks on a full pipe; `-EPIPE` (-32) when the pipe has no reader | no SIGPIPE in either |
@@ -90,7 +90,7 @@ Hamnix's `sys_*` stubs keeps its meaning. Hamnix Micro-only calls start at 512.
 | 10 | `sys_execve_env(path, argv, envp)` | replaces the caller's program; returns only on failure (`-ENOENT`, `-ENOEXEC` -8, `-ENOMEM`, `-E2BIG` -7) | same; the program must be a position-independent ELF for this machine |
 | 12 | `sys_waitpid(pid)`, `sys_waitpid_nb_raw(pid, flags)` | the exit code of process `pid` once it has ended, and the process is gone; `flags` bit 0: `-EAGAIN` (-11) instead of waiting; `-ECHILD` (-10) for an unknown pid | same |
 | 24 | `sys_yield()` | give up the rest of the time slice. **After 16 empty polls in a row** (a `read_nb` that found nothing, or a `waitpid_jc` that found its process still running) **it waits instead**: until console input arrives, a pipe is written, a process ends, or 250 ms pass. A read that returns data, or any write, ends the streak | Hamnix schedules cooperatively; Hamnix Micro also preempts. The wait exists because Hamnix's shell and editor wait for a key, and the shell for its foreground job, by polling and yielding; left alone that keeps the processor awake for ever |
-| 256 | `sys_rfork(flags)` | **vfork**: needs `RFPROC`; the child runs on the parent's memory with its own descriptors and `/fd` names, and the parent is suspended until the child calls `exec` or `exit`. `RFNOWAIT` (0x100) detaches the child. Other flag bits are ignored | Hamnix copies the address space (copy on write) and can also change namespaces; see below |
+| 256 | `sys_rfork(flags)` | **vfork**: with `RFPROC` the child runs on the parent's memory with its own descriptors and `/fd` names, and the parent is suspended until the child calls `exec` or `exit`; a child that has not exec'ed may itself `rfork`. `RFNOWAIT` (0x100) detaches the child. **Namespace:** shared with the parent by default; `RFNAMEG` (0x008) gives the child a copy (made only when one side changes it), `RFCNAMEG` (0x080) an empty one. Without `RFPROC`, `RFNAMEG` or `RFCNAMEG` changes the caller's own namespace that way and nothing else. Other flag bits are ignored | Hamnix copies the address space (copy on write); the namespace flags are the same |
 | 288, 289 | `sys_getuid()`, `sys_getgid()` | 1: there is one user, the owner | same value for Hamnix's hostowner |
 | 290 | `sys_setuid(uid)` | succeeds for the current uid only | |
 | 297 | `sys_setpgid(pid, pgid)` | puts a process in a group (`pgid` 0: its own); children inherit it | same |
@@ -98,7 +98,7 @@ Hamnix's `sys_*` stubs keeps its meaning. Hamnix Micro-only calls start at 512.
 | 299 | `sys_waitpid_jc(pid, &status)` | never waits: `pid` when the process has ended (`status = (code & 0xFF) << 8 \| 1`, and it is gone), 0 while it runs, `-ECHILD` | no stopped or continued states |
 | 308 | `nanosleep({sec, nsec})` | rounded up to scheduler ticks (1 ms) | same structure |
 | 516 | `sys_sleep_ms(ms)` | | Hamnix Micro only |
-| 517 | `sys_spawn(path, argv)` | a new process running `path` with the caller's descriptors, `/fd` names and directory; returns its id. No fork involved: the native way to start a program | Hamnix Micro only (Hamnix retired its `spawn` call in favour of `rfork` + `exec`) |
+| 517 | `sys_spawn(path, argv)` | a new process running `path` with the caller's descriptors, `/fd` names, directory and namespace (shared, as after `rfork(RFPROC)`); returns its id. No fork involved: the native way to start a program | Hamnix Micro only (Hamnix retired its `spawn` call in favour of `rfork` + `exec`) |
 | 518 | `halt(status)` | prints `[hmicro] exit status N` and resets the machine | Hamnix Micro only |
 | 520 | `sys_suspend(ms, sources)` | stops the whole system until a wake source fires: `sources` bit 0 = a byte at the console, bit 1 = after `ms` milliseconds. Returns the source that fired (1 or 2); `-EINVAL` when nothing could end it or the board cannot suspend. The clock is moved by the time spent. See [`power.md`](power.md) | Hamnix Micro only |
 
@@ -122,15 +122,15 @@ Hamnix's shell does not build pipelines from `pipe` and `dup`. Every process
 has sixteen names `/fd/0` ... `/fd/15`; each is bound to the console, one end
 of a pipe, a file, or nothing, and a descriptor opened on `/fd/N` resolves the
 name at every read and write, in the process that makes the call. So a parent
-can redirect a child after the child exists. Hamnix Micro implements this part of
-Hamnix's namespace model and nothing else of it.
+can redirect a child after the child exists. (In Hamnix the table of `/fd`
+names belongs to the namespace group; in Hamnix Micro to the process.)
 
 | Nr | Wrapper | Behaviour |
 |--|--|--|
 | 278 | `sys_fdbind(pid, n, kind, arg)` | bind `/fd/n` of process `pid` (0 = the caller; otherwise a child of the caller). `kind`: 0 nothing, 1 console, 2 read end of pipe `arg`, 3 write end of pipe `arg`, 4 file channel `arg`, 5 whatever `/fd/arg` is bound to (dup), 6 file channel written at its end (append), 7 device or ROM-file channel `arg`. **A process can bind only what it holds** (`-EPERM` otherwise): a pipe it created with `pipechan` or already has at one of its names; a file it opened with `openchan` or already has bound. A child of `rfork` that has not exec'ed counts as its parent. A dup (5) of a file makes both names write at the end of the file, so `> file 2>&1` keeps the two streams in order |
 | 280 | `sys_pipechan()` | a new pipe (4 KiB), as a slot number for `fdbind`; it lives while a name is bound to either end |
 | 281 | `sys_openchan(path, mode)` | open a file as a channel for `fdbind`: mode 0 existing, 1 create or truncate, 2 create and keep. tmpfs files, devices, and (mode 0) the programs under `/bin`. The caller is granted the right to bind the result (until it ends or the file is removed; the kernel remembers 32 grants and overwrites the oldest) |
-| 282 | `sys_nsid()` | 1 |
+| 282 | `sys_nsid()` | the caller's namespace group, counted from 1: equal for processes that share a namespace |
 | 287, 324 | `sys_fdslot_kind(pid, n)`, `sys_fdslot_arg(pid, n)` | what a name is bound to |
 
 The bindings are copied to a child with every pipe end counted, and dropped
@@ -160,6 +160,7 @@ are what Hamnix's `ps`, `free`, `df` and `date` read, with Hamnix Micro's conten
 | `/proc/power` | idle and wake-up counters ([`power.md`](power.md)). Writing `tickless 0` or `tickless 1` switches tickless idle |
 | `/proc/screen` | the text on the display's character cells, or `no display` |
 | `/proc/keys` | write-only, on a board with the emulated keyboard: the text written is typed through the key matrix model |
+| `/proc/<pid>/ns` | the namespace of process `<pid>` as `bind` and `mount` commands in the order they were made; `self` stands for the reader ([`namespaces.md`](namespaces.md)) |
 | `/proc/<pid>/note` | write-only: `kill`, `interrupt`, `hangup` or `term` ends process `<pid>`. This is all there is of Plan 9's notes: nothing can be caught. Hamnix's shell built-in `kill PID` writes `kill` here |
 
 ### Memory and threads
@@ -172,13 +173,24 @@ are what Hamnix's `ps`, `free`, `df` and `date` read, with Hamnix Micro's conten
 | 513 | `sys_thread_join(tid, &code)` | |
 | 515 | `sys_gettid()` | |
 
+### Namespaces
+
+[`namespaces.md`](namespaces.md) has the model, examples and the measured
+cost.
+
+| Nr | Wrapper | Behaviour | Compared with Hamnix |
+|--|--|--|--|
+| 257 | `sys_bind(new, old, flag)` | afterwards the name `new` leads to what `old` names now (`old`: a path, resolved at once, or a server name `#X/...`). `flag`: `MREPL` 0 replaces what is bound at `new`, `MBEFORE` 1 and `MAFTER` 2 add a union member in front or behind; `MCREATE` 4: creates go to this member; `MCACHE` 8: stored, no effect; `MRDONLY` 16: changes through this binding fail with `-EROFS` | same arguments, flags and search order; errors are errno values (Hamnix: -1) |
+| 259 | `sys_unmount(new, old)` | `new` = 0: remove everything bound at `old`; else remove the one binding of a source and a mount point, in either order | Hamnix: mount point first |
+| 285 | `sys_nslabel(op, label, to, from)` | op 0: label the newest binding at `to`; op 1: remove the binding carrying `label` | same; `from` is not needed |
+| 258 | `sys_mount(srvfd, afd, old, flag, spec)` | attach a 9P server | see [`9p.md`](9p.md) |
+
 ### Accepted but empty
 
-So that Hamnix's shell links and runs: `bind` (257), `mount` (258), `unmount`
-(259) return `-ENOSYS` with the error string "no namespaces on this system";
-`svc_ctl` (296) answers "nothing pending" to the shell's idle poll and
-`-ENOSYS` to everything else. Any other number returns `-ENOSYS` (-38) with
-the error string `unknown syscall` (Hamnix returns -1).
+So that Hamnix's shell links and runs: `svc_ctl` (296) answers "nothing
+pending" to the shell's idle poll and `-ENOSYS` to everything else. Any other
+number returns `-ENOSYS` (-38) with the error string `unknown syscall`
+(Hamnix returns -1).
 
 ## What is deliberately different without an MMU
 
@@ -197,8 +209,10 @@ the error string `unknown syscall` (Hamnix returns -1).
 * **Programs are position-independent.** `exec` accepts ELF `ET_DYN` files
   with `R_ARM_RELATIVE` relocations only (`clang -fPIE`, `ld.lld -pie`;
   `user/rt/prog.ld`).
-* **No namespaces.** One mount table: tmpfs at `/`, devices at `/dev`,
-  programs at `/bin`, `/fd`, and a FAT volume at `/sd` when there is one.
+* **Namespaces are small.** A namespace is one heap block of packed
+  entries, shared copy-on-write between the processes that have not changed
+  it, where Hamnix has a 10 KB table per namespace
+  ([`namespaces.md`](namespaces.md)).
 * **Open modes.** As in Hamnix, `open` is read-only and `open_write` creates or
   truncates. The kernel-internal `vfs_open(path, mode)` also has read-write
   and append; only `create` exposes read-write to programs so far.
@@ -218,7 +232,7 @@ the error string `unknown syscall` (Hamnix returns -1).
 ## Not implemented (Hamnix has them)
 
 `pipe` (14; use `pipechan` + `fdbind`), `kill` (15; write to `/proc/<pid>/note`),
-`fd2path` (264), `wstat`/`fwstat` (266-267), `srv_open` (276), `nslabel`
-(285), `svc_publish` (291), `setuid_auth` (300), `clock_gettime` (307),
+`fd2path` (264), `wstat`/`fwstat` (266-267), `srv_open` (276),
+`svc_publish` (291), `setuid_auth` (300), `clock_gettime` (307),
 `waitfds` (313), `listdir_records` (318), `chan_dir_mode` (319: `ls -l` falls
 back to the plain listing), sockets, services, graphics, and the rest.

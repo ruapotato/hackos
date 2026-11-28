@@ -20,6 +20,9 @@
 #   /proc/keys          write-only: text typed through the emulated key matrix
 #                       (the TCA8418 model), where a board has it
 #   /proc/screen        the text on the display's character cells, or "no display"
+#   /proc/<pid>/ns      the namespace of process <pid> as bind and mount
+#                       commands (fs/ns.ad renders it; fs/hvfs.ad serves it).
+#                       "self" stands for the reader's own pid
 #   /proc/<pid>/note    write-only: "kill", "interrupt", "hangup" or "term"
 #                       ends process <pid> with exit code 137, 130, 129 or 143
 #                       (Plan 9's notes as far as Hamnix Micro has them: nothing
@@ -29,7 +32,7 @@
 # opened (fs/hvfs.ad keeps it like a directory listing).
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
-from kernel.sched.core import Thread, threads, sched_now, sched_kill_pid, thread_kstack_used, proc_ustack_used, sched_switches, THREAD_MAX, T_UNUSED, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE, TF_PROC, TF_USER
+from kernel.sched.core import Thread, threads, current_thread, sched_now, sched_kill_pid, thread_kstack_used, proc_ustack_used, sched_switches, THREAD_MAX, T_UNUSED, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE, TF_PROC, TF_USER
 from mm.slab import kheap, uheap
 from mm.heap import heap_total, heap_free_bytes, heap_largest_free
 from mm.parena import pa_start, pa_end, pa_used, pa_peak
@@ -150,33 +153,53 @@ def proc_lookup(rel: Ptr[uint8]) -> uint32:
     return 0
 
 
-# "<pid>/note" -> pid, else 0.
-def proc_note_pid(rel: Ptr[uint8]) -> uint32:
+# "<pid><sub>" or "self<sub>" -> pid, else 0 (`sub` is "", "/note" or "/ns").
+def _pid_sub(rel: Ptr[uint8], sub: Ptr[uint8]) -> uint32:
     pid: uint32 = 0
     i: uint32 = 0
-    while rel[i] >= 48 and rel[i] <= 57 and i < 9:
-        pid = pid * 10 + cast[uint32](rel[i] - 48)
-        i = i + 1
-    if i == 0 or _streq(cast[Ptr[uint8]](cast[uint64](rel) + cast[uint64](i)), "/note") == 0:
+    if rel[0] == 115 and rel[1] == 101 and rel[2] == 108 and rel[3] == 102:
+        pid = current_thread()[0].tid
+        i = 4
+    else:
+        while rel[i] >= 48 and rel[i] <= 57 and i < 9:
+            pid = pid * 10 + cast[uint32](rel[i] - 48)
+            i = i + 1
+    if i == 0 or _streq(cast[Ptr[uint8]](cast[uint64](rel) + cast[uint64](i)), sub) == 0:
         return 0
     return pid
 
 
-# "<pid>" alone (a directory) -> pid, else 0.
-def proc_pid_dir(rel: Ptr[uint8]) -> uint32:
-    pid: uint32 = 0
-    i: uint32 = 0
-    while rel[i] >= 48 and rel[i] <= 57 and i < 9:
-        pid = pid * 10 + cast[uint32](rel[i] - 48)
-        i = i + 1
-    if i == 0 or rel[i] != 0:
-        return 0
+def _is_proc(pid: uint32) -> uint32:
     t: uint32 = 0
     while t < THREAD_MAX:
         if threads[t].state != T_UNUSED and threads[t].tid == pid and (threads[t].flags & TF_PROC) != 0:
+            return 1
+        t = t + 1
+    return 0
+
+
+# "<pid>/note" -> pid, else 0.
+def proc_note_pid(rel: Ptr[uint8]) -> uint32:
+    return _pid_sub(rel, "/note")
+
+
+# "<pid>/ns" of a process that exists -> pid, else 0.
+def proc_ns_pid(rel: Ptr[uint8]) -> uint32:
+    pid: uint32 = _pid_sub(rel, "/ns")
+    t: uint32 = 0
+    while t < THREAD_MAX:
+        if threads[t].state != T_UNUSED and threads[t].tid == pid:
             return pid
         t = t + 1
     return 0
+
+
+# "<pid>" alone (a directory) -> pid, else 0.
+def proc_pid_dir(rel: Ptr[uint8]) -> uint32:
+    pid: uint32 = _pid_sub(rel, "")
+    if pid == 0 or _is_proc(pid) == 0:
+        return 0
+    return pid
 
 
 def _two(b: Ptr[PBuf], v: uint64):
@@ -314,7 +337,7 @@ def proc_render(which: uint32, buf: Ptr[uint8], cap: uint64) -> uint64:
     pb.cap = cap
     b: Ptr[PBuf] = &pb
     if which == PROC_VERSION:
-        pb_s(b, "Hamnix Micro 0.4 (")
+        pb_s(b, "Hamnix Micro 0.5 (")
         pb_s(b, board_name())
         pb_s(b, ")\n")
     elif which == PROC_UPTIME:

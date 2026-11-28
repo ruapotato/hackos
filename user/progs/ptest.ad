@@ -31,6 +31,8 @@ extern def sys_fdslot_kind(pid: int32, fdnum: int32) -> int32
 extern def sys_fdslot_arg(pid: int32, fdnum: int32) -> int32
 extern def sys_openchan(path: Ptr[uint8], mode: int32) -> int32
 extern def sys_dup2(oldfd: int32, newfd: int32) -> int32
+extern def sys_bind(new: Ptr[uint8], old: Ptr[uint8], flag: int32) -> int32
+extern def sys_unmount(new: Ptr[uint8], old: Ptr[uint8]) -> int32
 extern def hmicro_test_dirty_fp()
 extern def hmicro_test_exec_dirty(path: Ptr[uint8], argv: Ptr[uint64]) -> int64
 extern def hmicro_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint64, a5: uint64) -> int64
@@ -512,6 +514,80 @@ def t_steal() -> int32:
     return r
 
 
+def can_open(path: Ptr[uint8]) -> uint32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    sys_close(fd)
+    return 1
+
+
+# Namespaces and rfork.  The kernel test has made /tmp/nsa (with a file
+# "onlya") and /tmp/nsb ("onlyb").  rfork flags: RFPROC 1, RFNAMEG 8,
+# RFCNAMEG 0x80.
+def t_ns() -> int32:
+    r: int32 = 0
+    # shared by default
+    pid: int32 = sys_rfork(0x001)
+    if pid == 0:
+        sys_exit(cast[uint64](sys_bind("/tmp/nsp", "/tmp/nsa", 0) + 5))
+    if sys_waitpid(pid) == 5 and can_open("/tmp/nsp/onlya") != 0:
+        r = r | 1
+    sys_unmount(cast[Ptr[uint8]](0), "/tmp/nsp")
+    # RFNAMEG: the child starts with what the parent has, and keeps its own
+    sys_bind("/tmp/nsq", "/tmp/nsa", 0)
+    pid = sys_rfork(0x009)
+    if pid == 0:
+        if can_open("/tmp/nsq/onlya") != 0 and sys_bind("/tmp/nsp", "/tmp/nsb", 0) == 0 and can_open("/tmp/nsp/onlyb") != 0:
+            sys_exit(7)
+        sys_exit(1)
+    if sys_waitpid(pid) == 7:
+        r = r | 2
+    if can_open("/tmp/nsp/onlyb") == 0 and can_open("/tmp/nsq/onlya") != 0:
+        r = r | 4
+    # RFCNAMEG: nothing, until the child binds something
+    pid = sys_rfork(0x081)
+    if pid == 0:
+        if can_open("/tmp/nsa/onlya") == 0 and can_open("/dev/null") == 0 and sys_bind("/", "#t", 0) == 0 and can_open("/tmp/nsa/onlya") != 0 and can_open("/dev/null") == 0:
+            sys_exit(9)
+        sys_exit(1)
+    if sys_waitpid(pid) == 9 and can_open("/dev/null") != 0:
+        r = r | 8
+    # rfork(RFNAMEG) without RFPROC: the caller leaves the shared namespace
+    pid = sys_rfork(0x001)
+    if pid == 0:
+        if sys_rfork(0x008) == 0 and sys_bind("/tmp/nsp", "/tmp/nsb", 0) == 0 and can_open("/tmp/nsp/onlyb") != 0:
+            sys_exit(11)
+        sys_exit(1)
+    if sys_waitpid(pid) == 11 and can_open("/tmp/nsp/onlyb") == 0:
+        r = r | 16
+    # a file bound over a program, for one process: "/bin/hello" is ptest
+    # there (exit code 0 for "nop"; the real hello returns its argc, 2)
+    child_argv[0] = cast[uint64]("hello")
+    child_argv[1] = cast[uint64]("nop")
+    child_argv[2] = 0
+    pid = sys_rfork(0x009)
+    if pid == 0:
+        sys_bind("/bin/hello", "/bin/ptest", 0)
+        sys_execve_env("/bin/hello", &child_argv[0], cast[Ptr[uint64]](0))
+        sys_exit(127)
+    pid2: int32 = sys_spawn("/bin/hello", &child_argv[0])
+    if sys_waitpid(pid) == 0 and sys_waitpid(pid2) == 2:
+        r = r | 32
+    # exec through a union: a directory without the program in front of /bin
+    pid = sys_rfork(0x009)
+    if pid == 0:
+        sys_bind("/bin", "/tmp/nsb", 1)
+        if can_open("/bin/onlyb") == 0:
+            sys_exit(126)
+        sys_execve_env("/bin/hello", &child_argv[0], cast[Ptr[uint64]](0))
+        sys_exit(127)
+    if sys_waitpid(pid) == 2 and can_open("/bin/onlyb") == 0:
+        r = r | 64
+    sys_unmount(cast[Ptr[uint8]](0), "/tmp/nsq")
+    return r
+
+
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     if argc < 2:
         return 200
@@ -605,6 +681,8 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         return t_pipexfer(parse_hex(arg), 1)        # no per-byte check, no message
     if seq(cmd, "vfpipe") != 0:
         return t_vfpipe()
+    if seq(cmd, "ns") != 0:
+        return t_ns()
     if seq(cmd, "redir") != 0:
         return t_redir(arg)
     if seq(cmd, "forkbench") != 0:

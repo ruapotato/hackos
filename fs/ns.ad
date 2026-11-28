@@ -1,0 +1,796 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- per-process namespaces: the mount table that path lookup consults.
+#
+# This is the Hamnix Micro counterpart of Hamnix's sys/src/9/port/chan.ad (the Pgrp
+# and its mount table, ns_walk, mnttab_bind/_mount/_unmount, the MCREATE and
+# MRDONLY rules, pgrp_render_ns).  The semantics are Hamnix's; the code is
+# new, because Hamnix's Pgrp is 10 KB per namespace (32 entries of two
+# 128-byte paths), is cloned whole for every rfork(RFNAMEG) (which its shell
+# does for every command it starts), and carries things Hamnix Micro does not have
+# (named partition stacks, by-id aliases, resource caps, the /fd table).  On
+# a board with 49 KB of kernel heap that cannot be copied.  Here:
+#
+#   * A TABLE is one heap block: a 16-byte header and the entries packed one
+#     after the other, in the order they were made.  A typical table (seven
+#     binds) is about 150 bytes.
+#   * A GROUP is what Hamnix calls a Pgrp: the processes that see each
+#     other's binds.  Groups are 8-byte slots in a fixed array; a thread
+#     holds a group number.  Group 0 is the boot namespace and is never
+#     freed.
+#   * rfork(RFNAMEG) makes a new group that points at the SAME table, with
+#     the table's reference count raised: nothing is copied until one of the
+#     groups changes its namespace, and then only that group gets a private
+#     copy (copy on write).  A command started by the shell therefore costs
+#     no heap at all for its namespace.
+#
+# An entry maps a name in the namespace (`from`, an absolute path: the mount
+# point) to a server-anchored name (`to`, a "#X/..." spec, frozen when the
+# bind was made, as in Hamnix): "/dev" -> "#c", "/bin" -> "#t/tmp/mybin".
+# A 9P mount is an entry whose `to` is "#M<connection>".  Several entries
+# with the same `from` are a union directory.
+#
+# Search order at a union point (Hamnix's ns_walk, which is Plan 9's):
+#   1. MBEFORE members, the most recently bound first
+#   2. MREPL members, in the order bound
+#   3. MAFTER members, in the order bound
+# Hamnix finds "most recent" by slot number, which after an unmount can be a
+# reused low slot; here it is really the order of the binds.
+#
+# Nothing here looks at files: fs/hvfs.ad asks for the n-th member's rewrite
+# of a path and probes whether it exists.  A path covered by no entry is
+# unbound, and fails: there is no global root behind the namespace.
+#
+# Locking: ns_lock around every entry point.
+
+from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock
+from kernel.rt import rt_memcpy
+from mm.slab import kmalloc, kfree
+
+# bind/mount flags: Plan 9's values, as in Hamnix.
+MREPL: uint32 = 0
+MBEFORE: uint32 = 1
+MAFTER: uint32 = 2
+MORDER: uint32 = 3
+MCREATE: uint32 = 4
+MCACHE: uint32 = 8                  # accepted and stored; no effect (as in Hamnix)
+MRDONLY: uint32 = 16                # Hamnix's kernel-enforced read-only view
+
+NS_BIND: uint32 = 1
+NS_MOUNT: uint32 = 2                # made by mount: `to` is "#M<conn>", rendered as "mount /srv/NAME ..."
+NS_NOCONN: uint32 = 0xFFFF          # an entry's connection number when its target is not on a 9P server
+
+NS_GROUPS: uint32 = 32              # = the dimension of ns_groups below
+NS_TAB_MAX: uint32 = 4096           # bytes of entries in one table (a board may patch it)
+NS_NAME_MAX: uint32 = 127           # longest from/to path
+NS_LABEL_MAX: uint32 = 31
+NS_HDR: uint32 = 16
+NS_EHDR: uint32 = 9                 # size[2] flag[1] kind[1] conn[2] flen[1] tlen[1] llen[1]
+
+NS_ENOMEM: int32 = -12
+NS_ENOSPC: int32 = -28
+NS_ENAMETOOLONG: int32 = -36
+NS_EAGAIN: int32 = -11
+
+
+class NsTab:
+    ref: uint32                     # groups pointing at this table
+    len: uint32                     # bytes of entries
+    cap: uint32                     # bytes of room for entries
+    pad: uint32
+
+
+class NsGroup:
+    ref: uint32                     # threads in the group (group 0: not counted)
+    tab: uint32                     # address of its NsTab
+
+
+ns_groups: Array[32, NsGroup]
+ns_lock: Mutex
+ns_ready: uint32 = 0
+# Statistics (reported by /proc/meminfo and the tests).
+ns_tab_copies: uint64 = 0           # private copies made (copy on write)
+ns_tabs_live: uint32 = 0
+# A 9P connection is referenced by every table entry whose target is on it
+# ("#M<conn>" or "#M<conn>/..."; the number is kept in the entry).  The 9P
+# client sets these; conn_get fails (< 0) for a connection that does not
+# exist, conn_put of the last reference closes the connection.
+ns_conn_get: Fn[int64, uint64]
+ns_conn_put: Fn[int64, uint64]
+ns_conn_hooks: uint32 = 0
+# The text that names a connection in the rendered namespace ("/srv/NAME"),
+# written into buf; returns its length (0: unknown).
+ns_conn_name: Fn[uint64, uint64, Ptr[uint8], uint64]
+
+
+def _tab(g: uint32) -> Ptr[NsTab]:
+    return cast[Ptr[NsTab]](cast[uint64](ns_groups[g].tab))
+
+
+def _data(t: Ptr[NsTab]) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](t) + cast[uint64](NS_HDR))
+
+
+def _e_size(e: Ptr[uint8]) -> uint32:
+    return cast[uint32](e[0]) | (cast[uint32](e[1]) << 8)
+
+
+def _e_conn(e: Ptr[uint8]) -> uint32:
+    return cast[uint32](e[4]) | (cast[uint32](e[5]) << 8)
+
+
+def _e_from(e: Ptr[uint8]) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](e) + cast[uint64](NS_EHDR))
+
+
+def _e_to(e: Ptr[uint8]) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](e) + cast[uint64](NS_EHDR) + cast[uint64](e[6]) + 1)
+
+
+def _e_label(e: Ptr[uint8]) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](e) + cast[uint64](NS_EHDR) + cast[uint64](e[6]) + cast[uint64](e[7]) + 2)
+
+
+def _at(t: Ptr[NsTab], off: uint32) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](t) + cast[uint64](NS_HDR) + cast[uint64](off))
+
+
+def _len(s: Ptr[uint8]) -> uint32:
+    n: uint32 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _eq(a: Ptr[uint8], b: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while a[i] != 0 and a[i] == b[i]:
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+def _tab_new(cap: uint32) -> Ptr[NsTab]:
+    t: Ptr[NsTab] = cast[Ptr[NsTab]](kmalloc(cast[uint64](NS_HDR + cap)))
+    if t != cast[Ptr[NsTab]](0):
+        t[0].ref = 1
+        t[0].len = 0
+        t[0].cap = cap
+        t[0].pad = 0
+        ns_tabs_live = ns_tabs_live + 1
+    return t
+
+
+# Every mount entry of `t` takes (dir = 1) or drops (dir = 0) a reference to
+# its connection.
+def _tab_conns(t: Ptr[NsTab], dir: uint32):
+    if ns_conn_hooks == 0:
+        return
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        if _e_conn(e) != NS_NOCONN:
+            if dir != 0:
+                ns_conn_get(cast[uint64](_e_conn(e)))
+            else:
+                ns_conn_put(cast[uint64](_e_conn(e)))
+        off = off + _e_size(e)
+
+
+def _tab_unref(t: Ptr[NsTab]):
+    t[0].ref = t[0].ref - 1
+    if t[0].ref == 0:
+        _tab_conns(t, 0)
+        ns_tabs_live = ns_tabs_live - 1
+        kfree(cast[uint64](t))
+
+
+# Make group g's table private to it and give it room for `extra` more
+# bytes.  0 or a negative errno.
+def _writable(g: uint32, extra: uint32) -> int32:
+    t: Ptr[NsTab] = _tab(g)
+    need: uint32 = t[0].len + extra
+    if need > NS_TAB_MAX:
+        return NS_ENOSPC
+    if t[0].ref == 1 and need <= t[0].cap:
+        return 0
+    cap: uint32 = (need + 63) & 0xFFFFFFC0
+    n: Ptr[NsTab] = _tab_new(cap)
+    if n == cast[Ptr[NsTab]](0):
+        return NS_ENOMEM
+    rt_memcpy(cast[uint64](_data(n)), cast[uint64](_data(t)), cast[uint64](t[0].len))
+    n[0].len = t[0].len
+    if t[0].ref > 1:
+        ns_tab_copies = ns_tab_copies + 1
+    _tab_conns(n, 1)
+    _tab_unref(t)
+    ns_groups[g].tab = cast[uint32](cast[uint64](n))
+    return 0
+
+
+# Remove the entry at `off` of g's (already private) table.
+def _remove_at(g: uint32, off: uint32):
+    t: Ptr[NsTab] = _tab(g)
+    e: Ptr[uint8] = _at(t, off)
+    sz: uint32 = _e_size(e)
+    if _e_conn(e) != NS_NOCONN and ns_conn_hooks != 0:
+        ns_conn_put(cast[uint64](_e_conn(e)))
+    rest: uint32 = t[0].len - off - sz
+    i: uint32 = 0
+    while i < rest:
+        e[i] = e[i + sz]
+        i = i + 1
+    t[0].len = t[0].len - sz
+
+
+def _append(g: uint32, frm: Ptr[uint8], to: Ptr[uint8], label: Ptr[uint8], flag: uint32, kind: uint32, conn: uint32):
+    t: Ptr[NsTab] = _tab(g)
+    fl: uint32 = _len(frm)
+    tl: uint32 = _len(to)
+    ll: uint32 = _len(label)
+    e: Ptr[uint8] = _at(t, t[0].len)
+    sz: uint32 = NS_EHDR + fl + tl + ll + 3
+    e[0] = cast[uint8](sz & 255)
+    e[1] = cast[uint8](sz >> 8)
+    e[2] = cast[uint8](flag)
+    e[3] = cast[uint8](kind)
+    e[4] = cast[uint8](conn & 255)
+    e[5] = cast[uint8](conn >> 8)
+    e[6] = cast[uint8](fl)
+    e[7] = cast[uint8](tl)
+    e[8] = cast[uint8](ll)
+    rt_memcpy(cast[uint64](_e_from(e)), cast[uint64](frm), cast[uint64](fl) + 1)
+    rt_memcpy(cast[uint64](_e_to(e)), cast[uint64](to), cast[uint64](tl) + 1)
+    rt_memcpy(cast[uint64](_e_label(e)), cast[uint64](label), cast[uint64](ll) + 1)
+    t[0].len = t[0].len + sz
+
+
+# ---------------------------------------------------------------- groups
+# The boot namespace: group 0 with an empty table.  fs/hvfs.ad binds the
+# servers into it.
+def ns_init() -> int32:
+    mutex_init(&ns_lock)
+    mutex_register(&ns_lock)
+    i: uint32 = 0
+    while i < NS_GROUPS:
+        ns_groups[i].ref = 0
+        ns_groups[i].tab = 0
+        i = i + 1
+    t: Ptr[NsTab] = _tab_new(192)
+    if t == cast[Ptr[NsTab]](0):
+        return NS_ENOMEM
+    ns_groups[0].ref = 1
+    ns_groups[0].tab = cast[uint32](cast[uint64](t))
+    ns_ready = 1
+    return 0
+
+
+# A thread joins group g (a new thread shares its creator's namespace).
+def ns_ref(g: uint32):
+    if g == 0:
+        return
+    mutex_lock(&ns_lock)
+    ns_groups[g].ref = ns_groups[g].ref + 1
+    mutex_unlock(&ns_lock)
+
+
+# A thread leaves group g; the last one out releases the table.
+def ns_unref(g: uint32):
+    if g == 0:
+        return
+    mutex_lock(&ns_lock)
+    ns_groups[g].ref = ns_groups[g].ref - 1
+    if ns_groups[g].ref == 0:
+        _tab_unref(_tab(g))
+        ns_groups[g].tab = 0
+    mutex_unlock(&ns_lock)
+
+
+# A new group for one thread, split off group `src`:
+#   clean = 0  (RFNAMEG)   the same namespace, copied when either side
+#                          changes it;
+#   clean = 1  (RFCNAMEG)  an empty namespace.
+# Returns the group number or a negative errno.  The caller still holds its
+# reference to `src` and drops it with ns_unref.
+def ns_split(src: uint32, clean: uint32) -> int32:
+    mutex_lock(&ns_lock)
+    g: uint32 = 1
+    while g < NS_GROUPS and ns_groups[g].ref != 0:
+        g = g + 1
+    if g == NS_GROUPS:
+        mutex_unlock(&ns_lock)
+        return NS_EAGAIN
+    if clean != 0:
+        t: Ptr[NsTab] = _tab_new(64)
+        if t == cast[Ptr[NsTab]](0):
+            mutex_unlock(&ns_lock)
+            return NS_ENOMEM
+        ns_groups[g].tab = cast[uint32](cast[uint64](t))
+    else:
+        s: Ptr[NsTab] = _tab(src)
+        s[0].ref = s[0].ref + 1
+        ns_groups[g].tab = ns_groups[src].tab
+    ns_groups[g].ref = 1
+    mutex_unlock(&ns_lock)
+    return cast[int32](g)
+
+
+# ---------------------------------------------------------------- changes
+def _zap_from(g: uint32, frm: Ptr[uint8]):
+    t: Ptr[NsTab] = _tab(g)
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        if _eq(_e_from(e), frm) != 0:
+            _remove_at(g, off)
+        else:
+            off = off + _e_size(e)
+
+
+# The connection number in "#M<n>" or "#M<n>/...", else NS_NOCONN.
+def ns_spec_conn(to: Ptr[uint8]) -> uint32:
+    if to[0] != 35 or to[1] != 77 or to[2] < 48 or to[2] > 57:
+        return NS_NOCONN
+    n: uint32 = 0
+    i: uint32 = 2
+    while to[i] >= 48 and to[i] <= 57 and n < 6000:
+        n = n * 10 + cast[uint32](to[i]) - 48
+        i = i + 1
+    if to[i] != 0 and to[i] != 47:
+        return NS_NOCONN
+    return n
+
+
+# Add `frm` -> `to`.  MREPL replaces every entry at `frm` (Hamnix's
+# _mtab_zap_from); MBEFORE and MAFTER stack.  An entry whose target is on a
+# 9P connection takes a reference to it.  0 or a negative errno (-2: no
+# such connection).
+def ns_add(g: uint32, frm: Ptr[uint8], to: Ptr[uint8], flag: uint32, kind: uint32) -> int32:
+    fl: uint32 = _len(frm)
+    tl: uint32 = _len(to)
+    if fl == 0 or fl > NS_NAME_MAX or tl == 0 or tl > NS_NAME_MAX:
+        return NS_ENAMETOOLONG
+    conn: uint32 = ns_spec_conn(to)
+    mutex_lock(&ns_lock)
+    if conn != NS_NOCONN:
+        if ns_conn_hooks == 0 or ns_conn_get(cast[uint64](conn)) < 0:
+            mutex_unlock(&ns_lock)
+            return -2
+    rc: int32 = _writable(g, NS_EHDR + fl + tl + 3)
+    if rc == 0:
+        if (flag & MORDER) == MREPL:
+            _zap_from(g, frm)
+        _append(g, frm, to, "", flag, kind, conn)
+    elif conn != NS_NOCONN:
+        ns_conn_put(cast[uint64](conn))
+    mutex_unlock(&ns_lock)
+    return rc
+
+
+# Remove entries: every entry at `frm`, or (to != 0) the ones at `frm` that
+# lead to `to`.  Returns how many went, or a negative errno.
+def ns_remove(g: uint32, frm: Ptr[uint8], to: Ptr[uint8]) -> int32:
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    hits: int32 = 0
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        if _eq(_e_from(e), frm) != 0 and (to == cast[Ptr[uint8]](0) or _eq(_e_to(e), to) != 0):
+            hits = hits + 1
+        off = off + _e_size(e)
+    if hits > 0:
+        rc: int32 = _writable(g, 0)
+        if rc < 0:
+            mutex_unlock(&ns_lock)
+            return rc
+        t = _tab(g)
+        off = 0
+        while off < t[0].len:
+            e2: Ptr[uint8] = _at(t, off)
+            if _eq(_e_from(e2), frm) != 0 and (to == cast[Ptr[uint8]](0) or _eq(_e_to(e2), to) != 0):
+                _remove_at(g, off)
+            else:
+                off = off + _e_size(e2)
+    mutex_unlock(&ns_lock)
+    return hits
+
+
+# Offset of the entry carrying `label`, or the newest entry at `frm` (label
+# == 0); -1 when there is none.
+def _find(g: uint32, frm: Ptr[uint8], label: Ptr[uint8]) -> int32:
+    t: Ptr[NsTab] = _tab(g)
+    best: int32 = -1
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        if label != cast[Ptr[uint8]](0):
+            if e[8] != 0 and _eq(_e_label(e), label) != 0:
+                return cast[int32](off)
+        elif _eq(_e_from(e), frm) != 0:
+            best = cast[int32](off)
+        off = off + _e_size(e)
+    return best
+
+
+# Hamnix's mount labels (`mount SRV PATH as LABEL`, `unmount LABEL`): stamp
+# `label` on the newest entry at `frm`.  0, -1 (no such entry) or an errno.
+def ns_set_label(g: uint32, frm: Ptr[uint8], label: Ptr[uint8]) -> int32:
+    ll: uint32 = _len(label)
+    if ll == 0 or ll > NS_LABEL_MAX:
+        return NS_ENAMETOOLONG
+    tmp: Array[300, uint8]
+    mutex_lock(&ns_lock)
+    off: int32 = _find(g, frm, cast[Ptr[uint8]](0))
+    if off < 0:
+        mutex_unlock(&ns_lock)
+        return -1
+    rc: int32 = _writable(g, ll)
+    if rc < 0:
+        mutex_unlock(&ns_lock)
+        return rc
+    # rebuild the entry with the label and put it back where it was
+    t: Ptr[NsTab] = _tab(g)
+    e: Ptr[uint8] = _at(t, cast[uint32](off))
+    old: uint32 = _e_size(e)
+    fl: uint32 = cast[uint32](e[6])
+    tl: uint32 = cast[uint32](e[7])
+    nsz: uint32 = NS_EHDR + fl + tl + ll + 3
+    rt_memcpy(cast[uint64](&tmp[0]), cast[uint64](e), cast[uint64](NS_EHDR + fl + tl + 2))
+    rt_memcpy(cast[uint64](&tmp[NS_EHDR + fl + tl + 2]), cast[uint64](label), cast[uint64](ll) + 1)
+    tmp[0] = cast[uint8](nsz & 255)
+    tmp[1] = cast[uint8](nsz >> 8)
+    tmp[8] = cast[uint8](ll)
+    rest: uint32 = t[0].len - cast[uint32](off) - old
+    if nsz > old:
+        i: uint32 = rest
+        while i > 0:
+            i = i - 1
+            e[nsz + i] = e[old + i]
+    else:
+        j: uint32 = 0
+        while j < rest:
+            e[nsz + j] = e[old + j]
+            j = j + 1
+    rt_memcpy(cast[uint64](e), cast[uint64](&tmp[0]), cast[uint64](nsz))
+    t[0].len = t[0].len + nsz - old
+    mutex_unlock(&ns_lock)
+    return 0
+
+
+# Remove the one entry carrying `label`.  0 or -1.
+def ns_remove_label(g: uint32, label: Ptr[uint8]) -> int32:
+    mutex_lock(&ns_lock)
+    off: int32 = _find(g, cast[Ptr[uint8]](0), label)
+    if off < 0 or _writable(g, 0) < 0:
+        mutex_unlock(&ns_lock)
+        return -1
+    _remove_at(g, cast[uint32](_find(g, cast[Ptr[uint8]](0), label)))
+    mutex_unlock(&ns_lock)
+    return 0
+
+
+# ---------------------------------------------------------------- the walk
+# How much of `input` entry e's `from` covers: its length when `input` is
+# that name or lies below it, 1 for "/" (which covers everything), else 0.
+def _match_len(e: Ptr[uint8], input: Ptr[uint8]) -> uint32:
+    fp: Ptr[uint8] = _e_from(e)
+    fl: uint32 = cast[uint32](e[6])
+    if fl == 1 and fp[0] == 47:
+        if input[0] == 47:
+            return 1
+        return 0
+    i: uint32 = 0
+    while i < fl:
+        if input[i] != fp[i]:
+            return 0
+        i = i + 1
+    if input[fl] == 0 or input[fl] == 47:
+        return fl
+    return 0
+
+
+# Depth of the deepest bound name covering `input`: that name is the
+# namespace point, and the entries bound exactly there are its union.
+def _best_len(t: Ptr[NsTab], input: Ptr[uint8]) -> uint32:
+    best: uint32 = 0
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        m: uint32 = _match_len(e, input)
+        if m > best:
+            best = m
+        off = off + _e_size(e)
+    return best
+
+
+def _band(e: Ptr[uint8]) -> uint32:
+    o: uint32 = cast[uint32](e[2]) & MORDER
+    if o == MBEFORE:
+        return 0
+    if o == MAFTER:
+        return 2
+    return 1
+
+
+# The nth member (in search order) of the union at the point of depth blen
+# that covers `input`; with `mask` != 0 only members whose flags have a bit
+# of it.  0 when there are not that many.
+def _pick(t: Ptr[NsTab], input: Ptr[uint8], blen: uint32, nth: uint32, mask: uint32) -> Ptr[uint8]:
+    band: uint32 = 0
+    while band < 3:
+        cnt: uint32 = 0
+        off: uint32 = 0
+        while off < t[0].len:
+            e: Ptr[uint8] = _at(t, off)
+            if _band(e) == band and _match_len(e, input) == blen and (mask == 0 or (cast[uint32](e[2]) & mask) != 0):
+                cnt = cnt + 1
+            off = off + _e_size(e)
+        if nth < cnt:
+            want: uint32 = nth              # MREPL, MAFTER: oldest first
+            if band == 0:
+                want = cnt - 1 - nth        # MBEFORE: newest first
+            off = 0
+            while off < t[0].len:
+                e2: Ptr[uint8] = _at(t, off)
+                if _band(e2) == band and _match_len(e2, input) == blen and (mask == 0 or (cast[uint32](e2[2]) & mask) != 0):
+                    if want == 0:
+                        return e2
+                    want = want - 1
+                off = off + _e_size(e2)
+        nth = nth - cnt
+        band = band + 1
+    return cast[Ptr[uint8]](0)
+
+
+# `input` with the covered prefix replaced by e's target (Hamnix's
+# _rewrite_via_slot).  1, or -1 when it does not fit.
+def _rewrite(e: Ptr[uint8], blen: uint32, input: Ptr[uint8], out: Ptr[uint8], cap: uint32) -> int32:
+    tp: Ptr[uint8] = _e_to(e)
+    j: uint32 = 0
+    while tp[j] != 0:
+        if j + 1 >= cap:
+            return -1
+        out[j] = tp[j]
+        j = j + 1
+    si: uint32 = blen
+    if e[6] == 1:                       # bound at "/": the slash is also the separator
+        si = 0
+    if input[si] == 47 and input[si + 1] == 0:
+        si = si + 1                     # "/" itself: no trailing slash
+    while input[si] != 0:
+        if j + 1 >= cap:
+            return -1
+        out[j] = input[si]
+        j = j + 1
+        si = si + 1
+    out[j] = 0
+    return 1
+
+
+# The nth union member's name for `input` (a canonical absolute path) in
+# group g.  Returns
+#    1   out holds the member's "#X/..." name; flags[0] its bind flags
+#    0   unbound: nothing covers `input`
+#   -1   the name does not fit in cap bytes
+#   -2   there are fewer than nth+1 members
+def ns_walk(g: uint32, input: Ptr[uint8], out: Ptr[uint8], cap: uint32, nth: uint32, flags: Ptr[uint32]) -> int32:
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    blen: uint32 = _best_len(t, input)
+    rc: int32 = 0
+    if blen != 0:
+        e: Ptr[uint8] = _pick(t, input, blen, nth, 0)
+        if e == cast[Ptr[uint8]](0):
+            rc = -2
+        else:
+            rc = _rewrite(e, blen, input, out, cap)
+            if flags != cast[Ptr[uint32]](0):
+                flags[0] = cast[uint32](e[2])
+    mutex_unlock(&ns_lock)
+    return rc
+
+
+# Where a create or another change of `input` goes (Hamnix's
+# mnttab_create_target and mnttab_path_is_readonly):
+#    1   out = the name under the highest-priority MCREATE member
+#    0   no member of the union has MCREATE (the caller uses the ordinary
+#        lookup: the first member that has the name, else the first member),
+#        or the path is unbound
+#   -1   does not fit
+#  -30   (EROFS) the member a change would land on is bound read-only
+def ns_create_target(g: uint32, input: Ptr[uint8], out: Ptr[uint8], cap: uint32) -> int32:
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    blen: uint32 = _best_len(t, input)
+    rc: int32 = 0
+    if blen != 0:
+        e: Ptr[uint8] = _pick(t, input, blen, 0, MCREATE)
+        if e != cast[Ptr[uint8]](0):
+            if (cast[uint32](e[2]) & MRDONLY) != 0:
+                rc = -30
+            else:
+                rc = _rewrite(e, blen, input, out, cap)
+        else:
+            h: Ptr[uint8] = _pick(t, input, blen, 0, 0)
+            if h != cast[Ptr[uint8]](0) and (cast[uint32](h[2]) & MRDONLY) != 0:
+                rc = -30
+    mutex_unlock(&ns_lock)
+    return rc
+
+
+# Is `path` itself a mount point of group g?
+def ns_is_point(g: uint32, path: Ptr[uint8]) -> uint32:
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    r: uint32 = 0
+    off: uint32 = 0
+    while off < t[0].len and r == 0:
+        e: Ptr[uint8] = _at(t, off)
+        if _eq(_e_from(e), path) != 0:
+            r = 1
+        off = off + _e_size(e)
+    mutex_unlock(&ns_lock)
+    return r
+
+
+def ns_line_in(buf: Ptr[uint8], n: uint64, name: Ptr[uint8], nl: uint32) -> uint32:
+    p: uint64 = 0
+    while p < n:
+        st: uint64 = p
+        while p < n and buf[p] != 10:
+            p = p + 1
+        if p - st == cast[uint64](nl):
+            k: uint32 = 0
+            while k < nl and buf[st + cast[uint64](k)] == name[k]:
+                k = k + 1
+            if k == nl:
+                return 1
+        p = p + 1
+    return 0
+
+
+# Append a "NAME\n" line to buf[0..start) for every mount point that is, or
+# lies below, an immediate child of directory `dir`, unless the name is
+# listed already (Hamnix's chan_dir_mount_children): a bound name shows up
+# in its parent's listing although no file system holds it.  Returns the new
+# length.
+def ns_children(g: uint32, dir: Ptr[uint8], buf: Ptr[uint8], cap: uint64, start: uint64) -> uint64:
+    dl: uint32 = _len(dir)
+    root: uint32 = 0
+    if dl == 1:
+        root = 1
+    out: uint64 = start
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        fp: Ptr[uint8] = _e_from(e)
+        cs: uint32 = 0
+        if root != 0:
+            cs = 1
+        else:
+            k: uint32 = 0
+            while k < dl and fp[k] == dir[k]:
+                k = k + 1
+            if k == dl and fp[k] == 47:
+                cs = dl + 1
+        if cs != 0:
+            cl: uint32 = 0
+            while fp[cs + cl] != 0 and fp[cs + cl] != 47:
+                cl = cl + 1
+            cp: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](fp) + cast[uint64](cs))
+            if cl > 0 and ns_line_in(buf, out, cp, cl) == 0 and out + cast[uint64](cl) + 1 <= cap:
+                rt_memcpy(cast[uint64](buf) + out, cast[uint64](cp), cast[uint64](cl))
+                buf[out + cast[uint64](cl)] = 10
+                out = out + cast[uint64](cl) + 1
+        off = off + _e_size(e)
+    mutex_unlock(&ns_lock)
+    return out
+
+
+# ---------------------------------------------------------------- as text
+class NsOut:
+    p: Ptr[uint8]
+    n: uint64
+    cap: uint64
+
+
+def _oc(o: Ptr[NsOut], c: uint32):
+    if o[0].n < o[0].cap:
+        o[0].p[o[0].n] = cast[uint8](c)
+    o[0].n = o[0].n + 1
+
+
+def _os(o: Ptr[NsOut], s: Ptr[uint8]):
+    i: uint32 = 0
+    while s[i] != 0:
+        _oc(o, cast[uint32](s[i]))
+        i = i + 1
+
+
+def _oname(o: Ptr[NsOut], s: Ptr[uint8]):
+    if s[0] == 35:                      # '#' starts a comment in the shell
+        _oc(o, 39)
+        _os(o, s)
+        _oc(o, 39)
+    else:
+        _os(o, s)
+
+
+# The namespace of group g as commands Hamnix's shell accepts, one per
+# entry in the order they were made, so that running the lines in an empty
+# namespace builds the same one:
+#     bind [-b|-a|-c|-bc|-ac|-r|-br|-ar] SOURCE MOUNTPOINT
+#     mount [-b|-a|...] /srv/NAME MOUNTPOINT [as LABEL]
+# (Hamnix's /proc/<pid>/ns prints "bind MOUNTPOINT SOURCE -b", which its own
+# shell does not read back.)  Returns the length; a line that does not fit
+# whole is left out.
+def ns_render(g: uint32, buf: Ptr[uint8], cap: uint64) -> uint64:
+    o: NsOut
+    o.p = buf
+    o.n = 0
+    o.cap = cap
+    nm: Array[64, uint8]
+    good: uint64 = 0
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    off: uint32 = 0
+    while off < t[0].len:
+        e: Ptr[uint8] = _at(t, off)
+        fl: uint32 = cast[uint32](e[2])
+        mount: uint32 = 0
+        if cast[uint32](e[3]) == NS_MOUNT:
+            mount = 1
+            _os(&o, "mount ")
+        else:
+            _os(&o, "bind ")
+        ord: uint32 = fl & MORDER
+        if ord != 0 or (fl & (MCREATE | MRDONLY)) != 0:
+            _oc(&o, 45)
+            if ord == MBEFORE:
+                _oc(&o, 98)
+            elif ord == MAFTER:
+                _oc(&o, 97)
+            if (fl & MCREATE) != 0:
+                _oc(&o, 99)
+            elif (fl & MRDONLY) != 0:
+                _oc(&o, 114)
+            _oc(&o, 32)
+        nl: uint64 = 0
+        if mount != 0 and ns_conn_hooks != 0:
+            nl = ns_conn_name(cast[uint64](_e_conn(e)), &nm[0], 64)
+        if nl != 0:
+            nm[nl] = 0
+            _os(&o, &nm[0])
+        else:
+            _oname(&o, _e_to(e))
+        _oc(&o, 32)
+        _os(&o, _e_from(e))
+        if e[8] != 0 and mount != 0:
+            _os(&o, " as ")
+            _os(&o, _e_label(e))
+        _oc(&o, 10)
+        if o.n <= cap:
+            good = o.n
+        off = off + _e_size(e)
+    mutex_unlock(&ns_lock)
+    return good
+
+
+# Figures for the tests and /proc: entries and bytes of g's table, and how
+# many groups share that table.
+def ns_stat(g: uint32, entries: Ptr[uint32], bytes: Ptr[uint32], sharers: Ptr[uint32]):
+    mutex_lock(&ns_lock)
+    t: Ptr[NsTab] = _tab(g)
+    n: uint32 = 0
+    off: uint32 = 0
+    while off < t[0].len:
+        n = n + 1
+        off = off + _e_size(_at(t, off))
+    entries[0] = n
+    bytes[0] = t[0].len
+    sharers[0] = t[0].ref
+    mutex_unlock(&ns_lock)

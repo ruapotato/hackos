@@ -36,6 +36,9 @@ from fs.tmpfs import TmpfsEntry
 from fs.hvfs import fat_mounted
 from kernel.block.blk import blkdevs
 from fs.hvfs import fs_lock
+from fs.hvfs import vfs_bind, vfs_unmount, vfs_nslabel, vfs_ns_split, vfs_stat, vfs_chdir
+from fs.ns import ns_stat, ns_render, ns_tab_copies, ns_tabs_live, NS_TAB_MAX, MREPL, MBEFORE, MAFTER, MCREATE, MRDONLY
+from kernel.sched.core import current_thread
 from kernel.sync import mutex_dead_released
 from kernel.sched.core import sched_bad_stacks, pw_tick_irqs, pw_ticks_skipped, pw_idle_sleeps, SCHED_TICKLESS
 from kernel.power import power_suspend, pw_suspend_wakes, WAKE_TIMER, WAKE_CONSOLE
@@ -1724,6 +1727,180 @@ def test_keyboard():
     console_set_mode(CON_COOKED)
 
 
+# ============================================================ 17. namespaces
+ns_io: Array[512, uint8]
+ns_txt: Array[512, uint8]
+
+
+def ns_put(path: Ptr[uint8], text: Ptr[uint8]) -> int32:
+    fd: int32 = vfs_open(path, OWRITE | OTRUNC | OCREATE)
+    if fd < 0:
+        return fd
+    n: uint64 = 0
+    while text[n] != 0:
+        n = n + 1
+    vfs_write(fd, text, n)
+    vfs_close(fd)
+    return 0
+
+
+# Is the content of `path` (a file, or a directory's listing) exactly `text`?
+def ns_is(path: Ptr[uint8], text: Ptr[uint8]) -> uint32:
+    fd: int32 = vfs_open(path, OREAD)
+    if fd < 0:
+        return 0
+    n: int64 = vfs_read(fd, &ns_io[0], 511, 0)
+    vfs_close(fd)
+    return line_is(&ns_io[0], n, text)
+
+
+def ns_err_is(text: Ptr[uint8]) -> uint32:
+    e: Ptr[uint8] = &current_thread()[0].errstr[0]
+    i: uint32 = 0
+    while text[i] != 0 and e[i] == text[i]:
+        i = i + 1
+    if text[i] == 0 and e[i] == 0:
+        return 1
+    return 0
+
+
+def ns_entries() -> uint32:
+    n: uint32 = 0
+    b: uint32 = 0
+    sh: uint32 = 0
+    ns_stat(current_thread()[0].nsg, &n, &b, &sh)
+    return n
+
+
+# Runs as a kernel thread of its own, so that it can leave the boot
+# namespace (group 0, which the runner stays in) and end with its group.
+def ns_thread(arg: uint64) -> int64:
+    me: Ptr[Thread] = current_thread()
+    n: uint32 = 0
+    b: uint32 = 0
+    sh: uint32 = 0
+    live0: uint32 = kheap.n_live
+    cop0: uint64 = ns_tab_copies
+    check(cast[uint32](me[0].nsg == 0 and vfs_ns_split(me, 0) == 0 and me[0].nsg != 0), "ns: a thread starts in its creator's namespace group; rfork(RFNAMEG) puts it in a group of its own")
+    ns_stat(me[0].nsg, &n, &b, &sh)
+    base: uint32 = n
+    check(cast[uint32](sh == 2 and kheap.n_live == live0 and ns_tab_copies == cop0), "ns: the new group shares the table (copy on write): no memory allocated")
+    printk2("   boot namespace: %d entries in %d bytes of table\n", cast[uint64](n), cast[uint64](b))
+    # two directories and a union of them
+    vfs_mkdir("/tmp/nsa")
+    vfs_mkdir("/tmp/nsb")
+    vfs_mkdir("/tmp/nsu")
+    ns_put("/tmp/nsa/onlya", "A")
+    ns_put("/tmp/nsa/shared", "FROM-A")
+    ns_put("/tmp/nsb/onlyb", "B")
+    ns_put("/tmp/nsb/shared", "FROM-B")
+    used0: uint64 = kheap.used_bytes
+    check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nsa", MREPL) == 0 and ns_is("/tmp/nsu/onlya", "A") == 1 and ns_is("/tmp/nsu/shared", "FROM-A") == 1), "bind: the new name leads to the old directory")
+    ns_stat(me[0].nsg, &n, &b, &sh)
+    check(cast[uint32](sh == 1 and ns_tab_copies == cop0 + 1 and n == base + 1), "ns: the first change gave this group a private copy of the table")
+    printk2("   a private namespace of %d entries: %d bytes of kernel heap\n", cast[uint64](n), kheap.used_bytes - used0)
+    b0: uint32 = b
+    check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nsb", MAFTER) == 0 and ns_is("/tmp/nsu/onlya", "A") == 1 and ns_is("/tmp/nsu/onlyb", "B") == 1 and ns_is("/tmp/nsu/shared", "FROM-A") == 1), "union: MAFTER adds a member that is searched after the first")
+    ns_stat(me[0].nsg, &n, &b, &sh)
+    printk1("   one more bind: %d bytes of its table\n", cast[uint64](b - b0))
+    check(ns_is("/tmp/nsu", "onlya\nshared\nonlyb\n"), "union: the directory lists every member's names in search order, each name once")
+    check(cast[uint32](ns_put("/tmp/nsu/made", "M") == 0 and ns_is("/tmp/nsa/made", "M") == 1 and vfs_open("/tmp/nsb/made", OREAD) == -2), "union: without MCREATE a new file goes to the first member")
+    vfs_mkdir("/tmp/nsc")
+    ns_put("/tmp/nsc/shared", "FROM-C")
+    check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nsc", MBEFORE | MCREATE) == 0 and ns_is("/tmp/nsu/shared", "FROM-C") == 1 and ns_is("/tmp/nsu/onlya", "A") == 1), "union: MBEFORE puts a member in front; it shadows the names it has")
+    check(cast[uint32](ns_put("/tmp/nsu/made", "N") == 0 and ns_is("/tmp/nsc/made", "N") == 1 and ns_is("/tmp/nsa/made", "M") == 1 and ns_put("/tmp/nsu/onlyb", "X") == 0 and ns_is("/tmp/nsb/onlyb", "B") == 1 and ns_is("/tmp/nsc/onlyb", "X") == 1), "union: with an MCREATE member every create goes there, also for a name another member has")
+    check(ns_is("/tmp/nsu", "shared\nmade\nonlyb\nonlya\n"), "union: three members, merged listing in search order")
+    # unmount, in the three forms
+    check(cast[uint32](vfs_unmount("/tmp/nsu", "/tmp/nsc") == 0 and ns_is("/tmp/nsu/shared", "FROM-A") == 1), "unmount(mount point, source): Hamnix's argument order removes one member")
+    check(cast[uint32](vfs_unmount("/tmp/nsb", "/tmp/nsu") == 0 and vfs_open("/tmp/nsu/onlyb", OREAD) == -2 and ns_is("/tmp/nsu/onlya", "A") == 1), "unmount(source, mount point): Plan 9's order is accepted too")
+    check(cast[uint32](vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsu") == 0 and vfs_open("/tmp/nsu/onlya", OREAD) == -2 and ns_entries() == base), "unmount(0, mount point) removes everything bound there")
+    check(cast[uint32](vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsu") == -2 and ns_err_is("unmount failed: not mounted") == 1), "unmount of a name with nothing bound fails with Hamnix's error string")
+    check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nowhere", MREPL) == -2 and ns_err_is("bind failed: source does not resolve in this namespace") == 1 and vfs_bind("/tmp/nsu", "/tmp/nsa", 3) == -22), "bind: a source that names nothing, and a bad flag, are refused")
+    # the source is frozen when the bind is made
+    vfs_bind("/tmp/nsu", "/tmp/nsa", MREPL)
+    vfs_bind("/tmp/nsa", "/tmp/nsb", MREPL)
+    check(cast[uint32](ns_is("/tmp/nsu/onlya", "A") == 1 and ns_is("/tmp/nsa/onlyb", "B") == 1), "bind: a binding keeps naming what its source was when it was made, whatever is bound over the source later")
+    vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsa")
+    vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsu")
+    # a read-only view
+    check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nsa", MRDONLY) == 0 and ns_is("/tmp/nsu/onlya", "A") == 1 and ns_put("/tmp/nsu/x", "X") == -30 and vfs_unlink("/tmp/nsu/onlya") == -30 and vfs_mkdir("/tmp/nsu/d") == -30 and ns_is("/tmp/nsa/onlya", "A") == 1), "bind MRDONLY: reads pass, create, remove and mkdir through the binding fail with EROFS")
+    vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsu")
+    # servers by name, and a label
+    check(cast[uint32](ns_is("#c", "console\nnull\nzero\n") == 1 and ns_is("#t/tmp/nsa/onlya", "A") == 1 and vfs_open("#q/x", OREAD) == -2 and ns_put("#q/x", "X") == -2), "a server can be named directly (#c, #t/...); an unknown one does not exist")
+    check(cast[uint32](vfs_bind("/n/devices", "#c", MREPL) == 0 and ns_is("/n", "devices\n") == 1 and ns_is("/n/devices", "console\nnull\nzero\n") == 1 and vfs_chdir("/n") == 0 and vfs_stat("devices", &ns_io[0], 256) > 0 and vfs_chdir("/") == 0), "a mount point shows up in its parent's listing though no file system holds the parent; cd and stat work there")
+    check(cast[uint32](vfs_nslabel(0, "devs", "/n/devices") == 0 and vfs_nslabel(1, "nolabel", cast[Ptr[uint8]](0)) == -2 and vfs_nslabel(1, "devs", cast[Ptr[uint8]](0)) == 0 and vfs_open("/n/devices/null", OREAD) == -2), "nslabel: a binding is labelled and then removed by its label")
+    # the namespace as text
+    vfs_bind("/tmp/nsu", "/tmp/nsa", MREPL)
+    vfs_bind("/tmp/nsu", "/tmp/nsb", MBEFORE | MCREATE)
+    tn: uint64 = ns_render(me[0].nsg, &ns_txt[0], 512)
+    tail: Ptr[uint8] = "bind '#t/tmp/nsa' /tmp/nsu\nbind -bc '#t/tmp/nsb' /tmp/nsu\n"
+    tl: uint64 = 0
+    while tail[tl] != 0:
+        tl = tl + 1
+    check(cast[uint32](tn > tl and line_is(cast[Ptr[uint8]](cast[uint64](&ns_txt[0]) + tn - tl), cast[int64](tl), tail) == 1 and line_is(&ns_txt[0], 11, "bind '#t' /") == 1), "the namespace renders as bind commands in the order made")
+    fd: int32 = vfs_open("/proc/self/ns", OREAD)
+    pn: int64 = vfs_read(fd, &ns_io[0], 511, 0)
+    vfs_close(fd)
+    same: uint32 = cast[uint32](pn == cast[int64](tn))
+    k: uint64 = 0
+    while k < tn and same != 0:
+        if ns_io[k] != ns_txt[k]:
+            same = 0
+        k = k + 1
+    check(same, "/proc/self/ns is that text")
+    # an empty namespace: nothing resolves until something is bound
+    check(cast[uint32](vfs_ns_split(me, 1) == 0 and ns_entries() == 0 and vfs_open("/tmp/nsa/onlya", OREAD) == -2 and vfs_open("/", OREAD) == -2 and vfs_open("/dev/null", OREAD) == -2), "rfork(RFCNAMEG): an empty namespace; no name resolves, there is no root behind it")
+    check(cast[uint32](vfs_bind("/", "#t/tmp/nsa", MREPL) == 0 and ns_is("/onlya", "A") == 1 and vfs_open("/tmp", OREAD) == -2 and vfs_bind("/dev", "#c", MREPL) == 0 and ns_is("/", "onlya\nshared\nmade\ndev\n") == 1), "a namespace built from nothing: a directory as the root, the devices at /dev")
+    # the table has a size limit
+    nm: Array[16, uint8]
+    nm[0] = 47
+    nm[1] = 120
+    nm[4] = 0
+    made: uint32 = 0
+    rc: int32 = 0
+    while rc == 0 and made < 2000:
+        nm[2] = cast[uint8](65 + (made / 26) % 26)
+        nm[3] = cast[uint8](65 + made % 26)
+        rc = vfs_bind(&nm[0], "#c", MAFTER)
+        if rc == 0:
+            made = made + 1
+    ns_stat(me[0].nsg, &n, &b, &sh)
+    check(cast[uint32](rc == -28 and ns_err_is("mount table full") == 1 and b <= NS_TAB_MAX and made > 20), "a namespace's table is limited in size; a bind beyond it fails cleanly")
+    printk3("   %d binds filled the table (%d of %d bytes)\n", cast[uint64](made), cast[uint64](b), cast[uint64](NS_TAB_MAX))
+    return 0
+
+
+def test_ns():
+    printk0("-- 17. namespaces: per-process mount tables, bind, union directories\n")
+    nul: Ptr[uint8] = cast[Ptr[uint8]](0)
+    live0: uint32 = kheap.n_live
+    tabs0: uint32 = ns_tabs_live
+    base: uint32 = ns_entries()
+    nt: Ptr[Thread] = thread_create("ns", cast[uint64](&ns_thread), 0, 2, 8192, 0)
+    join(nt[0].tid)
+    check(cast[uint32](ns_entries() == base and vfs_open("/tmp/nsu/onlya", OREAD) == -2 and ns_is("/tmp/nsa/onlya", "A") == 1 and ns_is("/dev", "console\nnull\nzero\n") == 1), "ns: none of that thread's binds reached the boot namespace")
+    check(cast[uint32](ns_tabs_live == tabs0), "ns: a group's table is freed with its last thread")
+    code: int64 = run_prog("/bin/ptest", "ns", nul, nul)
+    printk1("   ptest ns -> %d\n", cast[uint64](code))
+    check(cast[uint32]((code & 1) == 1), "rfork(RFPROC): the child shares the parent's namespace; its bind is the parent's too")
+    check(cast[uint32]((code & 6) == 6), "rfork(RFPROC|RFNAMEG): the child's bind is invisible to the parent; the child had the parent's binds")
+    check(cast[uint32]((code & 24) == 24), "rfork(RFPROC|RFCNAMEG): the child starts with nothing; rfork(RFNAMEG) alone detaches the caller")
+    check(cast[uint32]((code & 96) == 96), "a program started in a changed namespace runs in it: /bin/hello replaced for that process, exec through a union")
+    vfs_unlink("/tmp/nsa/onlya")
+    vfs_unlink("/tmp/nsa/shared")
+    vfs_unlink("/tmp/nsa/made")
+    vfs_unlink("/tmp/nsb/onlyb")
+    vfs_unlink("/tmp/nsb/shared")
+    vfs_unlink("/tmp/nsc/shared")
+    vfs_unlink("/tmp/nsc/made")
+    vfs_unlink("/tmp/nsc/onlyb")
+    vfs_unlink("/tmp/nsa")
+    vfs_unlink("/tmp/nsb")
+    vfs_unlink("/tmp/nsc")
+    vfs_unlink("/tmp/nsu")
+    check(cast[uint32](ns_entries() == base and ns_tabs_live == tabs0 and kheap.n_live == live0), "ns: the boot namespace is as it was; nothing left allocated")
+
+
 def runner(arg: uint64) -> int64:
     vfs_open_stdio()
     test_boot()
@@ -1738,6 +1915,7 @@ def runner(arg: uint64) -> int64:
     test_proc()
     test_pipes()
     test_fat()
+    test_ns()
     bench_switch()
     bench_proc()
     test_power()

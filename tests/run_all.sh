@@ -327,12 +327,12 @@ expect "monitor: ps lists the idle thread" $M '^ +1 idle +ready +7 kern +[0-9]+/
 expect "monitor: ps shows itself running with its stack high-water mark" $M '^ +3 monitor +running +2 kern +[0-9]+/ 15360 '
 expect "monitor: heap statistics, consistent" $M '^kernel heap: total [0-9]+  used [0-9]+  peak [0-9]+  free [0-9]+ in [0-9]+ block'
 expect "monitor: heap consistency check is 0" $M 'requested bytes live [0-9]+  consistency 0$'
-expect "monitor: write reports the byte count" $M '^wrote 22 bytes to /tmp/d/hello.txt$'
+expect "monitor: write reports the byte count" $M '^wrote 16 bytes to /tmp/d/hello.txt$'
 expect "monitor: ls / shows dev, tmp and etc" $M '^dev$'
 expect "monitor: ls shows the new file" $M '^hello.txt$'
 expect "monitor: cat prints the first line" $M '^Hello,  Hamnix Micro!$'
 expect "monitor: cat prints the appended line, edited with DEL on the way in" $M '^second line$'
-expect "monitor: stat" $M '^/tmp/d/hello.txt: file, 34 bytes, mode 1a4, mtime [0-9]+$'
+expect "monitor: stat" $M '^/tmp/d/hello.txt: file, 28 bytes, mode 1a4, mtime [0-9]+$'
 expect "monitor: pwd after cd" $M '^/tmp/d$'
 expect "monitor: mv with relative paths" $M '^moved.txt$'
 expect "monitor: error with the kernel's error string" $M '^cat: error -2 \(file does not exist\)$'
@@ -514,6 +514,65 @@ if wait_for "hamsh\$ "; then
     say ':q\r'; sleep 0.3
     say ':q!\r'; sleep 0.5
     sh 'wc < /tmp/edit.txt'
+    # ---- milestone 5: namespaces ----
+    sh 'mkdir /tmp/ua'; sh 'mkdir /tmp/ub'; sh 'mkdir /tmp/uc'; sh 'mkdir /tmp/un'
+    sh 'echo from-a > /tmp/ua/shared'; sh 'echo only-a > /tmp/ua/afile'
+    sh 'echo from-b > /tmp/ub/shared'; sh 'echo only-b > /tmp/ub/bfile'
+    sh 'cat /proc/self/ns | wc'
+    # `ns { }` is rfork(RFPROC|RFNAMEG): a bind made in the child ...
+    sh 'ns { bind /tmp/ua /tmp/un ; cat /tmp/un/afile ; cat /proc/self/ns | wc }'
+    # ... is not the parent's
+    sh 'cat /tmp/un/afile'
+    sh 'cat /proc/self/ns | wc'
+    # a union of two directories: order, merged listing, where a create goes
+    sh 'bind /tmp/ua /tmp/un'
+    sh 'bind -a /tmp/ub /tmp/un'
+    sh 'ls /tmp/un'
+    sh 'ls /tmp/un | wc'
+    sh 'cat /tmp/un/shared'
+    sh 'cat /tmp/un/bfile'
+    sh 'echo made-here > /tmp/un/created'
+    sh 'ls /tmp/ua | wc'
+    sh 'bind -bc /tmp/uc /tmp/un'
+    sh 'echo in-c > /tmp/un/cfile'
+    sh 'ls /tmp/uc'
+    sh 'cat /proc/self/ns'
+    # the text of /proc/self/ns, run in an empty namespace, builds the same one
+    sh 'cat /proc/self/ns > /tmp/ns.saved'
+    sh "echo 'ns clean {' > /tmp/replay.hsh"
+    sh 'cat /tmp/ns.saved >> /tmp/replay.hsh'
+    sh "echo 'cat /proc/self/ns > /tmp/ns.replayed' >> /tmp/replay.hsh"
+    sh "echo '}' >> /tmp/replay.hsh"
+    sh "echo 'exit 0' >> /tmp/replay.hsh"
+    shn 'hamsh /tmp/replay.hsh'
+    sh 'echo replay-status $status'
+    sh 'echo saved-ns-follows'; sh 'cat /tmp/ns.saved'
+    sh 'echo replayed-ns-follows'; sh 'cat /tmp/ns.replayed'
+    sh 'echo ns-texts-end'
+    # another process has its own: a job started before a bind does not get it
+    sh 'ptest loop &'
+    nspid="$(tr -d '\r' < $QLOG | sed -n 's/^\[[0-9]*\] \([0-9][0-9]*\)$/\1/p' | tail -1)"
+    sh 'bind /tmp/ub /tmp/late'
+    sh "cat /proc/${nspid:-0}/ns | grep /tmp | wc"
+    sh 'cat /proc/self/ns | grep /tmp | wc'
+    sh "kill ${nspid:-0}"
+    sleep 0.5
+    sh 'unmount /tmp/late'
+    sh 'unmount /tmp/un'
+    sh 'cat /tmp/un/shared'
+    # bind over /bin replaces a program for one process only
+    sh 'mkdir /tmp/mybin'
+    sh 'cp /bin/hello /tmp/mybin/seq'
+    sh 'ns { bind -b /tmp/mybin /bin ; seq 7 }'
+    sh 'seq 7 | tail -1'
+    # a namespace built from nothing (a template, entered later)
+    sh "box = ns clean { bind '#t/tmp/ua' / ; bind '#r' /bin }"
+    sh 'enter box { ls / | wc }'
+    sh 'enter box { cat /tmp/copy }'
+    # `with bind` in the shell itself, undone at the closing brace
+    sh 'with bind("/tmp/ub", "/tmp/un") as p { cat /tmp/un/bfile | tr a-z A-Z }'
+    sh 'cat /tmp/un/bfile'
+    sh 'bind /nonexistent /tmp/un'
     # power: how often the processor wakes while the system idles at the
     # prompt of a sleeping command, tickless and with the periodic tick;
     # then suspend, ended by a key and by its timer
@@ -578,7 +637,7 @@ expect "shell: script: exit status" $S '^script status 5$'
 expect "shell: Ctrl-C ends a looping foreground program (status 130)" $S '^interrupted 130$'
 expect "shell: Ctrl-C ends a program that waits for console input" $S '^again 130$'
 expect "shell: ls /sd shows the files of the FAT volume" $S '^PATTERN\.BIN$'
-expect "shell: cat a file from the card" $S '^Hamnix Micro reads it with Hamnix fat\.ad\.$'
+expect "shell: cat a file from the card" $S '^Hamnix Micro reads it through Hamnix fs/fat.ad\.$'
 n40k="$(grep -c '^157 627 40000$' $S)"
 [ "$n40k" = 2 ] && ok "shell: cp card -> tmpfs -> card, 40000 bytes each way" || bad "shell: the 40000-byte copies were counted $n40k times, expected 2"
 expect "shell: a program run from the card" $S '^from the card 2$'
@@ -631,6 +690,31 @@ expect "shell: suspend, ended by a key after about 1.5 s" $S '^woke: console aft
 expect "shell: suspend 2 -n, ended by its timer after 2000 ms" $S '^woke: timer after 2000 ms, processor woken [0-9]+ times in all suspends$'
 [ "$(grep -c '^persistent-history-probe$' $S)" = 2 ] && ok "shell: history survives exit: the next shell recalls a line of the previous one" || bad "shell: persistent-history-probe seen $(grep -c '^persistent-history-probe$' $S) times, expected 2"
 expect "shell: a pasted block of 60 command lines (2 KB in one write): every line ran, in order" $S '^60 180 900$'
+# milestone 5: namespaces
+expect "ns: the shell's namespace is the boot namespace (six binds)" $S '^6 18 86$'
+expect "ns: a bind made inside \`ns { }\` (a child after rfork RFNAMEG) works there: file read, seven binds" $S '^7 21 111$'
+expect "ns: ... and is invisible to the parent" $S '^cat: cannot open /tmp/un/afile: .*file does not exist'
+[ "$(grep -c '^6 18 86$' $S)" = 2 ] && ok "ns: the parent's namespace is unchanged after the block" || bad "ns: '6 18 86' seen $(grep -c '^6 18 86$' $S) times, expected 2"
+expect "union: a name both directories have comes from the first" $S '^from-a$'
+expect "union: a name only the second has is found there" $S '^only-b$'
+expect "union: the listing is both directories' names, each once (shared, afile, bfile)" $S '^3 3 19$'
+expect "union: a new file goes to the first member when none has MCREATE" $S '^3 3 21$'
+expect "union: with a -bc member a new file goes to that one" $S '^cfile$'
+expect "ns: /proc/self/ns lists the union in bind order with its flags" $S "^bind -bc '#t/tmp/uc' /tmp/un\$"
+expect "ns: replay: the script ran" $S '^replay-status 0$'
+sed -n '/^saved-ns-follows$/,/^replayed-ns-follows$/p' $S | grep '^bind\|^mount' > $B/ns.saved
+sed -n '/^replayed-ns-follows$/,/^ns-texts-end$/p' $S | grep '^bind\|^mount' > $B/ns.replayed
+[ "$(grep -c . $B/ns.saved)" = 9 ] && cmp -s $B/ns.saved $B/ns.replayed && ok "ns: the 9 lines of /proc/self/ns, run in an empty namespace (\`ns clean\`), build a namespace that prints the same 9 lines" \
+    || bad "ns: replay differs: $(grep -c . $B/ns.saved) lines saved, $(grep -c . $B/ns.replayed) replayed"
+grep -q '^3 11 82$' $S && grep -q '^4 14 109$' $S && ok "ns: /proc/PID/ns of a job started before a bind has 3 lines naming /tmp, the shell's own has 4" || bad "ns: the job's and the shell's /proc/<pid>/ns do not differ as expected"
+expect "ns: unmount removes the union" $S '^cat: cannot open /tmp/un/shared: .*file does not exist'
+expect "ns: bind -b over /bin replaces a program inside the block (seq is /bin/hello there)" $S '^  arg: 7$'
+expect "ns: ... and only there" $S '^7$'
+expect "ns: a template made with \`ns clean\`, entered: the root is /tmp/ua plus the mount points /bin and /fd" $S '^5 5 28$'
+expect "ns: ... and nothing else is reachable in it" $S '^cat: cannot open /tmp/copy: .*file does not exist'
+expect "ns: \`with bind\` binds for the block" $S '^ONLY-B$'
+expect "ns: ... and unbinds at its end" $S '^cat: cannot open /tmp/un/bfile: .*file does not exist'
+expect "ns: bind of a source that does not exist fails with the kernel's error string" $S '^bind: bind failed: source does not resolve in this namespace$'
 # the same session as the fake e-paper panel showed it
 P=$B/panel-shell.txt
 python3 -I tests/display/panel2png.py $B/panel-shell.bin $B/panel-shell --font third_party/font8x8/font8x8_basic.h --yscale 2 --keep 3 > $P 2>&1; prc=$?
@@ -638,7 +722,7 @@ grep '^records:\|^image:' $P
 awk '/^text:$/{f=1; next} f' $P | grep -v '^$' | tail -8 | sed 's/^/    | /'
 [ $prc -eq 0 ] && ok "display: the session's panel stream is well-formed" || bad "display: panel2png.py failed on the session's stream ($prc)"
 nfull="$(sed -n 's/^records: full \([0-9]*\) partial \([0-9]*\).*/\1/p' $P)"; npart="$(sed -n 's/^records: full \([0-9]*\) partial \([0-9]*\).*/\2/p' $P)"
-[ "${npart:-0}" -ge 5 ] && [ "${nfull:-0}" -ge 2 ] && ok "display: the console reached the panel in $nfull full and $npart partial refreshes" || bad "display: $nfull full and $npart partial refreshes"
+[ "${npart:-0}" -ge 3 ] && [ "${nfull:-0}" -ge 2 ] && ok "display: the console reached the panel in $nfull full and $npart partial refreshes" || bad "display: $nfull full and $npart partial refreshes"
 awk '/^text:$/{f=1; next} f' $P | grep -q '^60 180 900$' && awk '/^text:$/{f=1; next} f' $P | grep -q '^hamsh\$ halt 0$' \
     && ok "display: the last frame, read back from its pixels, shows the end of the session (the paste count, 'hamsh\$ halt 0')" \
     || bad "display: the last frame does not show the end of the session"

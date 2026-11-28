@@ -10,11 +10,12 @@ system (it needs the `cortex-m7` branch of
 [ruapotato/adder](https://github.com/ruapotato/adder/tree/cortex-m7)), and is meant to reuse Hamnix's file-system layer, libraries and shell
 on top of a new kernel that needs no page tables.
 
-## Status: milestone 4, emulators only
+## Status: milestone 5, emulators only
 
-**A shell prompt that runs real programs, an editor, a display and a
-keyboard to run them on, and a processor that sleeps when there is nothing
-to do: all in emulators.** Hamnix Micro boots to Hamnix's shell, `hamsh`, on the
+**A shell prompt that runs real programs, each in a namespace of its own
+that `bind` rearranges; an editor, a display and a keyboard to run them on,
+and a processor that sleeps when there is nothing to do: all in
+emulators.** Hamnix Micro boots to Hamnix's shell, `hamsh`, on the
 serial console. The shell is an unprivileged process loaded from a file; so
 are `ls`, `cat`, `grep`, `vi` and the other 30 programs it runs. It runs in
 QEMU's `mps2-an500` (Cortex-M7) and `mps2-an386` (Cortex-M4F) machines and,
@@ -23,6 +24,8 @@ hardware.
 
 ```
 hamsh$ ls /bin | grep h | wc
+hamsh$ cat /proc/self/ns
+hamsh$ ns { bind -b /tmp/mybin /bin ; ls }
 hamsh$ vi /tmp/notes
 hamsh$ ptest loop &
 hamsh$ ps
@@ -32,8 +35,21 @@ idlestat, tickless: 3000 ms, of them idle 2999
 hamsh$ suspend 30
 ```
 
-New in milestone 4 (all checked by `make test`, `make test-m4`,
+New in milestone 5 (checked by `make test`, `make test-m4`,
 `make test-nrf52`):
+
+- **Per-process namespaces** ([`docs/namespaces.md`](docs/namespaces.md),
+  with examples to type). Path lookup goes through the mount table of the
+  calling process. `bind`, `unmount` and `rfork`'s `RFNAMEG` / `RFCNAMEG`
+  are Hamnix's, with its flags (`MREPL`, `MBEFORE`, `MAFTER`, `MCREATE`,
+  `MRDONLY`) and its search order; union directories look names up in
+  order, list the names of all members, and send a create to the `MCREATE`
+  member. The unmodified hamsh's `bind`, `unmount`, `ns { }`, `ns clean`,
+  `enter` and `with bind` work; `/proc/<pid>/ns` shows a process's
+  namespace as commands that rebuild it. A process that only inherits its
+  namespace costs no memory: tables are shared until someone changes them.
+
+New in milestone 4:
 
 - **Power** ([`docs/power.md`](docs/power.md)). Tickless idle: with nothing
   runnable the periodic tick is stopped until the next timer is due. An idle
@@ -169,17 +185,18 @@ everything here from source, and runs:
 3. static checks on the linked images (vector tables, the empty null-guard
    area, constants in read-only memory, no undefined symbols);
 4. the run-time self-test from milestone 1 (arithmetic, FPU, start-up);
-5. the kernel tests: one image, 197 counted checks, including processes
-   (isolation, faults, spawn, rfork, exec, wait), pipes, FAT, power (tickless
-   idle, suspend), the display stack and the keyboard stack, with console
+5. the kernel tests: one image, 229 counted checks, including processes
+   (isolation, faults, spawn, rfork, exec, wait), pipes, FAT, namespaces
+   (bind, unions, rfork's namespace flags), power (tickless idle, suspend), the display stack and the keyboard stack, with console
    input typed into the emulated UART by the harness; then the fake panel's
    output is turned into PNG frames and the text read back from the pixels;
 6. a scripted session with the kernel monitor (`build/monitor.elf`);
 7. an image that faults before the scheduler starts, for the fatal report;
 8. a scripted session with the shell: pipelines, redirections, a faulting
    program, the FAT volume, a script file run by a second shell, jobs, kill,
-   history, completion, the editor, a command typed on the emulated key
-   matrix, idle and suspend measurements, a pasted block; and the same
+   history, completion, namespaces (`ns { }`, unions, a program replaced
+   for one command, `/proc/self/ns` replayed), the editor, a command typed
+   on the emulated key matrix, idle and suspend measurements, a pasted block; and the same
    session as the fake e-paper panel showed it.
 
 Every check prints `PASS` or `FAIL`; the number of `PASS` lines must equal the
@@ -233,7 +250,8 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `kernel/rt.ad` | 64-bit divide/modulo, integer/float64 conversion, memcpy/memset |
 | `kernel/fault.ad`, `kernel/print.ad`, `kernel/printk/` | fatal report, console formatting |
 | `mm/` | heap (`heap.ad`) and the allocation names Hamnix code expects |
-| `fs/hvfs.ad` | descriptors, paths, mounts, device files, `/bin`, `/fd` names, the FAT glue (Hamnix Micro) |
+| `fs/hvfs.ad` | descriptors, path resolution through the caller's namespace, device files, `/bin`, `/fd` names, the FAT glue (Hamnix Micro) |
+| `fs/ns.ad` | namespaces: the per-process mount tables, shared copy-on-write; union search order; `/proc/<pid>/ns` |
 | `fs/tmpfs.ad`, `fs/fat.ad`, `fs/vfs_mount.ad`, `lib/p9dir.ad`, `lib/9p/` | copied from Hamnix (`fs/HAMNIX_ORIGIN`); `tmpfs.ad` with a size patch |
 | `user/hamnix/` | Hamnix's shell and programs, copied; `hamsh.ad` with a size patch |
 | `lib/p9.ad`, `perror.ad`, `regex.ad`, `hamcomplete.ad`, `passwd/` | Hamnix libraries those programs import, copied |
@@ -251,6 +269,7 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `tests/` | kernel test image, harness, link-rule check, measurement fixtures, the FAT image's contents |
 | `tests/imxrt/` | the Teensy checks: boot header, register and pin checkers, register models, the driver test image, the uSDHC test on QEMU's i.MX6UL, the Teensy memory test |
 | `docs/syscalls.md` | the system-call table and how it differs from Hamnix |
+| `docs/namespaces.md` | namespaces: examples, how lookup works, what it costs, differences from Hamnix |
 | `docs/boards/teensy41.md` | flashing, wiring, first power-up, bring-up checklist, memory |
 | `docs/boards/feather-nrf52840.md` | the same for the Feather nRF52840 |
 | `docs/porting.md` | what a new board, chip family or architecture needs |
@@ -304,8 +323,8 @@ linked. A C file works the same way (`user/progs/crel.c`).
   shell code works only as far as vfork allows: the child runs in the shell's
   own memory while the shell waits, changes it makes to shell variables stay,
   and it cannot write more than a pipe holds (4 KiB) to a stage that has not
-  been started yet. `bind`, `mount`, `ns`, `enter` and services report that
-  there are no namespaces.
+  been started yet. `ns { }` and `enter` blocks run that way (the shell
+  waits for them anyway).
 - A process block is readable, writable and executable throughout: a program
   can overwrite its own code. Its size is fixed at start; there is no way to
   grow a heap.
