@@ -158,3 +158,47 @@
         vmov    d0, r0, r1
         bl      rt_f64_to_u64
         pop     {r4, pc}
+
+/* 64-bit shifts by a variable count, which LLVM calls instead of expanding
+ * them when it optimises for size (-Os/-Oz: the Feather nRF52840 build).
+ * value = r1:r0 (high:low), count = r2 (0..63); result in r1:r0.  A
+ * register shift by 32 or more gives 0 (or the sign, for asr), which is
+ * what the cases below rely on.                                         */
+        func    __aeabi_llsl
+        subs    r3, r2, #32
+        bpl     1f
+        rsb     r12, r2, #32
+        lsls    r1, r2
+        lsr     r12, r0, r12
+        orr     r1, r1, r12
+        lsls    r0, r2
+        bx      lr
+1:      lsl     r1, r0, r3
+        movs    r0, #0
+        bx      lr
+
+        func    __aeabi_llsr
+        subs    r3, r2, #32
+        bpl     1f
+        rsb     r12, r2, #32
+        lsrs    r0, r2
+        lsl     r12, r1, r12
+        orr     r0, r0, r12
+        lsrs    r1, r2
+        bx      lr
+1:      lsr     r0, r1, r3
+        movs    r1, #0
+        bx      lr
+
+        func    __aeabi_lasr
+        subs    r3, r2, #32
+        bpl     1f
+        rsb     r12, r2, #32
+        lsrs    r0, r2
+        lsl     r12, r1, r12
+        orr     r0, r0, r12
+        asrs    r1, r2
+        bx      lr
+1:      asr     r0, r1, r3
+        asrs    r1, r1, #31
+        bx      lr

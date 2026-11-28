@@ -15,8 +15,21 @@ SOFT_DOUBLE := 1
 # Programs' code stays in flash (/bin), only their data goes to RAM.
 PROG_ABI := rwpi
 PROG_AFLAGS := --llvm-optsize
-# crel tests absolute pointers in C data, which an RWPI program cannot have.
-PROGS_SKIP := crel
+# Everything is compiled for size: the image must end below 0xAD000 (link.ld)
+# and /bin starts at 0x60000, so the kernel has 232 KB and /bin 308 KB.  At
+# -O2 the milestone-5 kernel alone is 228 KB and /bin 323 KB; at -Oz they
+# are 123 KB and 271 KB (docs/boards/feather-nrf52840.md, size).  -Oz makes
+# LLVM call __aeabi_llsl/llsr/lasr for 64-bit shifts (arch/armv7m/aeabi.S).
+OPT ?= -Oz
+# Programs left out of this board's /bin:
+#   crel         tests absolute pointers in C data, which an RWPI program
+#                cannot have
+#   p9srv_demo   Hamnix's one-file 9P demo server (10 KB); exportfs is the 9P
+#                server here
+# Everything else fits since the image is built with -Oz (below); the next to
+# go if room is needed: ptest (12 KB, a test program), vi (9 KB), sort, cut,
+# tr, idlestat (docs/boards/feather-nrf52840.md, size).
+PROGS_SKIP := crel p9srv_demo
 BOARD_PATCHES := $(wildcard boards/feather_nrf52840/patches/*/*.patch boards/feather_nrf52840/patches/*/*/*.patch)
 # Application start of Adafruit's bootloader: after SoftDevice S140 6.1.1
 # (what the Feather nRF52840 ships with; INFO_UF2.TXT on its drive says
