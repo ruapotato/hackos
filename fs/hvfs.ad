@@ -144,6 +144,7 @@ DEVFD_SLOTS: uint32 = 16
 CHAN_INLINE_TAG: int32 = 0x40000000
 CHAN_DEV: int32 = 0x10000
 CHAN_ROM: int32 = 0x20000
+CHAN_OF: int32 = 0x80000            # ... | CHAN_OF | index: an entry of the open-file table (a file on a 9P server)
 
 # The ROM table (generated: build/romfs.S): `romfs_count` entries of
 # {name address, data address, size, 0}, 32-bit words.
@@ -957,15 +958,16 @@ def _p9_list(key: Ptr[uint8], buf: Ptr[uint8], cap: uint64, off: uint64) -> uint
             pos: uint64 = 0
             n: int64 = p9c_read(cast[uint32](conn), cast[uint32](fid), pos, tp, 512)
             while n > 2:
-                # whole stat records: size[2], then 41 bytes, then name[s]
+                # whole stat records: size[2], 39 bytes of fixed fields
+                # (type dev qid mode atime mtime length), then name[s]
                 o: uint64 = 0
-                while o + 45 <= cast[uint64](n):
+                while o + 43 <= cast[uint64](n):
                     sz: uint64 = cast[uint64](tp[o]) | (cast[uint64](tp[o + 1]) << 8)
-                    nl: uint64 = cast[uint64](tp[o + 43]) | (cast[uint64](tp[o + 44]) << 8)
-                    if o + 45 + nl > cast[uint64](n) or sz < 43 + nl:
+                    nl: uint64 = cast[uint64](tp[o + 41]) | (cast[uint64](tp[o + 42]) << 8)
+                    if o + 2 + sz > cast[uint64](n) or sz < 41 + nl:
                         break
                     if off + nl + 1 <= cap:
-                        rt_memcpy(cast[uint64](buf) + off, tmp + o + 45, nl)
+                        rt_memcpy(cast[uint64](buf) + off, tmp + o + 43, nl)
                         buf[off + nl] = 10
                         off = off + nl + 1
                     o = o + 2 + sz
@@ -980,8 +982,10 @@ def _p9_list(key: Ptr[uint8], buf: Ptr[uint8], cap: uint64, off: uint64) -> uint
     return off
 
 
-# Open (or create) a file on a 9P server.  fs_lock is not held.
-def _p9_open(key: Ptr[uint8], mode: uint32) -> int32:
+# Open (or create) a file on a 9P server.  fs_lock is not held.  Returns the
+# index of a new entry of the open-file table (one reference, no descriptor
+# yet), or a negative errno.
+def _p9_open_idx(key: Ptr[uint8], mode: uint32) -> int32:
     rel: Ptr[uint8] = cast[Ptr[uint8]](0)
     conn: int32 = _p9_begin(key, &rel)
     if conn < 0:
@@ -994,6 +998,7 @@ def _p9_open(key: Ptr[uint8], mode: uint32) -> int32:
         pm = pm | 0x10
     fid: int32 = p9c_walk(cu, rel, 0, cast[Ptr[uint32]](0), &qt)
     rc: int32 = 0
+    pos: uint64 = 0
     if fid == ENOENT and (mode & OCREATE) != 0:
         fid = p9c_walk(cu, rel, 1, &last, &qt)
         if fid >= 0:
@@ -1007,19 +1012,130 @@ def _p9_open(key: Ptr[uint8], mode: uint32) -> int32:
             rc = _err(EISDIR, "is a directory")
         else:
             rc = p9c_open(cu, cast[uint32](fid), pm)
+            if rc == 0 and (mode & OAPPEND) != 0:
+                # writing starts at the end the file has now
+                st: Array[128, uint8]
+                if p9c_stat(cu, cast[uint32](fid), &st[0], 128) >= 41:
+                    pos = cast[uint64](_get32(&st[0], 33))
     if fid < 0:
         _p9_end(conn)
         return fid
     if rc == 0:
         mutex_lock(&fs_lock)
-        rc = _install(OF_9P, conn, mode & 3, 0, 0)
-        if rc >= 0:
-            _fd_file(rc)[0].aux0 = cast[uint64](fid)
+        i: int32 = 0
+        while i < cast[int32](VFS_NR_OPEN) and ofiles[i].refs != 0:
+            i = i + 1
+        if i == cast[int32](VFS_NR_OPEN):
+            rc = _err(EMFILE, "too many open files")
+        else:
+            ofiles[i].refs = 1
+            ofiles[i].kind = OF_9P
+            ofiles[i].slot = conn
+            ofiles[i].mode = mode & 3
+            ofiles[i].pos = pos
+            ofiles[i].dirbuf = 0
+            ofiles[i].dirlen = 0
+            ofiles[i].aux0 = cast[uint64](fid)
+            rc = i
         mutex_unlock(&fs_lock)
     if rc < 0:
         p9c_clunk(cu, cast[uint32](fid))
         _p9_end(conn)                   # an open file keeps the reference
     return rc
+
+
+# ... and give it a descriptor.
+def _p9_open(key: Ptr[uint8], mode: uint32) -> int32:
+    idx: int32 = _p9_open_idx(key, mode)
+    if idx < 0:
+        return idx
+    t: Ptr[Thread] = current_thread()
+    mutex_lock(&fs_lock)
+    fd: int32 = 0
+    while fd < cast[int32](VFS_NR_FDS) and t[0].fd[fd] >= 0:
+        fd = fd + 1
+    tok: uint64 = 0
+    if fd == cast[int32](VFS_NR_FDS):
+        tok = _close_index(idx)
+        fd = _err(EMFILE, "too many open files")
+    else:
+        t[0].fd[fd] = idx
+    mutex_unlock(&fs_lock)
+    _p9_finish(tok, 1)
+    return fd
+
+
+# ---- a 9P file as a channel (a redirection: `cmd < /n/x/f`, `>`, `>>`) ----
+# vfs_openchan hands out CHAN_INLINE_TAG | CHAN_OF | index for a file on a 9P
+# server: an entry of the open-file table that no descriptor refers to yet.
+# Its one reference waits in chan_pend for the opener to bind it at an /fd
+# name (the shell does that at once); every name it is then bound at, in any
+# process, holds a reference, and the last one to go clunks the fid.  A
+# channel the opener never binds is closed at its next openchan or when it
+# ends.
+class ChanPend:
+    tid: uint32
+    idx: int32
+
+
+CHAN_PEND: uint32 = 4
+chan_pend: Array[4, ChanPend]
+
+
+def _chan_drop(idx: int32, tell: uint32):
+    mutex_lock(&fs_lock)
+    tok: uint64 = _close_index(idx)
+    mutex_unlock(&fs_lock)
+    _p9_finish(tok, tell)
+
+
+# Close what `tid` opened and never bound.
+def _chan_pend_reap(tid: uint32, tell: uint32):
+    i: uint32 = 0
+    while i < CHAN_PEND:
+        if chan_pend[i].tid == tid:
+            chan_pend[i].tid = 0
+            _chan_drop(chan_pend[i].idx, tell)
+        i = i + 1
+
+
+# Take the waiting reference of channel idx if `tid` (or `alt`) opened it.
+def _chan_pend_take(tid: uint32, alt: uint32, idx: int32) -> uint32:
+    i: uint32 = 0
+    while i < CHAN_PEND:
+        if chan_pend[i].tid != 0 and chan_pend[i].idx == idx and (chan_pend[i].tid == tid or chan_pend[i].tid == alt):
+            chan_pend[i].tid = 0
+            return 1
+        i = i + 1
+    return 0
+
+
+def _p9_openchan(key: Ptr[uint8], mode: int32) -> int32:
+    me: uint32 = current_thread()[0].tid
+    _chan_pend_reap(me, 1)
+    m: uint32 = OREAD
+    if mode == 1:
+        m = OWRITE | OCREATE | OTRUNC
+    elif mode == 2:
+        m = OWRITE | OCREATE | OAPPEND
+    idx: int32 = _p9_open_idx(key, m)
+    if idx < 0:
+        return idx
+    i: uint32 = 0
+    while i < CHAN_PEND and chan_pend[i].tid != 0:
+        i = i + 1
+    if i == CHAN_PEND:
+        _chan_drop(idx, 1)
+        return _err(EMFILE, "too many redirections waiting to be bound")
+    chan_pend[i].idx = idx
+    chan_pend[i].tid = me
+    return CHAN_INLINE_TAG | CHAN_OF | idx
+
+
+def _chan_is_of(kind: int32, arg: int32) -> uint32:
+    if kind == DEVFD_CHAN and (arg & CHAN_OF) != 0:
+        return 1
+    return 0
 
 
 # stat, remove and mkdir on a 9P server.
@@ -1229,6 +1345,16 @@ def _fdn_read(fdn: int32, buf: Ptr[uint8], n: uint64, nonblock: uint32) -> int64
         got = tmpfs_read(arg, buf, t[0].fdn_pos[fdn], n)
         t[0].fdn_pos[fdn] = t[0].fdn_pos[fdn] + got
         mutex_unlock(&fs_lock)
+    elif _chan_is_of(kind, arg) != 0:
+        # a file on a 9P server; the position is the open file's, shared by
+        # every name it is bound at
+        of: Ptr[OpenFile] = &ofiles[arg & 0xFFFF]
+        pr: int64 = p9c_read(cast[uint32](of[0].slot), cast[uint32](of[0].aux0), of[0].pos, buf, n)
+        if pr > 0:
+            of[0].pos = of[0].pos + cast[uint64](pr)
+        if pr == 0 and nonblock != 0:
+            return -1
+        return pr
     elif kind == DEVFD_CHAN and (arg & CHAN_ROM) != 0:
         got = _rom_read(arg & 0xFFFF, buf, t[0].fdn_pos[fdn], n)
         t[0].fdn_pos[fdn] = t[0].fdn_pos[fdn] + got
@@ -1281,6 +1407,14 @@ def _fdn_write(fdn: int32, buf: Ptr[uint8], n: uint64) -> int64:
         if w == 0 and n != 0:
             return cast[int64](_err(ENOSPC, "tmpfs: no space"))
         return cast[int64](w)
+    if _chan_is_of(kind, arg) != 0:
+        of: Ptr[OpenFile] = &ofiles[arg & 0xFFFF]
+        if (of[0].mode & 3) == OREAD:
+            return cast[int64](_err(EBADF, "write: not open for writing"))
+        pw: int64 = p9c_write(cast[uint32](of[0].slot), cast[uint32](of[0].aux0), of[0].pos, buf, n)
+        if pw > 0:
+            of[0].pos = of[0].pos + cast[uint64](pw)
+        return pw
     if kind == DEVFD_CHAN and (arg & CHAN_DEV) != 0:
         if (arg & 0xFFFF) == DEV_CONSOLE:
             console_write(buf, n)
@@ -1378,6 +1512,8 @@ def _fdn_holds(t: Ptr[Thread], pipe: uint32, arg: int32) -> uint32:
                 return 1
             if pipe == 0 and (k == DEVFD_FILE or k == DEVFD_FILE_APPEND):
                 return 1
+            if pipe == 2 and k == DEVFD_CHAN:
+                return 1
         n = n + 1
     return 0
 
@@ -1408,7 +1544,7 @@ def _may_bind(me: Ptr[Thread], pipe: uint32, arg: int32) -> uint32:
 
 
 # Drop what /fd/<n> of `t` is bound to.
-def _fdn_release(t: Ptr[Thread], n: uint32):
+def _fdn_release(t: Ptr[Thread], n: uint32, tell: uint32):
     kind: int32 = t[0].fdn_kind[n]
     arg: int32 = t[0].fdn_arg[n]
     t[0].fdn_kind[n] = DEVFD_NONE
@@ -1418,6 +1554,8 @@ def _fdn_release(t: Ptr[Thread], n: uint32):
         pipe_close_reader(arg)
     elif kind == DEVFD_PIPE_W:
         pipe_close_writer(arg)
+    elif _chan_is_of(kind, arg) != 0:
+        _chan_drop(arg & 0xFFFF, tell)
 
 
 # Bind /fd/<fdnum> of process `pid` (0 = the caller).  The caller may bind
@@ -1434,6 +1572,7 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
     n: uint32 = cast[uint32](fdnum)
     pos: uint64 = 0
     dup: uint32 = 0                     # a dup copies what the target already holds
+    ofref: uint32 = 0                   # the new name takes a reference to an open-file entry
     if kind == DEVFD_DUP:
         dup = 1
         if arg < 0 or arg >= cast[int32](DEVFD_SLOTS):
@@ -1453,6 +1592,11 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
             # which is what a shared position amounts to for writers.
             kind = DEVFD_FILE_APPEND
             t[0].fdn_kind[src] = DEVFD_FILE_APPEND
+    if (kind == DEVFD_FILE or kind == DEVFD_FILE_APPEND) and (arg & CHAN_INLINE_TAG) != 0:
+        # what openchan returned says itself that it is not a tmpfs slot;
+        # Hamnix's shell binds an appending redirection of a built-in
+        # command as a file whatever it got
+        kind = DEVFD_CHAN
     if kind == DEVFD_PIPE_R or kind == DEVFD_PIPE_W:
         if pipe_valid(arg) == 0:
             return _err(EBADF, "fdbind: no such pipe")
@@ -1466,7 +1610,23 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
     elif kind == DEVFD_CHAN:
         # exactly the values vfs_openchan hands out, nothing a caller made up
         cok: uint32 = 0
-        if (arg & (CHAN_INLINE_TAG | CHAN_DEV | CHAN_ROM | 0xFFFF)) == arg and (arg & CHAN_INLINE_TAG) != 0:
+        if (arg & (CHAN_INLINE_TAG | CHAN_OF | 0xFFFF)) == arg and (arg & CHAN_INLINE_TAG) != 0 and (arg & CHAN_OF) != 0:
+            # a 9P file: the caller opened it just now (the waiting reference
+            # becomes this name's), or holds it at a name already
+            oi: int32 = arg & 0xFFFF
+            if oi < cast[int32](VFS_NR_OPEN) and ofiles[oi].refs != 0 and ofiles[oi].kind == OF_9P:
+                alt: uint32 = 0
+                if (me[0].pflags & PF_VFORK) != 0:
+                    alt = me[0].ppid
+                if dup != 0:
+                    cok = 1
+                    ofref = 1
+                elif _chan_pend_take(me[0].tid, alt, oi) != 0:
+                    cok = 1
+                elif _fdn_holds(me, 2, arg) != 0:
+                    cok = 1
+                    ofref = 1
+        elif (arg & (CHAN_INLINE_TAG | CHAN_DEV | CHAN_ROM | 0xFFFF)) == arg and (arg & CHAN_INLINE_TAG) != 0:
             idx: int32 = arg & 0xFFFF
             if (arg & CHAN_DEV) != 0 and (arg & CHAN_ROM) == 0 and idx >= DEV_CONSOLE and idx <= DEV_ZERO:
                 cok = 1
@@ -1484,7 +1644,11 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
         pipe_inc_reader(arg)
     elif kind == DEVFD_PIPE_W:
         pipe_inc_writer(arg)
-    _fdn_release(t, n)
+    if ofref == 1:
+        mutex_lock(&fs_lock)
+        ofiles[arg & 0xFFFF].refs = ofiles[arg & 0xFFFF].refs + 1
+        mutex_unlock(&fs_lock)
+    _fdn_release(t, n, 1)
     t[0].fdn_kind[n] = kind
     t[0].fdn_arg[n] = arg
     t[0].fdn_pos[n] = pos
@@ -1532,6 +1696,8 @@ def vfs_openchan(path: Ptr[uint8], mode: int32) -> int32:
     if rc < 0:
         return rc
     kind: uint32 = _kind(&canon[0])
+    if kind == FS_KIND_9P:
+        return _p9_openchan(&canon[0], mode)
     rel: Ptr[uint8] = cast[Ptr[uint8]](vfs_fs_rel(_pc(&canon[0])))
     if kind == FS_KIND_DEVFS:
         dev: int32 = _dev_lookup(rel)
@@ -2173,8 +2339,9 @@ def _vfs_thread_exit(tp: uint64) -> int64:
     # of file or EPIPE
     n: uint32 = 0
     while n < DEVFD_SLOTS:
-        _fdn_release(t, n)
+        _fdn_release(t, n, tell)
         n = n + 1
+    _chan_pend_reap(t[0].tid, tell)
     pipe_release_unbound(t[0].tid)
     _grant_drop(t[0].tid, -1)
     ns_unref(t[0].nsg)
@@ -2213,6 +2380,10 @@ def _vfs_thread_spawn(childp: uint64, parentp: uint64) -> int64:
             pipe_inc_reader(p[0].fdn_arg[n])
         elif p[0].fdn_kind[n] == DEVFD_PIPE_W:
             pipe_inc_writer(p[0].fdn_arg[n])
+        elif _chan_is_of(p[0].fdn_kind[n], p[0].fdn_arg[n]) != 0:
+            mutex_lock(&fs_lock)
+            ofiles[p[0].fdn_arg[n] & 0xFFFF].refs = ofiles[p[0].fdn_arg[n] & 0xFFFF].refs + 1
+            mutex_unlock(&fs_lock)
         n = n + 1
     return 0
 

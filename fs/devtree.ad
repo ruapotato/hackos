@@ -25,7 +25,7 @@
 
 from kernel.rt import rt_memcpy
 
-DT_MAX: uint32 = 32                 # = the dimension of dt_nodes
+DT_MAX: uint32 = 48                 # = the dimension of dt_nodes
 DT_ENOENT: int64 = -2
 DT_EBADF: int64 = -9
 DT_EINVAL: int64 = -22
@@ -38,7 +38,7 @@ class DevNode:
     arg: uint32
 
 
-dt_nodes: Array[32, DevNode]
+dt_nodes: Array[48, DevNode]
 dt_count: uint32 = 0
 
 

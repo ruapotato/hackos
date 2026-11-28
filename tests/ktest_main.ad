@@ -1832,8 +1832,8 @@ def ns_thread(arg: uint64) -> int64:
     check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nsa", MRDONLY) == 0 and ns_is("/tmp/nsu/onlya", "A") == 1 and ns_put("/tmp/nsu/x", "X") == -30 and vfs_unlink("/tmp/nsu/onlya") == -30 and vfs_mkdir("/tmp/nsu/d") == -30 and ns_is("/tmp/nsa/onlya", "A") == 1), "bind MRDONLY: reads pass, create, remove and mkdir through the binding fail with EROFS")
     vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsu")
     # servers by name, and a label
-    check(cast[uint32](ns_is("#c", "console\nnull\nzero\npower\ni2c\n") == 1 and ns_is("#t/tmp/nsa/onlya", "A") == 1 and vfs_open("#q/x", OREAD) == -2 and ns_put("#q/x", "X") == -2), "a server can be named directly (#c, #t/...); an unknown one does not exist")
-    check(cast[uint32](vfs_bind("/n/devices", "#c", MREPL) == 0 and ns_is("/n", "devices\n") == 1 and ns_is("/n/devices", "console\nnull\nzero\npower\ni2c\n") == 1 and vfs_chdir("/n") == 0 and vfs_stat("devices", &ns_io[0], 256) > 0 and vfs_chdir("/") == 0), "a mount point shows up in its parent's listing though no file system holds the parent; cd and stat work there")
+    check(cast[uint32](ns_is("#c", "console\nnull\nzero\nconsctl\npower\ni2c\n") == 1 and ns_is("#t/tmp/nsa/onlya", "A") == 1 and vfs_open("#q/x", OREAD) == -2 and ns_put("#q/x", "X") == -2), "a server can be named directly (#c, #t/...); an unknown one does not exist")
+    check(cast[uint32](vfs_bind("/n/devices", "#c", MREPL) == 0 and ns_is("/n", "devices\n") == 1 and ns_is("/n/devices", "console\nnull\nzero\nconsctl\npower\ni2c\n") == 1 and vfs_chdir("/n") == 0 and vfs_stat("devices", &ns_io[0], 256) > 0 and vfs_chdir("/") == 0), "a mount point shows up in its parent's listing though no file system holds the parent; cd and stat work there")
     check(cast[uint32](vfs_nslabel(0, "devs", "/n/devices") == 0 and vfs_nslabel(1, "nolabel", cast[Ptr[uint8]](0)) == -2 and vfs_nslabel(1, "devs", cast[Ptr[uint8]](0)) == 0 and vfs_open("/n/devices/null", OREAD) == -2), "nslabel: a binding is labelled and then removed by its label")
     # the namespace as text
     vfs_bind("/tmp/nsu", "/tmp/nsa", MREPL)
@@ -1884,7 +1884,7 @@ def test_ns():
     base: uint32 = ns_entries()
     nt: Ptr[Thread] = thread_create("ns", cast[uint64](&ns_thread), 0, 2, 8192, 0)
     join(nt[0].tid)
-    check(cast[uint32](ns_entries() == base and vfs_open("/tmp/nsu/onlya", OREAD) == -2 and ns_is("/tmp/nsa/onlya", "A") == 1 and ns_is("/dev", "console\nnull\nzero\npower\ni2c\n") == 1), "ns: none of that thread's binds reached the boot namespace")
+    check(cast[uint32](ns_entries() == base and vfs_open("/tmp/nsu/onlya", OREAD) == -2 and ns_is("/tmp/nsa/onlya", "A") == 1 and ns_is("/dev", "console\nnull\nzero\nconsctl\npower\ni2c\n") == 1), "ns: none of that thread's binds reached the boot namespace")
     check(cast[uint32](ns_tabs_live == tabs0), "ns: a group's table is freed with its last thread")
     code: int64 = run_prog("/bin/ptest", "ns", nul, nul)
     printk1("   ptest ns -> %d\n", cast[uint64](code))
@@ -1915,11 +1915,11 @@ def test_devfiles():
     n0: uint32 = dt_count
     # every board has these (drivers/devfiles.ad); the emulated sensor and
     # pins are what the QEMU boards' system image adds (board.devices)
-    check(cast[uint32](n0 == 3 and ns_is("/dev", "console\nnull\nzero\npower\ni2c\n") == 1 and ns_is("/dev/i2c", "0\n") == 1 and ns_is("/dev/i2c/0", "ctl\ndata\n") == 1), "devtree: /dev lists the built-in devices and the drivers' directories; directories exist because files lie below them")
+    check(cast[uint32](n0 == 4 and ns_is("/dev", "console\nnull\nzero\nconsctl\npower\ni2c\n") == 1 and ns_is("/dev/i2c", "0\n") == 1 and ns_is("/dev/i2c/0", "ctl\ndata\n") == 1), "devtree: /dev lists the built-in devices and the drivers' directories; directories exist because files lie below them")
     sht4x_model_attach()
     sht4xfs_init()
     gpio_model_attach()
-    check(cast[uint32](ns_is("/dev", "console\nnull\nzero\npower\ni2c\nmodel\nsht4x\ngpio\n") == 1 and ns_is("/dev/sht4x", "temperature\nhumidity\nserial\n") == 1 and vfs_chdir("/dev/gpio") == 0 and vfs_stat("7", &ns_io[0], 256) > 0 and vfs_stat("8", &ns_io[0], 256) == -2 and vfs_chdir("/") == 0 and vfs_open("/dev/gpio", OWRITE) == -21), "devtree: a driver's files appear when it registers them; cd, stat, a directory cannot be written")
+    check(cast[uint32](ns_is("/dev", "console\nnull\nzero\nconsctl\npower\ni2c\nmodel\nsht4x\ngpio\n") == 1 and ns_is("/dev/sht4x", "temperature\nhumidity\nserial\n") == 1 and vfs_chdir("/dev/gpio") == 0 and vfs_stat("7", &ns_io[0], 256) > 0 and vfs_stat("8", &ns_io[0], 256) == -2 and vfs_chdir("/") == 0 and vfs_open("/dev/gpio", OWRITE) == -21), "devtree: a driver's files appear when it registers them; cd, stat, a directory cannot be written")
     # the sensor as text files, through the vendor's C driver and the I2C bus
     check(cast[uint32](ns_put("/dev/model/sht4x", "ticks 26214 32768\n") == 0 and ns_is("/dev/sht4x/temperature", "24.998\n") == 1 and ns_is("/dev/sht4x/humidity", "56.500\n") == 1 and ns_is("/dev/sht4x/serial", "0f3a9b2c\n") == 1), "sht4x: temperature and humidity read as text (25 C, 56.5 %RH set in the model), the serial number")
     check(cast[uint32](ns_put("/dev/model/sht4x", "ticks 4096 1024") == 0 and ns_is("/dev/sht4x/temperature", "-34.063\n") == 1 and ns_is("/dev/sht4x/humidity", "-4.047\n") == 1), "sht4x: negative values")

@@ -98,8 +98,8 @@ expect "mv" $S '^moved-n$'
 expect "Ctrl-C ends a pipeline (cat | wc: both wait, the shell names no group for them)" $S '^pipeline interrupted 130$'
 expect "kill PID ends the background job" $S '^\[1\]\+ Done ptest loop$'
 # milestone 5: namespaces
-[ "$(grep -c '^5 15 72$' $S)" = 1 ] && ok "ns: the boot namespace has five binds (no /sd)" || bad "ns: '5 15 72' seen $(grep -c '^5 15 72$' $S) times, expected 1"
-expect "ns: a bind made inside \`ns { }\` (rfork RFNAMEG, a nested vfork) works there" $S '^6 18 97$'
+[ "$(grep -c '^6 18 87$' $S)" = 1 ] && ok "ns: the boot namespace has six binds (no /sd)" || bad "ns: '6 18 87' seen $(grep -c '^6 18 87$' $S) times, expected 1"
+expect "ns: a bind made inside \`ns { }\` (rfork RFNAMEG, a nested vfork) works there" $S '^7 21 112$'
 expect "ns: ... and is invisible to the shell" $S '^cat: cannot open /tmp/un/afile: .*file does not exist'
 expect "union: merged listing of two directories" $S '^3 3 19$'
 expect "union: lookup order" $S '^from-a$'
@@ -110,7 +110,25 @@ expect "ns: bind -b over /bin replaces a program inside the block" $S '^  arg: 7
 expect "ns: ... and only there" $S '^7$'
 expect "ns: a clean namespace entered from a template (root = /tmp/ua, /bin, /fd)" $S '^4 4 20$'
 expect "devices: ls /dev shows the driver directories" $S '^gpio$'
-expect "devices: cat /dev/gpio/led reads the level the red LED's pin is driven to" $S '^[LH]$'
+expect "devices: cat /dev/gpio/red reads the level the red LED's pin is driven to (it is blinking)" $S '^[LH]$'
+seq_is() { [ "$(grep -A"$2" -m1 "^$1\$" $S | tr '\n' ' ')" = "$3" ] && ok "$4" || bad "$4 (got '$(grep -A"$2" -m1 "^$1\$" $S | tr '\n' ' ')')"; }
+seq_is blue-on 2 "blue-on 1 1 " "devices: echo 1 > /dev/gpio/blue switches the blue LED's pin (P1.10) on: /dev/gpio/blue and /dev/gpio/42 read 1 (Renode's GPIO model)"
+seq_is blue-off 1 "blue-off 0 " "devices: ... and echo 0 switches it off"
+seq_is red-stays-on 2 "red-stays-on 1 1 " "devices: a write to /dev/gpio/red takes the red LED from the heartbeat: still 1 two seconds later"
+seq_is red-off 1 "red-off 0 " "devices: ... and /dev/gpio/47 is the same pin"
+seq_is pin26-out 1 "pin26-out 1 " "devices: a header pin (/dev/gpio/26, D9) driven high reads 1"
+expect "devices: the button's file cannot be written" $S 'echo: .*|redirect|error'
+expect "devices: ls /dev/gpio: red, blue, button and 21 numbered pins" $S '^24 24 [0-9]+$'
+expect "help: /bin/help names the namespace commands, 9P and the device files" $S '^  namespace +bind .* unmount NAME'
+seq_is p9-list 2 "p9-list a exported-one " "9p: exportfs -s ex /tmp/ex posted in /srv and mounted with the shell's mount: listing and a file through the kernel's client"
+seq_is p9-new 1 "p9-new 6 6 28 " "9p: a file created through the mount, appended to with a program's >> (in the server's directory: 6 lines)"
+expect "9p: a program copied to the mount runs from it (loaded into RAM: it is not in the flash window)" $S '^  arg: ran-from-9p$'
+expect "9p: /proc/self/ns shows the mount" $S '^mount /srv/ex /n/ex$'
+seq_is p9-inner 1 "p9-inner exported-one " "9p: a mount made inside ns { } works there"
+expect "9p: ... and is not in the shell's namespace" $S '^cat: cannot open /n/inner/a: .*file does not exist'
+expect "9p: exportfs as a process: its block in the program arena (the MEM-KB column of ps)" $S '^ +[0-9]+ +[0-9]+ wait +[0-9]+ proc +[0-9]+ .* exportfs$'
+expect "9p: unmount" $S '^cat: cannot open /n/ex/a: .*file does not exist'
+seq_is p9-jobs 1 "p9-jobs p9-jobs-end " "9p: exportfs ends when its mount and its /srv name are gone"
 expect "devices: the I2C bus has no device (and no controller driver) here: nack" $S '^nack$'
 expect "devices: /dev/power/ctl" $S '^tickless: +1$'
 expect "vi: scripted keystrokes, left with :wq" $S '^vi-status 0$'

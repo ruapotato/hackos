@@ -16,6 +16,13 @@
 #     CR or LF          deliver the line, terminated by "\n"
 # In raw mode every byte is delivered at once, unechoed (what Hamnix's shell
 # expects from its console).
+# In wire mode the console is a plain byte channel for a while (a 9P server
+# talking to another machine over the console's serial line: `exportfs
+# /dev/console`, docs/9p.md): nothing is interpreted on the way in (no
+# Ctrl-C), nothing is added on the way out (no CR before LF), and a display
+# that shows the console does not get the bytes.  A program switches by
+# writing to /dev/consctl: "wireon", "wireoff" (back to the mode before);
+# "rawon" and "rawoff" as in Plan 9.
 #
 # Fast input (a pasted block).  Received bytes wait in a ring of CON_RING
 # bytes for a reader.  A reader that is slower than the line (the shell
@@ -39,6 +46,7 @@ CON_HIGH: uint32 = 512              # ring fill at which the sender is held off
 CON_LOW: uint32 = 256               # ... and let go again
 CON_COOKED: uint32 = 1
 CON_RAW: uint32 = 0
+CON_WIRE: uint32 = 2
 
 con_lock: Mutex
 con_wq: WaitQueue
@@ -49,6 +57,7 @@ con_line: Array[256, uint8]
 con_line_len: uint32 = 0
 con_eof: uint32 = 0                # pending end-of-file marks
 con_mode: uint32 = 1
+con_mode_saved: uint32 = 0         # the mode "wireoff" goes back to
 con_rx_bytes: uint64 = 0           # statistics
 con_rx_dropped: uint64 = 0
 con_rx_irqs: uint64 = 0            # receive interrupts taken
@@ -80,7 +89,37 @@ def console_set_mode(mode: uint32):
     con_mode = mode
 
 
+def _ctl_is(msg: Ptr[uint8], n: uint64, w: Ptr[uint8]) -> uint32:
+    i: uint64 = 0
+    while w[i] != 0 and i < n and msg[i] == w[i]:
+        i = i + 1
+    if w[i] == 0 and (i == n or msg[i] == 10 or msg[i] == 32):
+        return 1
+    return 0
+
+
+# A command written to /dev/consctl.  0, or -22.
+def console_ctl(msg: Ptr[uint8], n: uint64) -> int32:
+    if _ctl_is(msg, n, "rawon") != 0:
+        con_mode = CON_RAW
+    elif _ctl_is(msg, n, "rawoff") != 0:
+        con_mode = CON_COOKED
+    elif _ctl_is(msg, n, "wireon") != 0:
+        if con_mode != CON_WIRE:
+            con_mode_saved = con_mode
+        con_mode = CON_WIRE
+    elif _ctl_is(msg, n, "wireoff") != 0:
+        if con_mode == CON_WIRE:
+            con_mode = con_mode_saved
+    else:
+        return -22
+    return 0
+
+
 def _con_out(c: uint32):
+    if con_mode == CON_WIRE:
+        board_console_putc(c)
+        return
     if c == 10:
         board_console_putc(13)
         board_console_tee(13)
@@ -130,6 +169,11 @@ def _commit_line():
 def console_input(ch: uint32):
     c: uint32 = ch & 255
     con_rx_bytes = con_rx_bytes + 1
+    if con_mode == CON_WIRE:
+        _ring_put(c)
+        wq_wake_all(&con_wq)
+        sched_poll_wake()
+        return
     if con_mode == CON_RAW:
         # Ctrl-C ends the foreground process group, if a shell has named one
         # and it has members; else the processes a waiting shell is waiting

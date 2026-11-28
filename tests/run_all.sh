@@ -11,6 +11,9 @@
 #   6. an interactive monitor session, scripted
 #   7. the fatal-fault report (deliberate undefined instruction before the
 #      scheduler runs)
+#   8. the shell session (programs, pipelines, namespaces, device files, 9P
+#      mounts)
+#   9. 9P from the host: tests/9p/host_test.py against `exportfs /dev/console`
 # Exit status is non-zero if anything fails.  Every check is counted: a check
 # that does not run makes the count wrong, which is a failure.
 set -uo pipefail
@@ -27,7 +30,7 @@ OBJCOPY="${OBJCOPY:-llvm-objcopy}"
 B="${HMICRO_B:-build}"
 MACHINE="${HMICRO_MACHINE:-mps2-an500}"
 XP="${HMICRO_XP:-60}"
-ONLY="${HMICRO_ONLY:-1 2 3 4 5 6 7 8}"
+ONLY="${HMICRO_ONLY:-1 2 3 4 5 6 7 8 9}"
 want() { case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 # An image ends its run by printing "[hmicro] exit status N" and requesting a
 # system reset; -no-reboot turns the reset into the end of the emulator run.
@@ -588,6 +591,77 @@ if wait_for "hamsh\$ "; then
     shn 'echo echo Typed-Via-Dev-Keys > /dev/keys'; sleep 1.5
     sh 'echo after-dev-keys'
     sh 'ls /dev | wc'
+    # ---- milestone 5: 9P.  (c) Hamnix's demo server and exportfs, posted in
+    # /srv by themselves and mounted by the shell; (a) the kernel's client
+    # behind every name below the mount points
+    sh 'help'
+    sh 'p9srv_demo post demo &'
+    demopid="$(tr -d '\r' < $QLOG | sed -n 's/^\[[0-9]*\] \([0-9][0-9]*\)$/\1/p' | tail -1)"
+    sh 'sleep 1'
+    sh 'ls /srv'
+    sh 'mount /srv/demo /n/demo'
+    sh 'cat /n/demo/hello'
+    sh 'cat /proc/self/ns | grep demo'
+    sh 'unmount /n/demo'
+    sh 'cat /n/demo/hello'
+    sh 'mount /srv/demo /n/d2 as dlabel'
+    sh 'cat /n/d2/hello | tr a-z A-Z'
+    sh 'cat /proc/self/ns | grep d2'
+    sh 'unmount dlabel'
+    sh "kill ${demopid:-0}"
+    sh 'rm /srv/demo'
+    sh 'mkdir /tmp/ex'
+    sh 'echo exported-one > /tmp/ex/a'
+    sh 'mkdir /tmp/ex/sub'
+    sh 'echo exported-deep > /tmp/ex/sub/d'
+    sh 'exportfs -s ex /tmp/ex &'
+    expid="$(tr -d '\r' < $QLOG | sed -n 's/^\[[0-9]*\] \([0-9][0-9]*\)$/\1/p' | tail -1)"
+    sh 'sleep 1'
+    sh 'mount /srv/ex /n/ex'
+    sh 'echo p9-list ; ls /n/ex'
+    sh 'cat /n/ex/a /n/ex/sub/d'
+    sh 'echo through-the-mount > /n/ex/new'       # a built-in's redirection: open with create
+    sh 'echo appended >> /n/ex/new'
+    sh 'echo p9-new ; cat /tmp/ex/new'
+    sh 'seq 5 > /n/ex/five'                       # a program's: openchan, bound at its /fd/1
+    sh 'seq 6 9 >> /n/ex/five'
+    sh 'echo p9-five ; wc < /n/ex/five'
+    sh 'ls /nonexistent > /n/ex/errs 2>&1'
+    sh 'echo p9-errs ; cat /tmp/ex/errs'
+    sh 'cp /bin/hello /n/ex/hello'
+    sh '/n/ex/hello ran-from-9p'
+    sh 'mkdir /n/ex/made'
+    sh 'rm /n/ex/a'
+    sh 'mv /n/ex/new /n/ex/renamed'
+    sh 'echo p9-after ; ls /tmp/ex'
+    sh 'cat /n/ex/gone'
+    # a mount as a union member, and a mount made in a child's namespace
+    sh 'mkdir /tmp/loc'
+    sh 'echo local-file > /tmp/loc/lfile'
+    sh 'bind /tmp/loc /tmp/u9'
+    sh 'mount -a /srv/ex /tmp/u9'
+    sh 'echo p9-union ; ls /tmp/u9 | wc ; cat /tmp/u9/lfile /tmp/u9/sub/d'
+    sh 'cat /proc/self/ns | grep u9'
+    sh 'unmount /tmp/u9'
+    sh 'ns { mount /srv/ex /n/inner ; cat /n/inner/sub/d | tr a-z A-Z }'
+    sh 'cat /n/inner/sub/d'
+    # the server ends while it is mounted: an error, not a hang
+    sh "kill ${expid:-0}"
+    sh 'sleep 1'
+    sh 'cat /n/ex/sub/d'
+    sh 'unmount /n/ex'
+    sh 'rm /srv/ex'
+    sh 'echo p9-srv-empty ; ls /srv ; echo p9-srv-end'
+    # exportfs leaves by itself when its connection is closed
+    sh 'exportfs -s ex2 /tmp/ex &'
+    sh 'sleep 1'
+    sh 'mount /srv/ex2 /n/ex2'
+    sh 'cat /n/ex2/sub/d | wc'
+    sh 'unmount /n/ex2'
+    sh 'rm /srv/ex2'
+    sh 'sleep 1'
+    sh 'echo p9-jobs ; jobs ; echo p9-jobs-end'
+    sh 'echo p9-ps ; ps | grep exportfs ; echo p9-ps-end'
     # power: how often the processor wakes while the system idles at the
     # prompt of a sleeping command, tickless and with the periodic tick;
     # then suspend, ended by a key and by its timer
@@ -706,10 +780,10 @@ expect "shell: suspend 2 -n, ended by its timer after 2000 ms" $S '^woke: timer 
 [ "$(grep -c '^persistent-history-probe$' $S)" = 2 ] && ok "shell: history survives exit: the next shell recalls a line of the previous one" || bad "shell: persistent-history-probe seen $(grep -c '^persistent-history-probe$' $S) times, expected 2"
 expect "shell: a pasted block of 60 command lines (2 KB in one write): every line ran, in order" $S '^60 180 900$'
 # milestone 5: namespaces
-expect "ns: the shell's namespace is the boot namespace (six binds)" $S '^6 18 86$'
-expect "ns: a bind made inside \`ns { }\` (a child after rfork RFNAMEG) works there: file read, seven binds" $S '^7 21 111$'
+expect "ns: the shell's namespace is the boot namespace (seven binds)" $S '^7 21 101$'
+expect "ns: a bind made inside \`ns { }\` (a child after rfork RFNAMEG) works there: file read, eight binds" $S '^8 24 126$'
 expect "ns: ... and is invisible to the parent" $S '^cat: cannot open /tmp/un/afile: .*file does not exist'
-[ "$(grep -c '^6 18 86$' $S)" = 2 ] && ok "ns: the parent's namespace is unchanged after the block" || bad "ns: '6 18 86' seen $(grep -c '^6 18 86$' $S) times, expected 2"
+[ "$(grep -c '^7 21 101$' $S)" = 2 ] && ok "ns: the parent's namespace is unchanged after the block" || bad "ns: '7 21 101' seen $(grep -c '^7 21 101$' $S) times, expected 2"
 expect "union: a name both directories have comes from the first" $S '^from-a$'
 expect "union: a name only the second has is found there" $S '^only-b$'
 expect "union: the listing is both directories' names, each once (shared, afile, bfile)" $S '^3 3 19$'
@@ -719,7 +793,7 @@ expect "ns: /proc/self/ns lists the union in bind order with its flags" $S "^bin
 expect "ns: replay: the script ran" $S '^replay-status 0$'
 sed -n '/^saved-ns-follows$/,/^replayed-ns-follows$/p' $S | grep '^bind\|^mount' > $B/ns.saved
 sed -n '/^replayed-ns-follows$/,/^ns-texts-end$/p' $S | grep '^bind\|^mount' > $B/ns.replayed
-[ "$(grep -c . $B/ns.saved)" = 9 ] && cmp -s $B/ns.saved $B/ns.replayed && ok "ns: the 9 lines of /proc/self/ns, run in an empty namespace (\`ns clean\`), build a namespace that prints the same 9 lines" \
+[ "$(grep -c . $B/ns.saved)" = 10 ] && cmp -s $B/ns.saved $B/ns.replayed && ok "ns: the 10 lines of /proc/self/ns, run in an empty namespace (\`ns clean\`), build a namespace that prints the same 10 lines" \
     || bad "ns: replay differs: $(grep -c . $B/ns.saved) lines saved, $(grep -c . $B/ns.replayed) replayed"
 grep -q '^3 11 82$' $S && grep -q '^4 14 109$' $S && ok "ns: /proc/PID/ns of a job started before a bind has 3 lines naming /tmp, the shell's own has 4" || bad "ns: the job's and the shell's /proc/<pid>/ns do not differ as expected"
 expect "ns: unmount removes the union" $S '^cat: cannot open /tmp/un/shared: .*file does not exist'
@@ -748,7 +822,35 @@ expect "devices: ls /dev/sht4x" $S '^temperature$'
 expect "devices: text written to /dev/screen/text is on the screen (read back from /dev/screen/text)" $S '^Shown-On-Panel$'
 expect "devices: /dev/screen/data is the frame buffer, 48000 bytes" $S '^[0-9]+ [0-9]+ 48000$'
 expect "devices: text written to /dev/keys is typed on the emulated key matrix and runs as a command" $S '^Typed-Via-Dev-Keys$'
-expect "devices: ls /dev: console, null, zero and seven driver directories and files" $S '^10 10 [0-9]+$'
+expect "devices: ls /dev: console, null, zero, consctl and seven driver directories and files" $S '^11 11 [0-9]+$'
+expect "help: /bin/help names the namespace commands" $S '^  namespace +bind \[-b\|-a\|-c\] SRC NAME +unmount NAME'
+expect "help: ... 9P and the device files" $S '^  9P +exportfs -s N DIR & +mount /srv/N NAME'
+# milestone 5: 9P
+after() { grep -A"$2" -m1 "^$1\$" $S | tail -n +2 | tr '\n' ' '; }   # the $2 lines after the first line $1
+seq_is() { [ "$(after "$1" "$2")" = "$3" ] && ok "$4" || bad "$4 (got '$(after "$1" "$2")')"; }
+expect "9p: Hamnix's p9srv_demo posts itself in /srv" $S '^demo$'
+expect "9p: mount /srv/demo /n/demo; cat /n/demo/hello (Twalk, Topen, Tread through the kernel's client)" $S '^p9demo says hi$'
+expect "9p: /proc/self/ns shows the mount as a command" $S '^mount /srv/demo /n/demo$'
+expect "9p: unmount: the name is gone" $S '^cat: cannot open /n/demo/hello: .*file does not exist'
+expect "9p: mounted again under a label" $S '^P9DEMO SAYS HI$'
+expect "9p: ... which /proc/self/ns shows" $S '^mount /srv/demo /n/d2 as dlabel$'
+seq_is p9-list 2 "a sub " "9p: exportfs -s ex /tmp/ex, mounted: ls /n/ex lists the server's directory (a, sub)"
+expect "9p: a file read through the mount" $S '^exported-one$'
+expect "9p: ... and one in a subdirectory (a two-name walk)" $S '^exported-deep$'
+seq_is p9-new 2 "through-the-mount appended " "9p: a file created through the mount (Tcreate, Twrite), then appended to, is in the server's directory"
+seq_is p9-five 1 "9 9 18 " "9p: a program's output redirected onto the mount with > and >>, read back with <"
+seq_is p9-errs 1 "ls: listdir failed: /nonexistent " "9p: > file 2>&1 onto the mount"
+expect "9p: a program copied to the mount runs from it" $S '^  arg: ran-from-9p$'
+seq_is p9-after 6 "renamed sub five errs hello made " "9p: mkdir, rm and mv through the mount"
+expect "9p: a name the server does not have" $S '^cat: cannot open /n/ex/gone: .*file does not exist'
+seq_is p9-union 3 "7 7 39 local-file exported-deep " "9p: mount -a adds the server after a local directory: one listing, files of both"
+expect "9p: ... /proc/self/ns shows the flag" $S '^mount -a /srv/ex /tmp/u9$'
+expect "9p: a mount made inside ns { } works there" $S '^EXPORTED-DEEP$'
+expect "9p: ... and is not in the shell's namespace" $S '^cat: cannot open /n/inner/sub/d: .*file does not exist'
+expect "9p: the server killed while mounted: an error, not a hang" $S '^cat: cannot open /n/ex/sub/d: .*(the server has gone|file does not exist)'
+seq_is p9-srv-empty 1 "p9-srv-end " "9p: rm /srv/NAME removes a posted server: /srv is empty"
+seq_is p9-jobs 1 "p9-jobs-end " "9p: exportfs ends by itself when its mount and its /srv name are gone; no job is left"
+seq_is p9-ps 1 "p9-ps-end " "9p: ... and no exportfs process"
 # the same session as the fake e-paper panel showed it
 P=$B/panel-shell.txt
 python3 -I tests/display/panel2png.py $B/panel-shell.bin $B/panel-shell --font third_party/font8x8/font8x8_basic.h --yscale 2 --keep 3 > $P 2>&1; prc=$?
@@ -763,6 +865,17 @@ awk '/^text:$/{f=1; next} f' $P | grep -q '^60 180 900$' && awk '/^text:$/{f=1; 
 nmark="$(grep -c '^0 0 0$' $S)"
 [ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"
 
+fi
+if want 9; then
+echo "[test] === 9. 9P from the host: the device's own tree exported over its console line (tests/9p/host_test.py, tools/hm9p.py)"
+# The host side is a 9P2000 client written with the Python standard library
+# only.  It types \`exportfs /dev/console\` at the shell, speaks 9P on the
+# emulated UART (QEMU's stdio here), and ends the session with four zero
+# bytes; every check is a line of its output.
+python3 -I tests/9p/host_test.py --cmd "$QEMU $QFLAGS $SDCARD -kernel $B/hmicro.elf" $B/user/hello --halt > $B/9p-host.txt 2>&1; hrc=$?
+cat $B/9p-host.txt
+nh="$(grep -c '^\[9p-host\] ok: ' $B/9p-host.txt)"
+[ $hrc -eq 0 ] && [ "$nh" = 16 ] && ok "9p: host client against exportfs on the console: $nh checks" || bad "9p: host client: status $hrc, $nh of 16 checks ok"
 fi
 echo
 if [ $fails -eq 0 ]; then echo "[test] ALL TESTS PASSED"; exit 0; fi

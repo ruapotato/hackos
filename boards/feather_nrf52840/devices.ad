@@ -9,9 +9,9 @@
 # boards/mps2_an500/devices.ad does for the emulated ones.
 
 
-from board.board import led_pin
+from board.board import led_pin, led_heartbeat, PIN_BLUE_LED, PIN_BUTTON
 from soc.nrf52840.soc import P0_BASE, P1_BASE
-from soc.nrf52.gpio import gpio_set, gpio_clear, gpio_out_level
+from soc.nrf52.gpio import gpio_set, gpio_clear, gpio_out_level, gpio_read, gpio_is_output, gpio_output, gpio_input, DRIVE_S0S1, PULL_NONE, PULL_UP
 from drivers.gpio.gpiofs import gpiofs_set_board, gpiofs_add
 
 
@@ -24,34 +24,96 @@ def board_input_start() -> int32:
 
 
 # ---- device files of this board (docs/devices.md) -------------------------
-# /dev/gpio/led: the red LED, the pin board.ad found for this Feather (P1.15
-# on the Express).  Reading gives the level the pin is driven to; writing 0
-# or 1 drives it, until the "led" thread toggles it again half a second
-# later (its blinking is the board's sign of life).  UNTESTED ON HARDWARE;
-# in Renode the file reads and writes the GPIO model's OUT register.
-def _led_base() -> uint64:
-    if led_pin >= 32:
+# The pins as files.  A pin is named by its nRF number, 32 * port + n, as in
+# soc/nrf52/gpio.ad and Adafruit's variant.cpp (P0.26 = 26, P1.15 = 47):
+#
+#     /dev/gpio/red      the red LED (P1.15 on the Express; the pin board.ad
+#                        found for this Feather).  It blinks as the board's
+#                        sign of life until something is written here; from
+#                        then on it is the writer's.
+#     /dev/gpio/blue     the blue LED, P1.10
+#     /dev/gpio/button   the user switch, P1.02: 1 released, 0 pressed
+#     /dev/gpio/<n>      the header pins: 2 3 4 5 28 30 (A4 A5 A0 A1 A3 A2),
+#                        6 7 8 26 27 40 41 (D11 D6 D12 D9 D10 D5 D13),
+#                        10 (D2), 11 12 (SCL SDA), 13 14 15 (MOSI SCK MISO),
+#                        and the two LEDs' pins by number: 42, 47
+#
+# Reading gives the level an output is driven to, or the level at an input;
+# "1" and "0" drive the pin (and make it an output), "in" makes it an input
+# (no pull), "out" an output at the level it had.  Not files: the console's
+# pins (24, 25), the crystal, reset, the QSPI flash, the NeoPixel.
+# UNTESTED ON HARDWARE; in Renode the files read and write the GPIO model.
+PIN_RED: uint32 = 0xFF              # as a file argument: "the pin board.ad found"
+
+
+def _base(pin: uint32) -> uint64:
+    if pin >= 32:
         return P1_BASE
     return P0_BASE
 
 
-def _led_get(pin: uint32) -> uint32:
-    return gpio_out_level(_led_base(), led_pin)
+def _pin(pin: uint32) -> uint32:
+    if pin == PIN_RED:
+        return led_pin
+    return pin
 
 
-def _led_set(pin: uint32, level: uint32) -> int32:
-    if level != 0:
-        gpio_set(_led_base(), led_pin)
-    else:
-        gpio_clear(_led_base(), led_pin)
+def _pin_get(pin: uint32) -> uint32:
+    p: uint32 = _pin(pin)
+    if gpio_is_output(_base(p), p) != 0:
+        return gpio_out_level(_base(p), p)
+    return gpio_read(_base(p), p)
+
+
+def _pin_set(pin: uint32, level: uint32) -> int32:
+    p: uint32 = _pin(pin)
+    if p == PIN_BUTTON:
+        return -1
+    if p == led_pin:
+        led_heartbeat = 0               # the LED is the user's now
+    gpio_output(_base(p), p, level, DRIVE_S0S1)
     return 0
 
 
-def _led_dir(pin: uint32, out: uint32) -> int32:
-    return 0                            # it stays an output
+def _pin_dir(pin: uint32, out: uint32) -> int32:
+    p: uint32 = _pin(pin)
+    if p == PIN_BUTTON:
+        return -1
+    if p == led_pin:
+        led_heartbeat = 0
+    if out != 0:
+        gpio_output(_base(p), p, gpio_out_level(_base(p), p), DRIVE_S0S1)
+    else:
+        gpio_input(_base(p), p, PULL_NONE)
+    return 0
 
 
 def board_devices_start() -> int32:
-    gpiofs_set_board(_led_get, _led_set, _led_dir)
-    gpiofs_add("gpio/led", 0)
+    gpiofs_set_board(_pin_get, _pin_set, _pin_dir)
+    gpio_output(P1_BASE, PIN_BLUE_LED, 0, DRIVE_S0S1)
+    gpio_input(P1_BASE, PIN_BUTTON, PULL_UP)
+    gpiofs_add("gpio/red", PIN_RED)
+    gpiofs_add("gpio/blue", PIN_BLUE_LED)
+    gpiofs_add("gpio/button", PIN_BUTTON)
+    gpiofs_add("gpio/2", 2)
+    gpiofs_add("gpio/3", 3)
+    gpiofs_add("gpio/4", 4)
+    gpiofs_add("gpio/5", 5)
+    gpiofs_add("gpio/6", 6)
+    gpiofs_add("gpio/7", 7)
+    gpiofs_add("gpio/8", 8)
+    gpiofs_add("gpio/10", 10)
+    gpiofs_add("gpio/11", 11)
+    gpiofs_add("gpio/12", 12)
+    gpiofs_add("gpio/13", 13)
+    gpiofs_add("gpio/14", 14)
+    gpiofs_add("gpio/15", 15)
+    gpiofs_add("gpio/26", 26)
+    gpiofs_add("gpio/27", 27)
+    gpiofs_add("gpio/28", 28)
+    gpiofs_add("gpio/30", 30)
+    gpiofs_add("gpio/40", 40)
+    gpiofs_add("gpio/41", 41)
+    gpiofs_add("gpio/42", 42)
+    gpiofs_add("gpio/47", 47)
     return 0

@@ -2,7 +2,9 @@
 <!-- Copyright (C) 2026 David Hamner -->
 # Namespaces
 
-Status: milestone 5, emulators only. Every Hamnix Micro process looks names up in
+Status: milestone 5, **emulators only** (QEMU's Cortex-M7 and Cortex-M4
+machines; the Feather nRF52840 image in Renode). The namespace code has not
+run on a board yet. Every Hamnix Micro process looks names up in
 its own namespace: a small table that says which server stands behind which
 name. `bind` and `mount` change the table of the process that calls them,
 and nobody else's unless they share it. This is Plan 9's model as Hamnix
@@ -21,11 +23,13 @@ bind '#t' /
 bind '#c' /dev
 bind '#r' /bin
 bind '#p' /proc
+bind '#s' /srv
 bind '#f' /sd
 bind '#d' /fd
 ```
 
-That is the boot namespace: six servers bound to six names. A server is
+That is the boot namespace: seven servers bound to seven names (six on a
+board without a card: no `/sd`). A server is
 named with `#` and a letter (quote it: `#` starts a comment in the shell):
 
 | Name | Server |
@@ -76,6 +80,13 @@ hamsh$ ls /tmp/x
 greeting
 extra
 ```
+
+A union is made of what was *bound* at the name, and nothing else (Hamnix's
+rule; Plan 9 would keep the directory that was there as a member). So `bind
+-a /tmp/b /tmp/x` on a `/tmp/x` that nothing was bound at leaves only
+`/tmp/b` visible there; bind the directory onto itself first (`bind /tmp/x
+/tmp/x`) to keep it in the union. `mount -a /srv/name /tmp/x` adds a 9P
+server as a member the same way ([`9p.md`](9p.md)).
 
 * **Lookup** tries the members in order: `-b` members, the most recently
   bound first; then the plain one; then `-a` members in the order bound. The
@@ -143,6 +154,25 @@ hamsh$ echo 'cat /proc/self/ns' >> /tmp/replay
 hamsh$ echo '}' >> /tmp/replay
 hamsh$ echo 'exit 0' >> /tmp/replay
 hamsh$ hamsh /tmp/replay
+```
+
+### On the Feather nRF52840
+
+The same commands work there (the image in Renode; not yet on the board).
+RAM is the limit: every file in `/` is kernel heap, and a block inside `ns
+{ }` runs in a child that borrows the shell's memory, so keep the files
+small and remove them afterwards.
+
+```
+hamsh$ cat /proc/self/ns                      # six lines: no /sd
+hamsh$ mkdir /tmp/mybin
+hamsh$ cat /bin/hello > /tmp/mybin/seq        # (cp needs a 20 KB block; cat does not)
+hamsh$ ns { bind -b /tmp/mybin /bin ; seq 3 } # seq is hello in there
+hamsh$ seq 3                                  # ... and seq out here
+hamsh$ ns clean { bind '#c/gpio' /pins ; bind '#r' /bin ; ls /pins }
+hamsh$ bind '#c/gpio' /led                    # the pins under a second name
+hamsh$ echo 1 > /led/blue                     # the blue LED
+hamsh$ unmount /led
 ```
 
 ## How it works

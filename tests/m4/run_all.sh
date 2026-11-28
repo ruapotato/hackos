@@ -24,7 +24,7 @@ n="$(llvm-nm $B/user/hamsh.elf | grep -cE ' T __aeabi_d(add|mul|div)$')"
 llvm-objdump -d --mcpu=cortex-m4 $B/user/hamsh.elf | grep -qE '\sv(add|sub|mul|div)\.f64' && bad "hamsh has double-precision FPU instructions" || ok "hamsh: no double-precision FPU instruction"
 cpu="$(llvm-readelf -A $B/ktest.o 2>/dev/null | grep -A1 'TagName: CPU_name' | sed -n 's/.*Value: //p')"
 [ "$cpu" = cortex-m4 ] && ok "ktest.o is built for $cpu" || bad "ktest.o is built for '$cpu'"
-HMICRO_B=$B HMICRO_MACHINE=mps2-an386 HMICRO_XP=21 HMICRO_ONLY="5 8" ADDER="${ADDER:-../adder}" bash tests/run_all.sh; rc=$?
+HMICRO_B=$B HMICRO_MACHINE=mps2-an386 HMICRO_XP=21 HMICRO_ONLY="5 8 9" ADDER="${ADDER:-../adder}" bash tests/run_all.sh; rc=$?
 [ $rc -eq 0 ] || fails=$((fails+1))
 echo
 if [ $fails -eq 0 ]; then echo "[test-m4] ALL CHECKS PASSED"; exit 0; fi

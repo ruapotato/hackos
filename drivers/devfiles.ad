@@ -7,9 +7,12 @@
 #                     the text of /proc/power); write: "tickless 0" or
 #                     "tickless 1"
 #   /dev/i2c/0/ctl, /dev/i2c/0/data     the I2C bus (drivers/i2c/i2cfs.ad)
+#   /dev/consctl      write: "rawon", "rawoff", "wireon", "wireoff": the
+#                     console's mode (drivers/tty/console.ad)
 
 from mm.slab import kmalloc, kfree
 from kernel.power import power_render, power_ctl
+from drivers.tty.console import console_ctl
 from drivers.i2c.i2cfs import i2cfs_init
 from fs.devtree import devtree_add, devtree_text, DtIn, dt_in, dt_end
 
@@ -36,6 +39,17 @@ def _pw_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
     return cast[int64](n)
 
 
+def _cc_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    if console_ctl(buf, n) < 0:
+        return -22
+    return cast[int64](n)
+
+
 def devfiles_init():
+    devtree_add("consctl", 0, cast[uint64](&_cc_wr), 0)
     devtree_add("power/ctl", cast[uint64](&_pw_rd), cast[uint64](&_pw_wr), 0)
     i2cfs_init()

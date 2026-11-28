@@ -124,7 +124,42 @@ sh free
 # milestone 5: drivers as files (this board: the power file, the I2C bus
 # with nothing on it, the red LED)
 sh ls /dev
-sh cat /dev/gpio/led | tr 10 HL
+sh cat /dev/gpio/red | tr 10 HL
+sh echo 1 > /dev/gpio/blue
+sh echo blue-on ; cat /dev/gpio/blue ; cat /dev/gpio/42
+sh echo 0 > /dev/gpio/blue
+sh echo blue-off ; cat /dev/gpio/blue
+sh echo 1 > /dev/gpio/red
+sh sleep 2
+sh echo red-stays-on ; cat /dev/gpio/red ; cat /dev/gpio/47
+sh echo 0 > /dev/gpio/47
+sh echo red-off ; cat /dev/gpio/red
+sh echo 1 > /dev/gpio/26
+sh echo pin26-out ; cat /dev/gpio/26
+sh echo 1 > /dev/gpio/button
+sh ls /dev/gpio | wc
+sh help
+# 9P: exportfs posted in /srv, mounted by the shell (the kernel's client)
+sh mkdir /tmp/ex
+sh echo exported-one > /tmp/ex/a
+sh exportfs -s ex /tmp/ex &
+sh sleep 1
+sh mount /srv/ex /n/ex
+sh echo p9-list ; ls /n/ex ; cat /n/ex/a
+sh echo through-the-mount > /n/ex/new
+sh seq 5 >> /n/ex/new
+sh echo p9-new ; wc < /tmp/ex/new
+sh cat /bin/hello > /n/ex/hello
+sh /n/ex/hello ran-from-9p
+sh cat /proc/self/ns
+sh ns { mount /srv/ex /n/inner ; echo p9-inner ; cat /n/inner/a }
+sh cat /n/inner/a
+sh ps
+sh unmount /n/ex
+sh cat /n/ex/a
+sh rm /srv/ex
+sh sleep 1
+sh echo p9-jobs ; jobs ; echo p9-jobs-end
 sh echo "r 44 1" > /dev/i2c/0/ctl
 sh cat /dev/i2c/0/ctl
 sh cat /dev/power/ctl | grep tickless

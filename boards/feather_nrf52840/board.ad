@@ -71,6 +71,9 @@ CONSOLE_XONXOFF: uint32 = 1          # unchecked: policy
 CONSOLE_RTS_PIN: uint32 = 0xFF       # unchecked: policy -- no RTS line by default
 
 led_pin: uint32 = 47
+led_heartbeat: uint32 = 1          # the "led" thread blinks the red LED while this is set
+PIN_BLUE_LED: uint32 = 42            # unchecked: P1.10 = blue LED D4 (Adafruit variant.cpp, read 2026-11-28)
+PIN_BUTTON: uint32 = 34              # unchecked: P1.02 = user switch D7, to ground (variant.cpp)
 board_id: uint32 = 0
 boot_reset_reason: uint32 = 0
 
@@ -336,8 +339,10 @@ def board_code_loaded(base: uint64, size: uint64):
 
 
 # ---- after kernel_init: the boot report and the heartbeat -----------------
+# The red LED blinks as the board's sign of life until a program takes the
+# pin (a write to /dev/gpio/red: devices.ad clears led_heartbeat).
 def _led_main(arg: uint64) -> int64:
-    while 1 == 1:
+    while led_heartbeat != 0:
         gpio_toggle(_led_port(), led_pin)
         thread_sleep(500)
     return 0

@@ -14,6 +14,7 @@ GPIO_OUT: uint64 = 0x504             # hdr: NRF_GPIO_Type.OUT
 GPIO_OUTSET: uint64 = 0x508          # hdr: NRF_GPIO_Type.OUTSET
 GPIO_OUTCLR: uint64 = 0x50C          # hdr: NRF_GPIO_Type.OUTCLR
 GPIO_IN: uint64 = 0x510              # hdr: NRF_GPIO_Type.IN
+GPIO_DIR: uint64 = 0x514             # hdr: NRF_GPIO_Type.DIR
 GPIO_DIRSET: uint64 = 0x518          # hdr: NRF_GPIO_Type.DIRSET
 GPIO_DIRCLR: uint64 = 0x51C          # hdr: NRF_GPIO_Type.DIRCLR
 GPIO_PIN_CNF0: uint64 = 0x700        # hdr: NRF_GPIO_Type.PIN_CNF[0]
@@ -80,3 +81,9 @@ def gpio_read(port_base: uint64, pin: uint32) -> uint32:
 # disconnects the input buffer, so gpio_read() of such a pin reads 0.
 def gpio_out_level(port_base: uint64, pin: uint32) -> uint32:
     return (mmio_read32(port_base + GPIO_OUT) >> (pin & 31)) & 1
+
+
+# Is the pin an output now (its bit of DIR, which PIN_CNF's DIR field
+# mirrors)?
+def gpio_is_output(port_base: uint64, pin: uint32) -> uint32:
+    return (mmio_read32(port_base + GPIO_DIR) >> (pin & 31)) & 1

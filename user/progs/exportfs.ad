@@ -7,8 +7,15 @@
 #                                 on it; then, in the shell:
 #                                     mount /srv/NAME /n/somewhere
 #     exportfs DEVICE [DIR]       serve DIR over a device file that carries
-#                                 bytes both ways (/dev/eia1: a serial port),
-#                                 for a 9P client on another machine
+#                                 bytes both ways, for a 9P client on another
+#                                 machine.  `exportfs /dev/console` borrows
+#                                 the console's serial line: the console is
+#                                 switched to its wire mode (/dev/consctl),
+#                                 9P is spoken until something arrives that
+#                                 is not 9P (the client ends the session with
+#                                 four zero bytes), and then the shell has
+#                                 its console back.  tools/hm9p.py is such a
+#                                 client (docs/9p.md).
 #
 # DIR defaults to /.  What the client sees is what this process sees: its
 # namespace, so `ns { bind ... ; exportfs ... }` serves a tailored tree.
@@ -33,6 +40,9 @@ extern def sys_socketpair(domain: int32, type: int32, protocol: int32, sv: Ptr[i
 extern def sys_srv_post(name: Ptr[uint8], srvfd: int32) -> int32
 
 MSIZE: uint32 = 4120                # one message: 4096 bytes of data + the largest header
+DEV_MSIZE: uint32 = 280             # ... over a device: a whole request must fit a serial
+                                    # driver's receive buffer before the sender is held off
+                                    # (the console's is 1024 bytes, throttled at 512)
 IOHDR: uint32 = 24
 NFID: uint32 = 16
 PATHMAX: uint32 = 128
@@ -58,6 +68,8 @@ rfd: int32 = 0
 wfd: int32 = 1
 msize: uint32 = 4120
 served: uint64 = 0
+max_msize: uint32 = 4120
+wire: int32 = -1                    # /dev/consctl, when the console is the transport
 
 
 def slen(s: Ptr[uint8]) -> uint32:
@@ -65,6 +77,13 @@ def slen(s: Ptr[uint8]) -> uint32:
     while s[n] != 0:
         n = n + 1
     return n
+
+
+def str_eq(a: Ptr[uint8], b: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while a[i] != 0 and a[i] == b[i]:
+        i = i + 1
+    return cast[uint32](a[i] == b[i])
 
 
 def say(s: Ptr[uint8]):
@@ -205,8 +224,8 @@ def t_version() -> int32:
     m: uint32 = g32(&rx[0], 7)
     if m < 256:
         return rerror("msize too small")
-    if m > MSIZE:
-        m = MSIZE
+    if m > max_msize:
+        m = max_msize
     msize = m
     i: uint32 = 0
     while i < NFID:
@@ -575,6 +594,12 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             return 1
         rfd = fd
         wfd = fd
+        max_msize = DEV_MSIZE
+        if str_eq(a1, "/dev/console") != 0:
+            wire = sys_open_mode("/dev/consctl", 1)
+            if wire < 0:
+                say("exportfs: no /dev/consctl\n")
+                return 1
     if argc > dirarg:
         d: Ptr[uint8] = cast[Ptr[uint8]](argv[dirarg])
         if slen(d) >= PATHMAX or d[0] != 47:
@@ -584,9 +609,16 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     if stat_of(&root[0]) < 0 or is_dir() == 0:
         say("exportfs: not a directory\n")
         return 1
+    if wire >= 0:
+        say("exportfs: 9P on the console until four zero bytes arrive\n")
+        sys_write(wire, "wireon", 6)
     r: int32 = 1
     while r > 0:
         r = serve_one()
+    if wire >= 0:
+        sys_write(wire, "wireoff", 7)
+        say("exportfs: the console is a console again\n")
+        return 0
     if r < 0:
         say("exportfs: a message that is not 9P; giving up\n")
         return 1

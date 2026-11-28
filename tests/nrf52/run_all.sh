@@ -102,5 +102,6 @@ step image python3 -I tests/nrf52/check_image.py tests/nrf52/feather_facts.txt $
 step uf2conv uf2conv
 step code code
 step renode bash tests/nrf52/renode_session.sh
+step renode9p bash tests/nrf52/renode_9p.sh
 echo "[nrf52] $failed failed steps"
 exit $failed
