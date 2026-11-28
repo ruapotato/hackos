@@ -464,6 +464,12 @@ def board_halt(code: uint32):
     uarte_flush(UARTE0_BASE)
     if code == 0:
         return
+    if code == 87:
+        # `halt uf2`: POWER.GPREGRET = DFU_MAGIC_UF2_RESET (0x57, Adafruit
+        # bootloader main.c), which survives the reset that follows; the
+        # bootloader then stays in its UF2 drive mode.
+        mmio_write32(0x4000051C, 0x57)                   # unchecked: NRF_POWER->GPREGRET
+        return
     n: uint32 = code
     if n > 9:
         n = 9

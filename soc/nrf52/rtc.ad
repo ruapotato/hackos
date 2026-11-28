@@ -55,6 +55,8 @@ rtc_long: uint32 = 0                     # the tick is stopped (rtc_tick_stop_fo
 rtc_late: uint64 = 0                     # handler runs that delivered more than one tick
 rtc_dropped: uint64 = 0                  # ticks dropped after a stall
 rtc_stops: uint64 = 0                    # tickless stretches
+rtc_reaims: uint64 = 0                   # compares moved because the tick was closer than 3 counts
+rtc_pends: uint64 = 0                    # compares given up on: the interrupt was pended instead
 
 
 # Read COUNTER and extend it.
@@ -75,12 +77,31 @@ def _due_ticks(now: uint64) -> uint64:
     return now * cast[uint64](rtc_hz) / cast[uint64](LFCLK_HZ) - rtc_tick_no
 
 
-# Aim CC[0] at tick number k (at least 2 counts ahead).
+# Aim CC[0] at tick number k.  The product specification: a CC equal to
+# COUNTER or COUNTER + 1 may not raise COMPARE, and then nothing happens
+# until the 24-bit counter comes round again, 512 s later.  Found on the
+# first real board: `sleep 2` never returned and the clock stood still,
+# because the counter had moved on between the read that the old "at least
+# now + 2" was computed from and the write (the 64-bit divisions in between
+# are software on this core and take longer than a count, 30.5 us; an
+# emulator's counter does not move meanwhile).  So: write, read the counter
+# again, and accept only a CC that is still 2 or more ahead; after a few
+# tries make the handler run now by pending the interrupt at the NVIC (the
+# peripheral's id, bits 12..17 of its address, is its interrupt number).
 def _aim(base: uint64, k: uint64, now: uint64):
     cc: uint64 = _due_count(k)
-    if cc < now + 2:
-        cc = now + 2
-    mmio_write32(base + RTC_CC0, cast[uint32](cc) & RTC_COUNTER_MASK)
+    tries: uint32 = 0
+    while tries < 4:
+        c: uint64 = _now(base)
+        if cc < c + 3:
+            cc = c + 3
+            rtc_reaims = rtc_reaims + 1
+        mmio_write32(base + RTC_CC0, cast[uint32](cc) & RTC_COUNTER_MASK)
+        if cc >= _now(base) + 2:
+            return
+        tries = tries + 1
+    rtc_pends = rtc_pends + 1
+    mmio_write32(0xE000E200, cast[uint32](1) << cast[uint32]((base >> 12) & 0x1F))    # unchecked: NVIC ISPR0 (ARMv7-M); nRF52 interrupt number = peripheral id
 
 
 def rtc_tick_start(base: uint64, hz: uint32):
@@ -177,9 +198,11 @@ def rtc_suspend(base: uint64, ms: uint64, wake_irqs: uint32, rtc_irq_bit: uint32
         nxt: uint64 = now + 0x400000
         if ms != 0 and target < nxt:
             nxt = target
-        if nxt < now + 2:
-            nxt = now + 2
+        if nxt < now + 3:
+            nxt = now + 3
         mmio_write32(base + RTC_CC0, cast[uint32](nxt) & RTC_COUNTER_MASK)
+        if nxt < _now(base) + 2:
+            continue                    # the counter ran past it: aim again (see _aim)
         mmio_write32(base + RTC_EVENTS_COMPARE0, 0)
         mmio_read32(base + RTC_EVENTS_COMPARE0)
         mmio_write32(0xE000E280, rtc_irq_bit)               # unchecked: NVIC ICPR0 -- forget an earlier compare

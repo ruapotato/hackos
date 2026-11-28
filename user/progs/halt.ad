@@ -15,5 +15,10 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         while s[i] >= 48 and s[i] <= 57:
             code = code * 10 + cast[uint64](s[i]) - 48
             i = i + 1
+        # `halt uf2`: on a board with a UF2 bootloader, restart into its
+        # drive so that a new image can be copied without pressing a button
+        # (status 87 = 0x57, the magic Adafruit's bootloader looks for).
+        if s[0] == 117 and s[1] == 102 and s[2] == 50 and s[3] == 0:
+            code = 87
     hmicro_syscall(518, code, 0, 0, 0, 0, 0)
     return 1

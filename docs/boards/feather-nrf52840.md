@@ -57,6 +57,18 @@ status 139 (the MPU on the real Cortex-M4). Not yet run on the board:
 anything added in milestone 4 (the editor, the extra programs, tickless
 idle and suspend, pasted input), Ctrl-C, timing accuracy, current draw.
 
+Second fault found on the board (2026-11-28): `sleep 2` never returned and
+`/proc/uptime` stood still. The RTC compare for the next tick could be
+written when the counter had already moved to within one count of it, and
+then COMPARE does not fire until the counter wraps (512 s). `_aim` in
+`soc/nrf52/rtc.ad` now reads the counter back after the write and tries
+again, and pends the interrupt if it cannot get 2 counts ahead. **This fix
+has passed the emulator suites only; it has not run on the board yet.**
+
+`halt uf2` restarts into the bootloader's drive (GPREGRET = 0x57), so a new
+image can be copied without the reset button. Also not yet tried on the
+board.
+
 How it was found without a debugger, for the next board: the bootloader's
 drive exposes the application flash as `CURRENT.UF2`, so a build that
 writes words into a reserved erased page (NVMC) at each start-up stage and
