@@ -1038,6 +1038,26 @@ def test_proc():
     code = run_prog("/bin/ptest", "heap", nul, nul)
     printk1("   ptest heap -> %d\n", cast[uint64](code))
     check(cast[uint32](code == 31), "proc: a heap inside the program's own block (mmap, munmap, reuse, exhaustion)")
+    # a new program must find nothing in its registers (user/progs/regprobe.S
+    # exits with 1 = core register, 2 = FP register, 4 = FPSCR not zero)
+    code = run_prog("/bin/regprobe", nul, nul, nul)
+    printk1("   regprobe -> %d", cast[uint64](code))
+    rc2: int64 = run_prog("/bin/ptest", "regspawn", nul, nul)
+    printk1(", after a spawn by a process that uses the FPU -> %d", cast[uint64](rc2 - 16))
+    rc3: int64 = run_prog("/bin/ptest", "regexec", nul, nul)
+    printk1(", after an exec with every register dirty -> %d\n", cast[uint64](rc3))
+    check(cast[uint32](code == 0 and rc2 == 16), "proc: a spawned program starts with zeroed core and FP registers and FPSCR, whatever its creator left in them")
+    check(cast[uint32](rc3 == 0), "proc: so does a program started by exec (callee-saved and FP registers of the old image are gone)")
+    pargv[0] = cast[uint64]("/bin/ptest")
+    pargv[1] = cast[uint64]("fpspin")
+    fpid: int32 = proc_spawn("/bin/ptest", 2, &pargv[0], 3)
+    dirty: int64 = 0
+    ri: uint32 = 0
+    while ri < 20:
+        dirty = dirty | run_prog("/bin/regprobe", nul, nul, nul)
+        ri = ri + 1
+    proc_waitpid(fpid, 0)
+    check(cast[uint32](fpid > 0 and dirty == 0), "proc: 20 programs started while another process keeps the FP registers busy all see zeros")
     check(cast[uint32](run_prog("/bin/nothing", nul, nul, nul) == -2), "proc: a missing program is ENOENT")
     fd: int32 = vfs_open("/tmp/junk", OWRITE | OTRUNC | OCREATE)
     vfs_write(fd, "this is not an ELF file, not even close ........................", 64)

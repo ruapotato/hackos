@@ -57,3 +57,65 @@ hackos_syscall:
 
         heap_bound hackos_heap_lo, __heap_start
         heap_bound hackos_heap_hi, __heap_end
+
+/* ---- test helpers (linked only into a program that calls them) ---------- */
+/* hackos_test_dirty_fp(): leave a recognisable value in every FP register
+ * and set the FPSCR flags, as a program that computes would.  For the tests
+ * of "a new program starts with clean registers" (user/progs/regprobe.S). */
+        .section .text.hackos_test_dirty_fp, "ax", %progbits
+        .global hackos_test_dirty_fp
+        .thumb_func
+        .type   hackos_test_dirty_fp, %function
+hackos_test_dirty_fp:
+        movw    r0, #0xBEEF
+        movt    r0, #0x5EC0
+        .irp    n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        vmov    s\n, r0
+        .endr
+        mov     r0, #0xF0000000         /* N Z C V */
+        orr     r0, r0, #0x9F           /* the cumulative exception flags */
+        vmsr    fpscr, r0
+        bx      lr
+        .size   hackos_test_dirty_fp, . - hackos_test_dirty_fp
+
+/* hackos_test_exec_dirty(path, argv): execve_env(path, argv, 0) made with
+ * every callee-saved core register and every FP register holding a
+ * recognisable value.  Returns only if the exec failed (the callee-saved
+ * registers are restored then).  Adder convention: path in r0:r1, argv in
+ * r2:r3.                                                                 */
+        .section .text.hackos_test_exec_dirty, "ax", %progbits
+        .global hackos_test_exec_dirty
+        .thumb_func
+        .type   hackos_test_exec_dirty, %function
+hackos_test_exec_dirty:
+        push    {r4-r11, lr}
+        sub     sp, sp, #20             /* a1 (argv) and a2 (envp), 8 bytes each; 4 to stay 8-aligned */
+        str     r2, [sp, #0]
+        movs    r2, #0
+        str     r2, [sp, #4]
+        str     r2, [sp, #8]
+        str     r2, [sp, #12]
+        mov     r2, r0                  /* a0 = path */
+        movs    r3, #0
+        bl      hackos_test_dirty_fp
+        movw    r4, #0x1234
+        movt    r4, #0x5EC0
+        mov     r5, r4
+        mov     r6, r4
+        mov     r7, r4
+        mov     r8, r4
+        mov     r10, r4
+        mov     r11, r4
+#ifndef HACKOS_RWPI
+        mov     r12, r9
+        mov     r9, r4
+#endif
+        movs    r0, #10                 /* SYS_EXECVE */
+        movs    r1, #0
+        svc     #0
+#ifndef HACKOS_RWPI
+        mov     r9, r12
+#endif
+        add     sp, sp, #20
+        pop     {r4-r11, pc}
+        .size   hackos_test_exec_dirty, . - hackos_test_exec_dirty

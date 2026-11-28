@@ -640,7 +640,12 @@ def proc_exec(path: Ptr[uint8], argv: uint64, envp: uint64) -> int32:
     t[0].usp = frame                    # svc #1 returns through this frame
     t[0].svc_exc = 0xFFFFFFFD           # thread mode, process stack, no FP context
     t[0].svc_ctrl = 1
-    t[0].exec_sb = img.sb               # r9 on the way out (switch.S)
+    # The new program's r4-r11 (switch.S loads them on the way out and
+    # zeroes the FP registers): nothing of the old image, r9 = the static
+    # base of an RWPI program.
+    rt_memset(cast[uint64](&t[0].svc_regs[0]), 0, 32)
+    t[0].svc_regs[5] = img.sb
+    t[0].exec_new = 1
     was_vfork: uint32 = t[0].pflags & PF_VFORK
     t[0].pflags = (t[0].pflags & (0xFFFFFFFF ^ PF_VFORK)) | PF_VFDONE
     sched_mpu_apply(cast[uint64](t))

@@ -11,7 +11,7 @@
         .equ    T_SVC_EXC,    16        /* EXC_RETURN of the entering SVC  */
         .equ    T_KSTACK_TOP, 20
         .equ    T_SVC_CTRL,   24        /* caller's CONTROL.nPRIV          */
-        .equ    T_EXEC_SB,    28        /* r9 for a just-exec'ed RWPI program */
+        .equ    T_EXEC_NEW,   28        /* 1: an exec has just loaded a program */
         .equ    T_SVC_REGS,   32        /* caller's r4-r11 at system-call entry */
         .equ    T_STATE,      68        /* scheduler state                 */
         .equ    T_ZOMBIE,      4
@@ -27,6 +27,30 @@
         .fpu fpv5-d16
 #endif
         .thumb
+
+/* Zero s0-s31 and FPSCR.  \r is a core register that may be clobbered. */
+        .macro  fpzero r
+        movs    \r, #0
+        .irp    n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+        vmov    d\n, \r, \r
+        .endr
+        vmsr    fpscr, \r
+        .endm
+
+/* Floating-point registers must not carry values from one thread to
+ * another.  A thread WITH an FP context has its own values saved and
+ * restored.  A thread WITHOUT one (it has not used the FPU yet, or it is in
+ * the kernel part of a system call) would see whatever the last user left:
+ * so when such a thread is switched in and the registers may hold somebody's
+ * values (fp_dirty), they are zeroed.  fp_dirty is set wherever a thread
+ * with an FP context leaves the processor: at its context switch and at its
+ * system-call entry.  A system that never touches the FPU pays four
+ * instructions per switch for this.                                      */
+        .section .bss.fp_dirty, "aw", %nobits
+        .global fp_dirty
+fp_dirty:
+        .byte   0
+        .p2align 2
 
         .macro  func name
         .section .text.\name, "ax", %progbits
@@ -51,9 +75,13 @@
         func    pendsv_handler
         mrs     r0, psp
         tst     lr, #0x10
-        it      eq
-        vstmdbeq r0!, {d8-d15}
-        stmdb   r0!, {r4-r11}
+        bne     1f
+        vstmdb  r0!, {d8-d15}
+        movw    r3, #:lower16:fp_dirty
+        movt    r3, #:upper16:fp_dirty
+        movs    r1, #1
+        strb    r1, [r3]
+1:      stmdb   r0!, {r4-r11}
         movw    r3, #:lower16:sched_current
         movt    r3, #:upper16:sched_current
         ldr     r2, [r3]
@@ -72,11 +100,19 @@
         ldr     r2, [r3]
         ldr     r0, [r2, #T_SP]
         ldr     lr, [r2, #T_EXC]
-        ldr     r1, [r2, #T_CTRL]
         ldmia   r0!, {r4-r11}
         tst     lr, #0x10
-        it      eq
-        vldmiaeq r0!, {d8-d15}
+        bne     2f
+        vldmia  r0!, {d8-d15}
+        b       3f
+2:      movw    r3, #:lower16:fp_dirty  /* no FP context: it must not see */
+        movt    r3, #:upper16:fp_dirty  /* another thread's values        */
+        ldrb    r1, [r3]
+        cbz     r1, 3f
+        movs    r1, #0
+        strb    r1, [r3]
+        fpzero  r1
+3:      ldr     r1, [r2, #T_CTRL]
         msr     psp, r0
         mrs     r2, control
         bic     r2, r2, #1
@@ -183,9 +219,13 @@
         ldrne   r3, [r2, #T_KSTACK_TOP] /* privileged caller               */
         moveq   r3, r0
         tst     lr, #0x10
-        it      eq
-        vstmdbeq r3!, {d8-d15}
-        sub     r3, r3, #32             /* frame that enters the trampoline */
+        bne     4f
+        vstmdb  r3!, {d8-d15}
+        movw    r1, #:lower16:fp_dirty  /* the caller's values stay in the */
+        movt    r1, #:upper16:fp_dirty  /* registers while the kernel part */
+        mov     r12, #1                 /* runs without an FP context      */
+        strb    r12, [r1]
+4:      sub     r3, r3, #32             /* frame that enters the trampoline */
         movs    r1, #0
         str     r0, [r3, #0]            /* r0:r1 = caller's frame          */
         str     r1, [r3, #4]
@@ -215,23 +255,30 @@ svc_sysret:
         cmp     r0, #0
         beq     svc_bad
         ldr     r12, [r2, #T_SVC_EXC]
-        ldr     r1, [r2, #T_SVC_CTRL]
         movs    r3, #0
         str     r3, [r2, #T_USP]
         /* The svc #1 itself may have armed a lazy FP save pointing at the
          * kernel-stack frame that is being thrown away: cancel it.        */
         ldr     r3, =FPCCR
-        ldr     lr, [r3]
-        bic     lr, lr, #1              /* LSPACT                          */
-        str     lr, [r3]
+        ldr     r1, [r3]
+        bic     r1, r1, #1              /* LSPACT                          */
+        str     r1, [r3]
+        ldr     r1, [r2, #T_SVC_CTRL]
         tst     r12, #0x10
-        bne     1f
+        bne     2f
         cmp     r1, #0
         ite     ne
         ldrne   r3, [r2, #T_KSTACK_TOP]
         moveq   r3, r0
         sub     r3, r3, #64
         vldmia  r3, {d8-d15}            /* the caller's callee-saved FP    */
+        b       1f
+        /* The caller has no FP context.  If the kernel part of the call
+         * used the FPU (lr, the EXC_RETURN of this svc #1, says so), its
+         * values are in the registers: the caller must not find them.    */
+2:      tst     lr, #0x10
+        bne     1f
+        fpzero  r3
 1:      msr     psp, r0
         mrs     r3, control
         bic     r3, r3, #1
@@ -251,18 +298,28 @@ svc_bad:
         func    syscall_trampoline
         bl      syscall_dispatch        /* Adder; writes the result into   */
                                         /* the caller's frame              */
-        /* An exec that loaded an RWPI program (kernel/proc.ad) leaves the
-         * new program's static base in T_EXEC_SB: it returns with r9 set to
-         * that.  Otherwise r9 is still the caller's, as the kernel's code
-         * preserves it (AAPCS callee-saved).                               */
+        /* An exec that loaded a new program (kernel/proc.ad) sets T_EXEC_NEW
+         * and leaves the new program's r4-r11 in T_SVC_REGS: zeros, and in
+         * r9 the static base of an RWPI program.  The return then carries
+         * nothing of the old image: not its callee-saved core registers
+         * (which this code would otherwise still hold, as the kernel
+         * preserves them) and not its floating-point registers.  Using the
+         * FPU here gives the svc #1 an FP frame on the kernel stack, which
+         * svc_sysret throws away.                                         */
         movw    r3, #:lower16:sched_current
         movt    r3, #:upper16:sched_current
         ldr     r2, [r3]
-        ldr     r0, [r2, #T_EXEC_SB]
+        ldr     r0, [r2, #T_EXEC_NEW]
         cbz     r0, 2f
-        mov     r9, r0
         movs    r0, #0
-        str     r0, [r2, #T_EXEC_SB]
+        str     r0, [r2, #T_EXEC_NEW]
+        add     r0, r2, #T_SVC_REGS
+        ldmia   r0, {r4-r11}
+        fpzero  r0
+        movs    r1, #0
+        movs    r2, #0
+        movs    r3, #0
+        mov     r12, r0
 2:      svc     #1
 1:      b       1b
         .size   syscall_trampoline, . - syscall_trampoline

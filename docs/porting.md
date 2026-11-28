@@ -113,7 +113,7 @@ and data at the marker address 0x40000000 (an `ET_EXEC` with two
   place**; otherwise copies it into the block above the data;
 - copies the data segment's initial values, clears bss, heap and stack;
 - starts the program with r9 = the data's address: in the first context
-  frame for `spawn`, and through `Thread.exec_sb`, which `syscall_trampoline`
+  frame for `spawn`, and through `Thread.svc_regs` (with `exec_new` set), which `syscall_trampoline`
   loads into r9 on the way out, for `exec`.
 
 The kernel itself is built without RWPI. It treats r9 as an ordinary

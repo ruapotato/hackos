@@ -102,7 +102,7 @@ SRC_AD := $(wildcard kernel/*.ad kernel/*/*.ad mm/*.ad fs/*.ad lib/*.ad lib/*/*.
 #   user/hamnix/NAME.ad   copied from Hamnix (fs/HAMNIX_ORIGIN)
 # Per program: STACK_NAME (bytes of stack, default 8192) and HEAP_NAME
 # (bytes of heap for sys_mmap, default 0).
-PROGS_OWN    := hello ptest crel halt
+PROGS_OWN    := hello ptest crel halt regprobe
 HEAP_ptest   := 8192
 PROGS_HAMNIX := echo cat ls cp rm mkdir wc head grep hamsh
 STACK_hamsh  ?= 65536
@@ -191,6 +191,13 @@ $(B)/user/%.o: $(B)/user/%.ll
 # A C program: natural C code, position-independent, no C library.
 $(B)/user/%.o: user/progs/%.c | $(B)/user
 	$(CLANG) $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc $(UPIC) -ffunction-sections -fdata-sections -Wall -Wextra -c $< -o $@
+
+# An assembly program that is its own entry point (no run-time linked in).
+$(B)/user/regprobe.o: user/progs/regprobe.S | $(B)/user
+	$(CLANG) $(UAFLAGS) -c $< -o $@
+
+$(B)/user/regprobe.elf: $(B)/user/regprobe.o user/rt/prog.ld user/rt/prog_rwpi.ld
+	$(LLD) $(ULDFLAGS) -z stack-size=1024 --defsym=__heap_size=0 -Map=$(B)/user/regprobe.map -o $@ $<
 
 $(B)/user/crt.o: user/rt/crt.S | $(B)/user
 	$(CLANG) $(UAFLAGS) -c $< -o $@

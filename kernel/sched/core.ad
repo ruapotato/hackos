@@ -86,9 +86,10 @@ class Thread:
     svc_exc: uint32                 # 16 EXC_RETURN of the SVC that entered the system call
     kstack_top: uint32              # 20 top of the kernel stack
     svc_ctrl: uint32                # 24 CONTROL.nPRIV of the system-call caller
-    exec_sb: uint32                 # 28 r9 for the program an exec has just loaded (an RWPI
-                                    #    program's static base), set by syscall_trampoline
-                                    #    on the way out and cleared; 0 = leave r9 alone
+    exec_new: uint32                # 28 1 = an exec has just loaded a program: on the way
+                                    #    out syscall_trampoline loads r4-r11 from svc_regs
+                                    #    (zeros; r9 = an RWPI program's static base), zeroes
+                                    #    the FP registers and clears this
     svc_regs: Array[8, uint32]      # 32 caller's r4-r11 at system-call entry
     # ---- scheduler ----
     tid: uint32                     # 64
