@@ -1,0 +1,593 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- exportfs: a 9P2000 file server in user space that serves a
+# directory of its own namespace (Plan 9's exportfs, much reduced).
+#
+#     exportfs -s NAME [DIR]      post a connection as /srv/NAME and serve DIR
+#                                 on it; then, in the shell:
+#                                     mount /srv/NAME /n/somewhere
+#     exportfs DEVICE [DIR]       serve DIR over a device file that carries
+#                                 bytes both ways (/dev/eia1: a serial port),
+#                                 for a 9P client on another machine
+#
+# DIR defaults to /.  What the client sees is what this process sees: its
+# namespace, so `ns { bind ... ; exportfs ... }` serves a tailored tree.
+#
+# One request at a time, sixteen fids, no authentication (Tauth is refused,
+# as 9P allows), no wstat.  A directory is read as 9P wants it: whole stat
+# records, in order, from offset 0 or from where the last read ended.
+# The server ends when its connection is closed.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[uint8]) -> int32
+extern def sys_open_mode(path: Ptr[uint8], mode: int32) -> int32
+extern def sys_create(path: Ptr[uint8], flags: uint32, mode: uint32) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_lseek(fd: int32, off: int64, whence: int32) -> int64
+extern def sys_stat_p9(path: Ptr[uint8], buf: Ptr[uint8], nbuf: uint64) -> int64
+extern def sys_mkdir(path: Ptr[uint8]) -> int32
+extern def sys_remove(path: Ptr[uint8]) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+extern def sys_socketpair(domain: int32, type: int32, protocol: int32, sv: Ptr[int32]) -> int32
+extern def sys_srv_post(name: Ptr[uint8], srvfd: int32) -> int32
+
+MSIZE: uint32 = 4120                # one message: 4096 bytes of data + the largest header
+IOHDR: uint32 = 24
+NFID: uint32 = 16
+PATHMAX: uint32 = 128
+DLIST: uint32 = 2048                # a directory's names, as the kernel lists them
+
+rx: Array[4120, uint8]
+tx: Array[4120, uint8]
+dlist: Array[2048, uint8]
+sbuf: Array[256, uint8]
+tmp: Array[160, uint8]
+root: Array[128, uint8]
+sv: Array[2, int32]
+
+f_used: Array[16, uint32]
+f_fid: Array[16, uint32]
+f_fd: Array[16, int32]              # -1: not open
+f_dir: Array[16, uint32]
+f_doff: Array[16, uint64]           # where the next directory read must start
+f_dent: Array[16, uint32]           # ... and which entry that is
+f_path: Array[2048, uint8]          # 16 x 128
+
+rfd: int32 = 0
+wfd: int32 = 1
+msize: uint32 = 4120
+served: uint64 = 0
+
+
+def slen(s: Ptr[uint8]) -> uint32:
+    n: uint32 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def say(s: Ptr[uint8]):
+    sys_write(2, s, cast[uint64](slen(s)))
+
+
+def g16(b: Ptr[uint8], o: uint32) -> uint32:
+    return cast[uint32](b[o]) | (cast[uint32](b[o + 1]) << 8)
+
+
+def g32(b: Ptr[uint8], o: uint32) -> uint32:
+    return g16(b, o) | (g16(b, o + 2) << 16)
+
+
+def p16(o: uint32, v: uint32) -> uint32:
+    tx[o] = cast[uint8](v & 255)
+    tx[o + 1] = cast[uint8]((v >> 8) & 255)
+    return o + 2
+
+
+def p32(o: uint32, v: uint32) -> uint32:
+    p16(o, v & 0xFFFF)
+    p16(o + 2, v >> 16)
+    return o + 4
+
+
+def path_of(i: uint32) -> Ptr[uint8]:
+    return &f_path[i * PATHMAX]
+
+
+def read_exact(buf: Ptr[uint8], n: uint32) -> int32:
+    got: uint32 = 0
+    while got < n:
+        r: int64 = sys_read(rfd, cast[Ptr[uint8]](cast[uint64](buf) + cast[uint64](got)), cast[uint64](n - got))
+        if r <= 0:
+            return -1
+        got = got + cast[uint32](r)
+    return 0
+
+
+# Send the reply of type t whose body ends at offset `end` of tx.
+def reply(t: uint32, end: uint32) -> int32:
+    p32(0, end)
+    tx[4] = cast[uint8](t)
+    tx[5] = rx[5]
+    tx[6] = rx[6]
+    done: uint32 = 0
+    while done < end:
+        w: int64 = sys_write(wfd, &tx[done], cast[uint64](end - done))
+        if w <= 0:
+            return -1
+        done = done + cast[uint32](w)
+    return 0
+
+
+def rerror(msg: Ptr[uint8]) -> int32:
+    n: uint32 = slen(msg)
+    o: uint32 = p16(7, n)
+    i: uint32 = 0
+    while i < n:
+        tx[o + i] = msg[i]
+        i = i + 1
+    return reply(107, o + n)
+
+
+# Rerror with the kernel's reason for the system call that just failed.
+def rerror_sys() -> int32:
+    e: Array[64, uint8]
+    e[0] = 0
+    sys_errstr(&e[0], 64)
+    if e[0] == 0:
+        return rerror("error")
+    return rerror(&e[0])
+
+
+def fid_find(fid: uint32) -> int32:
+    i: uint32 = 0
+    while i < NFID:
+        if f_used[i] != 0 and f_fid[i] == fid:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def fid_new(fid: uint32) -> int32:
+    i: uint32 = 0
+    while i < NFID:
+        if f_used[i] == 0:
+            f_used[i] = 1
+            f_fid[i] = fid
+            f_fd[i] = -1
+            f_dir[i] = 0
+            f_doff[i] = 0
+            f_dent[i] = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def fid_drop(i: uint32):
+    if f_fd[i] >= 0:
+        sys_close(f_fd[i])
+    f_used[i] = 0
+
+
+def copy(dst: Ptr[uint8], src: Ptr[uint8]):
+    i: uint32 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+
+
+# The 9P stat record of `path` in sbuf; its length, or -1.  sys_stat_p9
+# writes exactly a 9P stat (size[2] type[2] dev[4] qid[13] ...), so the
+# qid of a file is sbuf[8..21).
+def stat_of(path: Ptr[uint8]) -> int32:
+    n: int64 = sys_stat_p9(path, &sbuf[0], 256)
+    if n < 49:
+        return -1
+    return cast[int32](n)
+
+
+def put_qid(o: uint32) -> uint32:
+    i: uint32 = 0
+    while i < 13:
+        tx[o + i] = sbuf[8 + i]
+        i = i + 1
+    return o + 13
+
+
+def is_dir() -> uint32:
+    return cast[uint32]((sbuf[8] & 0x80) != 0)
+
+
+# ---------------------------------------------------------------- requests
+def t_version() -> int32:
+    m: uint32 = g32(&rx[0], 7)
+    if m < 256:
+        return rerror("msize too small")
+    if m > MSIZE:
+        m = MSIZE
+    msize = m
+    i: uint32 = 0
+    while i < NFID:
+        if f_used[i] != 0:
+            fid_drop(i)
+        i = i + 1
+    o: uint32 = p32(7, m)
+    o = p16(o, 6)
+    v: Ptr[uint8] = "9P2000"
+    k: uint32 = 0
+    while k < 6:
+        tx[o + k] = v[k]
+        k = k + 1
+    return reply(101, o + 6)
+
+
+def t_attach() -> int32:
+    fid: uint32 = g32(&rx[0], 7)
+    if fid_find(fid) >= 0:
+        return rerror("fid in use")
+    if stat_of(&root[0]) < 0:
+        return rerror_sys()
+    i: int32 = fid_new(fid)
+    if i < 0:
+        return rerror("too many fids")
+    copy(path_of(cast[uint32](i)), &root[0])
+    return reply(105, put_qid(7))
+
+
+def t_walk(size: uint32) -> int32:
+    fid: uint32 = g32(&rx[0], 7)
+    newfid: uint32 = g32(&rx[0], 11)
+    nw: uint32 = g16(&rx[0], 15)
+    i: int32 = fid_find(fid)
+    if i < 0:
+        return rerror("unknown fid")
+    if nw > 16:
+        return rerror("walk too long")
+    if newfid != fid and fid_find(newfid) >= 0:
+        return rerror("fid in use")
+    copy(&tmp[0], path_of(cast[uint32](i)))
+    rl: uint32 = slen(&root[0])
+    o: uint32 = 17
+    out: uint32 = 9
+    done: uint32 = 0
+    while done < nw:
+        if o + 2 > size:
+            return rerror("bad walk")
+        nl: uint32 = g16(&rx[0], o)
+        if o + 2 + nl > size:
+            return rerror("bad walk")
+        tl: uint32 = slen(&tmp[0])
+        if nl == 2 and rx[o + 2] == 46 and rx[o + 3] == 46:
+            # "..": up, but not above the exported directory
+            if tl > rl:
+                while tl > 0 and tmp[tl - 1] != 47:
+                    tl = tl - 1
+                if tl > 1:
+                    tl = tl - 1
+                tmp[tl] = 0
+        elif not (nl == 1 and rx[o + 2] == 46):
+            if tl + nl + 2 > PATHMAX:
+                return rerror("path too long")
+            if tl > 1 or tmp[0] != 47:
+                tmp[tl] = 47
+                tl = tl + 1
+            k: uint32 = 0
+            while k < nl:
+                tmp[tl + k] = rx[o + 2 + k]
+                k = k + 1
+            tmp[tl + nl] = 0
+        if stat_of(&tmp[0]) < 0:
+            if done == 0:
+                return rerror("file does not exist")
+            break
+        out = put_qid(out)
+        done = done + 1
+        o = o + 2 + nl
+    if done == nw:
+        ni: int32 = i
+        if newfid != fid:
+            ni = fid_new(newfid)
+            if ni < 0:
+                return rerror("too many fids")
+        elif f_fd[i] >= 0:
+            return rerror("fid is open")
+        copy(path_of(cast[uint32](ni)), &tmp[0])
+    p16(7, done)
+    return reply(111, out)
+
+
+def t_open() -> int32:
+    i: int32 = fid_find(g32(&rx[0], 7))
+    mode: uint32 = cast[uint32](rx[11])
+    if i < 0:
+        return rerror("unknown fid")
+    u: uint32 = cast[uint32](i)
+    if f_fd[u] >= 0:
+        return rerror("fid is open")
+    if stat_of(path_of(u)) < 0:
+        return rerror_sys()
+    fd: int32 = 0
+    if is_dir() != 0:
+        if (mode & 3) != 0:
+            return rerror("is a directory")
+        fd = sys_open(path_of(u))
+        f_dir[u] = 1
+    else:
+        m: int32 = cast[int32](mode & 3)
+        if m == 3:
+            m = 0                       # OEXEC: read
+        if (mode & 0x10) != 0:
+            m = m | 16
+        fd = sys_open_mode(path_of(u), m)
+        f_dir[u] = 0
+    if fd < 0:
+        return rerror_sys()
+    f_fd[u] = fd
+    f_doff[u] = 0
+    f_dent[u] = 0
+    return reply(113, p32(put_qid(7), msize - IOHDR))
+
+
+def t_create(size: uint32) -> int32:
+    i: int32 = fid_find(g32(&rx[0], 7))
+    if i < 0:
+        return rerror("unknown fid")
+    u: uint32 = cast[uint32](i)
+    nl: uint32 = g16(&rx[0], 11)
+    if 13 + nl + 5 > size:
+        return rerror("bad create")
+    perm: uint32 = g32(&rx[0], 13 + nl)
+    if f_fd[u] >= 0:
+        return rerror("fid is open")
+    copy(&tmp[0], path_of(u))
+    tl: uint32 = slen(&tmp[0])
+    if tl + nl + 2 > PATHMAX:
+        return rerror("path too long")
+    if tl > 1 or tmp[0] != 47:
+        tmp[tl] = 47
+        tl = tl + 1
+    k: uint32 = 0
+    while k < nl:
+        tmp[tl + k] = rx[13 + k]
+        k = k + 1
+    tmp[tl + nl] = 0
+    if stat_of(&tmp[0]) >= 0:
+        return rerror("file exists")
+    fd: int32 = 0
+    if (perm & 0x80000000) != 0:
+        if sys_mkdir(&tmp[0]) < 0:
+            return rerror_sys()
+        fd = sys_open(&tmp[0])
+        f_dir[u] = 1
+    else:
+        fd = sys_create(&tmp[0], 0, 0)
+        f_dir[u] = 0
+    if fd < 0:
+        return rerror_sys()
+    if stat_of(&tmp[0]) < 0:
+        sys_close(fd)
+        return rerror_sys()
+    copy(path_of(u), &tmp[0])
+    f_fd[u] = fd
+    f_doff[u] = 0
+    f_dent[u] = 0
+    return reply(115, p32(put_qid(7), msize - IOHDR))
+
+
+# A directory read: stat records of entries f_dent.., as many as fit.
+def read_dir(u: uint32, off: uint64, count: uint32) -> int32:
+    if off == 0:
+        f_doff[u] = 0
+        f_dent[u] = 0
+    elif off != f_doff[u]:
+        return rerror("a directory is read from its start or from where the last read ended")
+    sys_lseek(f_fd[u], 0, 0)
+    ln: int64 = sys_read(f_fd[u], &dlist[0], cast[uint64](DLIST))
+    if ln < 0:
+        return rerror_sys()
+    o: uint32 = 11
+    ent: uint32 = 0
+    k: uint32 = 0
+    p: uint32 = 0
+    while p < cast[uint32](ln):
+        st: uint32 = p
+        while p < cast[uint32](ln) and dlist[p] != 10:
+            p = p + 1
+        nl: uint32 = p - st
+        p = p + 1
+        if ent >= f_dent[u] and nl > 0:
+            copy(&tmp[0], path_of(u))
+            tl: uint32 = slen(&tmp[0])
+            if tl + nl + 2 <= PATHMAX:
+                if tl > 1 or tmp[0] != 47:
+                    tmp[tl] = 47
+                    tl = tl + 1
+                k = 0
+                while k < nl:
+                    tmp[tl + k] = dlist[st + k]
+                    k = k + 1
+                tmp[tl + nl] = 0
+                sn: int32 = stat_of(&tmp[0])
+                if sn > 0:
+                    if o + cast[uint32](sn) > 11 + count:
+                        break
+                    k = 0
+                    while k < cast[uint32](sn):
+                        tx[o + k] = sbuf[k]
+                        k = k + 1
+                    o = o + cast[uint32](sn)
+            f_dent[u] = f_dent[u] + 1
+        ent = ent + 1
+    f_doff[u] = f_doff[u] + cast[uint64](o - 11)
+    p32(7, o - 11)
+    return reply(117, o)
+
+
+def t_read() -> int32:
+    i: int32 = fid_find(g32(&rx[0], 7))
+    if i < 0:
+        return rerror("unknown fid")
+    u: uint32 = cast[uint32](i)
+    if f_fd[u] < 0:
+        return rerror("fid is not open")
+    off: uint64 = cast[uint64](g32(&rx[0], 11)) | (cast[uint64](g32(&rx[0], 15)) << 32)
+    count: uint32 = g32(&rx[0], 19)
+    if count > msize - IOHDR:
+        count = msize - IOHDR
+    if f_dir[u] != 0:
+        return read_dir(u, off, count)
+    if sys_lseek(f_fd[u], cast[int64](off), 0) < 0:
+        return rerror_sys()
+    n: int64 = sys_read(f_fd[u], &tx[11], cast[uint64](count))
+    if n < 0:
+        return rerror_sys()
+    p32(7, cast[uint32](n))
+    return reply(117, 11 + cast[uint32](n))
+
+
+def t_write(size: uint32) -> int32:
+    i: int32 = fid_find(g32(&rx[0], 7))
+    if i < 0:
+        return rerror("unknown fid")
+    u: uint32 = cast[uint32](i)
+    if f_fd[u] < 0 or f_dir[u] != 0:
+        return rerror("fid is not open for writing")
+    off: uint64 = cast[uint64](g32(&rx[0], 11)) | (cast[uint64](g32(&rx[0], 15)) << 32)
+    count: uint32 = g32(&rx[0], 19)
+    if 23 + count > size:
+        return rerror("bad write")
+    if sys_lseek(f_fd[u], cast[int64](off), 0) < 0:
+        return rerror_sys()
+    n: int64 = sys_write(f_fd[u], &rx[23], cast[uint64](count))
+    if n < 0:
+        return rerror_sys()
+    return reply(119, p32(7, cast[uint32](n)))
+
+
+def t_clunk(remove: uint32) -> int32:
+    i: int32 = fid_find(g32(&rx[0], 7))
+    if i < 0:
+        return rerror("unknown fid")
+    u: uint32 = cast[uint32](i)
+    rc: int32 = 0
+    if f_fd[u] >= 0:
+        sys_close(f_fd[u])
+        f_fd[u] = -1
+    if remove != 0:
+        rc = sys_remove(path_of(u))
+    f_used[u] = 0
+    if rc < 0:
+        return rerror_sys()
+    if remove != 0:
+        return reply(123, 7)
+    return reply(121, 7)
+
+
+def t_stat() -> int32:
+    i: int32 = fid_find(g32(&rx[0], 7))
+    if i < 0:
+        return rerror("unknown fid")
+    n: int32 = stat_of(path_of(cast[uint32](i)))
+    if n < 0:
+        return rerror_sys()
+    o: uint32 = p16(7, cast[uint32](n))
+    k: uint32 = 0
+    while k < cast[uint32](n):
+        tx[o + k] = sbuf[k]
+        k = k + 1
+    return reply(125, o + cast[uint32](n))
+
+
+# One request and its reply.  1, 0 at the end of the connection, -1 on a
+# broken message.
+def serve_one() -> int32:
+    if read_exact(&rx[0], 4) < 0:
+        return 0
+    size: uint32 = g32(&rx[0], 0)
+    if size < 7 or size > MSIZE:
+        return -1
+    if read_exact(&rx[4], size - 4) < 0:
+        return 0
+    served = served + 1
+    t: uint32 = cast[uint32](rx[4])
+    rc: int32 = 0
+    if t == 100:
+        rc = t_version()
+    elif t == 104:
+        rc = t_attach()
+    elif t == 110:
+        rc = t_walk(size)
+    elif t == 112:
+        rc = t_open()
+    elif t == 114:
+        rc = t_create(size)
+    elif t == 116:
+        rc = t_read()
+    elif t == 118:
+        rc = t_write(size)
+    elif t == 120:
+        rc = t_clunk(0)
+    elif t == 122:
+        rc = t_clunk(1)
+    elif t == 124:
+        rc = t_stat()
+    elif t == 108:
+        rc = reply(109, 7)              # Tflush: nothing is ever pending
+    elif t == 102:
+        rc = rerror("authentication is not required")
+    elif t == 126:
+        rc = rerror("wstat is not supported")
+    else:
+        rc = rerror("not a 9P2000 request")
+    if rc < 0:
+        return 0
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        say("usage: exportfs -s NAME [DIR]   or   exportfs DEVICE [DIR]\n")
+        return 2
+    a1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    dirarg: int32 = 2
+    root[0] = 47
+    root[1] = 0
+    if a1[0] == 45 and a1[1] == 115 and a1[2] == 0:
+        if argc < 3:
+            say("exportfs: -s needs a name\n")
+            return 2
+        if sys_socketpair(1, 1, 0, &sv[0]) < 0:
+            say("exportfs: cannot make a socketpair\n")
+            return 1
+        if sys_srv_post(cast[Ptr[uint8]](argv[2]), sv[0]) < 0:
+            say("exportfs: cannot post in /srv (is the name taken?)\n")
+            return 1
+        sys_close(sv[0])                # /srv keeps that end; this one is ours
+        rfd = sv[1]
+        wfd = sv[1]
+        dirarg = 3
+    else:
+        fd: int32 = sys_open_mode(a1, 2)
+        if fd < 0:
+            say("exportfs: cannot open the device\n")
+            return 1
+        rfd = fd
+        wfd = fd
+    if argc > dirarg:
+        d: Ptr[uint8] = cast[Ptr[uint8]](argv[dirarg])
+        if slen(d) >= PATHMAX or d[0] != 47:
+            say("exportfs: the directory must be an absolute path\n")
+            return 2
+        copy(&root[0], d)
+    if stat_of(&root[0]) < 0 or is_dir() == 0:
+        say("exportfs: not a directory\n")
+        return 1
+    r: int32 = 1
+    while r > 0:
+        r = serve_one()
+    if r < 0:
+        say("exportfs: a message that is not 9P; giving up\n")
+        return 1
+    return 0

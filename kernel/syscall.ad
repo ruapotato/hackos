@@ -24,7 +24,7 @@ from kernel.uaccess import uok, ustr
 from kernel.proc import proc_sys_spawn, proc_exec, proc_rfork, proc_waitpid, proc_waitpid_jc, proc_release_held
 from kernel.rt import rt_memcpy
 from mm.slab import user_arena_start, user_arena_end, umalloc_aligned, ufree
-from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, vfs_bind, vfs_unmount, vfs_nslabel, vfs_nsid, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
+from fs.hvfs import vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek, vfs_dup, vfs_dup2, vfs_mkdir, vfs_unlink, vfs_rename, vfs_stat, vfs_fstat, vfs_chdir, vfs_getcwd, vfs_fdbind, vfs_fdslot_kind, vfs_fdslot_arg, vfs_pipechan, vfs_openchan, vfs_fd_is_pipe, vfs_bind, vfs_unmount, vfs_nslabel, vfs_nsid, vfs_mount_9p, vfs_socketpair, vfs_srv_post, vfs_srv_open, OREAD, OWRITE, ORDWR, OTRUNC, OCREATE, DMDIR, EFAULT, EINVAL, ENOSYS, ENOMEM
 from drivers.tty.console import console_write
 from kernel.exit import hmicro_exit
 from kernel.power import power_suspend
@@ -53,6 +53,7 @@ SYS_UNLINK: uint32 = 21
 SYS_MKDIR: uint32 = 22
 SYS_READ_NB: uint32 = 23
 SYS_YIELD: uint32 = 24
+SYS_SOCKETPAIR: uint32 = 53         # (domain, type, protocol, sv*): two connected descriptors
 SYS_RFORK: uint32 = 256             # (flags); vfork semantics, see kernel/proc.ad
 SYS_BIND: uint32 = 257              # (new, old, flag)
 SYS_MOUNT: uint32 = 258             # (srvfd, afd, old, flag, spec)
@@ -63,6 +64,8 @@ SYS_STAT_P9: uint32 = 261
 SYS_FSTAT_P9: uint32 = 262
 SYS_REMOVE: uint32 = 263
 SYS_ERRSTR: uint32 = 265
+SYS_SRV_POST: uint32 = 275          # (name, fd): leave a socket end in /srv
+SYS_SRV_OPEN: uint32 = 276          # (name) -> descriptor for the end posted in /srv
 SYS_FDBIND: uint32 = 278            # (pid, fdnum, kind, arg): bind an /fd name
 SYS_PIPECHAN: uint32 = 280          # () -> pipe slot
 SYS_OPENCHAN: uint32 = 281          # (path, mode) -> channel for fdbind
@@ -86,6 +89,7 @@ SYS_RENAME: uint32 = 514
 SYS_GETTID: uint32 = 515
 SYS_SLEEP_MS: uint32 = 516
 SYS_SPAWN: uint32 = 517             # (path, argv) -> pid: a new process, no fork involved
+SYS_OPEN_MODE: uint32 = 519         # (path, mode): open an existing file; mode 0 read, 1 write, 2 both, | 16 truncate
 SYS_HALT: uint32 = 518              # (status): report the status and reset the machine
 SYS_SUSPEND: uint32 = 520           # (ms, sources): suspend the system until a wake source fires
 
@@ -246,6 +250,10 @@ def sys_call(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uin
     if nr == SYS_WAITPID:
         proc_release_held()
         return proc_waitpid(cast[int32](a0), cast[uint32](a1))
+    if nr == SYS_SOCKETPAIR:
+        if uok(a3, 8, 1) == 0:
+            return _bad()
+        return cast[int64](vfs_socketpair(cast[Ptr[int32]](a3)))
     set_current_errstr("unknown syscall")
     return cast[int64](ENOSYS)
 
@@ -350,8 +358,18 @@ def _sys_p9(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64, a4: uint
             return _bad()
         return cast[int64](vfs_nslabel(cast[uint32](a0), cast[Ptr[uint8]](a1), cast[Ptr[uint8]](a2)))
     if nr == SYS_MOUNT:
-        set_current_errstr("mount: no 9P client yet")
-        return cast[int64](ENOSYS)
+        if ustr(a2) == 0:
+            return _bad()
+        proc_release_held()
+        return cast[int64](vfs_mount_9p(cast[int32](a0), cast[Ptr[uint8]](a2), cast[uint32](a3)))
+    if nr == SYS_SRV_POST:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_srv_post(cast[Ptr[uint8]](a0), cast[int32](a1)))
+    if nr == SYS_SRV_OPEN:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_srv_open(cast[Ptr[uint8]](a0)))
     if nr == SYS_MMAP:
         # anonymous memory only: (addr ignored, len, prot, flags, fd, off)
         if (current_thread()[0].flags & TF_PROC) != 0:
@@ -402,6 +420,10 @@ def _sys_own(nr: uint32, a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> int6
         if ustr(a0) == 0:
             return _bad()
         return cast[int64](proc_sys_spawn(cast[Ptr[uint8]](a0), a1))
+    if nr == SYS_OPEN_MODE:
+        if ustr(a0) == 0:
+            return _bad()
+        return cast[int64](vfs_open(cast[Ptr[uint8]](a0), cast[uint32](a1) & (3 | OTRUNC)))
     if nr == SYS_HALT:
         hmicro_exit(cast[uint32](a0))
         return 0
@@ -462,7 +484,9 @@ def _stack_args_slow(nr: uint32) -> uint32:
         return 3
     if nr == SYS_MOUNT:
         return 4
-    if nr == SYS_WAITPID or nr == SYS_WAITPID_JC or nr == SYS_SPAWN or nr == SYS_OPENCHAN or nr == SYS_FDSLOT_KIND or nr == SYS_FDSLOT_ARG or nr == SYS_SETPGID or nr == SYS_SUSPEND:
+    if nr == SYS_SOCKETPAIR:
+        return 3
+    if nr == SYS_WAITPID or nr == SYS_WAITPID_JC or nr == SYS_SPAWN or nr == SYS_OPENCHAN or nr == SYS_SRV_POST or nr == SYS_OPEN_MODE or nr == SYS_FDSLOT_KIND or nr == SYS_FDSLOT_ARG or nr == SYS_SETPGID or nr == SYS_SUSPEND:
         return 1
     if nr == SYS_EXECVE:
         return 2

@@ -1,0 +1,644 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- the kernel's 9P2000 client: what stands behind a mounted name.
+#
+# mount(srvfd, ..., "/n/x") attaches a 9P file server; afterwards the file
+# layer (fs/hvfs.ad) turns an open of /n/x/a/b into Twalk + Topen on the
+# server's connection, a read into Tread, and so on.  The server is whoever
+# is at the other end of the transport:
+#   * a pair of pipes (a socketpair end, usually posted in /srv by a
+#     user-space server: user/progs/exportfs.ad, Hamnix's p9srv_demo.ad);
+#   * a device file that reads and writes bytes (a serial port: a server on
+#     another machine).
+#
+# This is new code.  Hamnix's client (sys/src/9/port/9p_client.ad, 2500
+# lines) lives on Hamnix's descriptor, pipe and socketpair structures and on
+# its Chan layer, and keeps a page cache per connection; none of that exists
+# here.  The wire format is 9P2000 as in lib/9p/9p.ad (Hamnix's library,
+# which the user-space servers use): one request at a time per connection,
+# tag 1, no Tauth (afid is P9C_NOFID, as Hamnix's mount without an afd), no
+# Tflush.
+#
+# A connection is shared by every namespace entry and open file that uses
+# it (a reference each); the last reference closes the transport, which is
+# how the server learns that it can stop.  Fids: 0 is the root of the
+# attach, 1..31 are handed out here.
+#
+# A request whose caller is ended (Ctrl-C) while it waits for the reply
+# leaves the reply on the wire; the next request on the connection reads it
+# away first.  A server that goes away makes every later request fail with
+# P9C_EIO ("9P: the server has gone").
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock
+from kernel.sched.core import set_current_errstr, thread_killed
+from kernel.rt import rt_memcpy
+from kernel.pipe import pipe_read, pipe_write, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer
+from fs.devtree import devtree_read, devtree_write
+from mm.slab import kmalloc, kfree
+
+P9C_MAX: uint32 = 4                 # = the dimension of p9_conns
+P9C_MSIZE: uint32 = 4120            # one message: 4096 bytes of data and the largest header (a board may patch it)
+P9C_IOHDR: uint32 = 24
+P9C_PIPES: uint32 = 1
+P9C_DEVICE: uint32 = 2
+
+P9C_EIO: int32 = -5
+P9C_ENOENT: int32 = -2
+P9C_ENOMEM: int32 = -12
+P9C_EEXIST: int32 = -17
+P9C_EMFILE: int32 = -24
+P9C_EINVAL: int32 = -22
+P9C_EINTR: int32 = -4
+P9C_EACCES: int32 = -13
+
+P9C_TVERSION: uint32 = 100
+P9C_TATTACH: uint32 = 104
+P9C_RERROR: uint32 = 107
+P9C_TWALK: uint32 = 110
+P9C_TOPEN: uint32 = 112
+P9C_TCREATE: uint32 = 114
+P9C_TREAD: uint32 = 116
+P9C_TWRITE: uint32 = 118
+P9C_TCLUNK: uint32 = 120
+P9C_TREMOVE: uint32 = 122
+P9C_TSTAT: uint32 = 124
+P9C_NOFID: uint32 = 0xFFFFFFFF
+P9C_QTDIR: uint32 = 0x80
+
+
+class P9Conn:
+    used: uint32
+    refs: uint32                    # namespace entries, open files, operations under way
+    kind: uint32                    # P9C_PIPES or P9C_DEVICE
+    rp: int32                       # pipe slot read from; or the device file's number
+    wp: int32                       # pipe slot written to
+    msize: uint32
+    fids: uint32                    # bit n: fid n is in use
+    dead: uint32
+    owed: uint32                    # replies still on the wire that nobody waits for
+    rx_left: uint32                 # ... and what is left of one that was half read
+    buf: uint64                     # msize bytes: the request, then its reply
+    calls: uint64                   # requests sent (statistics)
+    lock: Mutex
+    name: Array[24, uint8]          # the /srv name it was mounted from, or ""
+
+
+p9_conns: Array[4, P9Conn]
+p9_ready: uint32 = 0
+p9_live: uint32 = 0                 # connections in use (statistics)
+
+
+def p9c_init():
+    i: uint32 = 0
+    while i < P9C_MAX:
+        p9_conns[i].used = 0
+        mutex_init(&p9_conns[i].lock)
+        mutex_register(&p9_conns[i].lock)
+        i = i + 1
+    p9_ready = 1
+
+
+# ---------------------------------------------------------------- the wire
+def _b(c: Ptr[P9Conn]) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](c[0].buf)
+
+
+def _p16(b: Ptr[uint8], o: uint32, v: uint32) -> uint32:
+    b[o] = cast[uint8](v & 255)
+    b[o + 1] = cast[uint8]((v >> 8) & 255)
+    return o + 2
+
+
+def _p32(b: Ptr[uint8], o: uint32, v: uint32) -> uint32:
+    _p16(b, o, v & 0xFFFF)
+    _p16(b, o + 2, v >> 16)
+    return o + 4
+
+
+def _g16(b: Ptr[uint8], o: uint32) -> uint32:
+    return cast[uint32](b[o]) | (cast[uint32](b[o + 1]) << 8)
+
+
+def _g32(b: Ptr[uint8], o: uint32) -> uint32:
+    return _g16(b, o) | (_g16(b, o + 2) << 16)
+
+
+def _pstr(b: Ptr[uint8], o: uint32, s: Ptr[uint8], n: uint32) -> uint32:
+    _p16(b, o, n)
+    i: uint32 = 0
+    while i < n:
+        b[o + 2 + i] = s[i]
+        i = i + 1
+    return o + 2 + n
+
+
+# Start a request: size[4] (filled in by _rpc) type[1] tag[2] fid[4].
+def _head(c: Ptr[P9Conn], t: uint32, fid: uint32) -> uint32:
+    b: Ptr[uint8] = _b(c)
+    b[4] = cast[uint8](t)
+    _p16(b, 5, 1)
+    return _p32(b, 7, fid)
+
+
+def _tx(c: Ptr[P9Conn], p: Ptr[uint8], n: uint32) -> int32:
+    done: uint32 = 0
+    while done < n:
+        r: int64 = 0
+        at: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](p) + cast[uint64](done))
+        if c[0].kind == P9C_PIPES:
+            r = pipe_write(c[0].wp, at, cast[uint64](n - done), 0)
+        else:
+            r = devtree_write(cast[uint32](c[0].rp), at, cast[uint64](n - done), 0)
+        if r <= 0:
+            c[0].dead = 1               # half a request is on the wire, or nobody reads
+            return P9C_EIO
+        done = done + cast[uint32](r)
+    return 0
+
+
+# Read n bytes.  0; P9C_EINTR when the caller was ended (the rest stays on the
+# wire, counted in rx_left by the caller); P9C_EIO when the server has gone.
+def _rx(c: Ptr[P9Conn], p: Ptr[uint8], n: uint32, got: Ptr[uint32]) -> int32:
+    got[0] = 0
+    while got[0] < n:
+        r: int64 = 0
+        at: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](p) + cast[uint64](got[0]))
+        if c[0].kind == P9C_PIPES:
+            r = pipe_read(c[0].rp, at, cast[uint64](n - got[0]), 0)
+        else:
+            r = devtree_read(cast[uint32](c[0].rp), at, cast[uint64](n - got[0]), 0)
+        if r == -4:
+            return P9C_EINTR
+        if r <= 0:
+            c[0].dead = 1
+            return P9C_EIO
+        got[0] = got[0] + cast[uint32](r)
+    return 0
+
+
+# Read replies away that an ended caller left behind.
+def _drain(c: Ptr[P9Conn]) -> int32:
+    junk: Array[64, uint8]
+    got: uint32 = 0
+    while c[0].owed != 0 or c[0].rx_left != 0:
+        if c[0].rx_left == 0:
+            rc: int32 = _rx(c, &junk[0], 4, &got)
+            if rc != 0:
+                c[0].dead = 1           # not even a whole size field: no way back into step
+                return P9C_EIO
+            c[0].rx_left = _g32(&junk[0], 0) - 4
+            c[0].owed = c[0].owed - 1
+        while c[0].rx_left != 0:
+            k: uint32 = c[0].rx_left
+            if k > 64:
+                k = 64
+            rc2: int32 = _rx(c, &junk[0], k, &got)
+            c[0].rx_left = c[0].rx_left - got
+            if rc2 == P9C_EINTR:
+                return P9C_EINTR
+            if rc2 != 0:
+                return P9C_EIO
+    return 0
+
+
+def _errno_of(e: Ptr[uint8], n: uint32) -> int32:
+    # the errno a server's error string stands for, as far as it can be told
+    i: uint32 = 0
+    while i + 3 < n:
+        if e[i] == 110 and e[i + 1] == 111 and e[i + 2] == 116 and e[i + 3] == 32:      # "not " (exist, found)
+            return P9C_ENOENT
+        if e[i] == 101 and e[i + 1] == 120 and e[i + 2] == 105 and e[i + 3] == 115:     # "exis"(ts)
+            return P9C_EEXIST
+        if e[i] == 112 and e[i + 1] == 101 and e[i + 2] == 114 and e[i + 3] == 109:     # "perm"(ission)
+            return P9C_EACCES
+        i = i + 1
+    return P9C_EIO
+
+
+# Send the request of n bytes in the buffer and read its reply into the
+# buffer.  The connection's lock is held.  Returns the reply's size, or a
+# negative errno with the error string set (the server's, for an Rerror).
+def _rpc(c: Ptr[P9Conn], n: uint32) -> int32:
+    b: Ptr[uint8] = _b(c)
+    got: uint32 = 0
+    if c[0].dead != 0:
+        set_current_errstr("9P: the server has gone")
+        return P9C_EIO
+    want: uint32 = cast[uint32](b[4]) + 1
+    rc: int32 = _drain(c)
+    if rc == 0:
+        _p32(b, 0, n)
+        rc = _tx(c, b, n)
+    if rc != 0:
+        if rc == P9C_EINTR:
+            set_current_errstr("interrupted")
+        else:
+            set_current_errstr("9P: the server has gone")
+        return rc
+    c[0].calls = c[0].calls + 1
+    rc = _rx(c, b, 4, &got)
+    if rc == P9C_EINTR and got == 0:
+        c[0].owed = c[0].owed + 1
+        set_current_errstr("interrupted")
+        return P9C_EINTR
+    size: uint32 = 0
+    if rc == 0:
+        size = _g32(b, 0)
+        if size < 7 or size > c[0].msize:
+            c[0].dead = 1
+            rc = P9C_EIO
+    if rc == 0:
+        rc = _rx(c, cast[Ptr[uint8]](cast[uint64](b) + 4), size - 4, &got)
+        if rc == P9C_EINTR:
+            c[0].rx_left = size - 4 - got
+            set_current_errstr("interrupted")
+            return P9C_EINTR
+    if rc != 0:
+        c[0].dead = 1
+        set_current_errstr("9P: the server has gone")
+        return P9C_EIO
+    t: uint32 = cast[uint32](b[4])
+    if t == P9C_RERROR:
+        el: uint32 = _g16(b, 7)
+        if el > size - 9:
+            el = size - 9
+        es: Array[64, uint8]
+        i: uint32 = 0
+        while i < el and i < 63:
+            es[i] = b[9 + i]
+            i = i + 1
+        es[i] = 0
+        set_current_errstr(&es[0])
+        return _errno_of(&es[0], i)
+    if t != want:
+        c[0].dead = 1
+        set_current_errstr("9P: the server answered with the wrong message")
+        return P9C_EIO
+    return cast[int32](size)
+
+
+# ---------------------------------------------------------------- connections
+def _conn(n: uint32) -> Ptr[P9Conn]:
+    return &p9_conns[n]
+
+
+# The transport's own references: a reader of rp, a writer of wp.
+def _transport_hold(c: Ptr[P9Conn]):
+    if c[0].kind == P9C_PIPES:
+        pipe_inc_reader(c[0].rp)
+        pipe_inc_writer(c[0].wp)
+
+
+def _close(c: Ptr[P9Conn]):
+    if c[0].kind == P9C_PIPES:
+        pipe_close_reader(c[0].rp)
+        pipe_close_writer(c[0].wp)
+    kfree(c[0].buf)
+    c[0].buf = 0
+    c[0].used = 0
+    p9_live = p9_live - 1
+
+
+# A reference to connection n; -1 when there is no such connection.
+def p9c_get(n: uint64) -> int64:
+    r: int64 = -1
+    irq: uint32 = cpu_irq_save()
+    if n < cast[uint64](P9C_MAX) and p9_conns[n].used != 0:
+        p9_conns[n].refs = p9_conns[n].refs + 1
+        r = 0
+    cpu_irq_restore(irq)
+    return r
+
+
+# Drop a reference; the last one closes the transport.
+def p9c_put(n: uint64) -> int64:
+    if n >= cast[uint64](P9C_MAX):
+        return -1
+    last: uint32 = 0
+    irq: uint32 = cpu_irq_save()
+    c: Ptr[P9Conn] = _conn(cast[uint32](n))
+    if c[0].used != 0 and c[0].refs > 0:
+        c[0].refs = c[0].refs - 1
+        if c[0].refs == 0:
+            last = 1
+    cpu_irq_restore(irq)
+    if last != 0:
+        _close(c)
+    return 0
+
+
+# "/srv/NAME" for the rendered namespace; 0 when it was not mounted from /srv.
+def p9c_name(n: uint64, buf: Ptr[uint8], cap: uint64) -> uint64:
+    if n >= cast[uint64](P9C_MAX) or p9_conns[n].used == 0 or p9_conns[n].name[0] == 0:
+        return 0
+    pre: Ptr[uint8] = "/srv/"
+    o: uint64 = 0
+    while pre[o] != 0:
+        buf[o] = pre[o]
+        o = o + 1
+    i: uint64 = 0
+    while p9_conns[n].name[i] != 0 and o + 1 < cap:
+        buf[o] = p9_conns[n].name[i]
+        o = o + 1
+        i = i + 1
+    return o
+
+
+# The connection mounted from /srv/<name>, or -1.
+def p9c_find_name(name: Ptr[uint8]) -> int32:
+    n: uint32 = 0
+    while n < P9C_MAX:
+        if p9_conns[n].used != 0:
+            i: uint32 = 0
+            while name[i] != 0 and name[i] == p9_conns[n].name[i]:
+                i = i + 1
+            if name[i] == 0 and p9_conns[n].name[i] == 0 and i != 0:
+                return cast[int32](n)
+        n = n + 1
+    return -1
+
+
+# Attach to the server at the other end of a transport: Tversion, Tattach.
+# A transport that is connected already gives the same connection.  Returns
+# the connection number (the caller must take a reference with p9c_get, or
+# call p9c_discard) or a negative errno with the error string set.
+def p9c_connect(kind: uint32, rp: int32, wp: int32, name: Ptr[uint8]) -> int32:
+    n: uint32 = 0
+    free: uint32 = P9C_MAX
+    while n < P9C_MAX:
+        if p9_conns[n].used != 0 and p9_conns[n].kind == kind and p9_conns[n].rp == rp and p9_conns[n].wp == wp and p9_conns[n].dead == 0:
+            return cast[int32](n)
+        if p9_conns[n].used == 0 and free == P9C_MAX:
+            free = n
+        n = n + 1
+    if free == P9C_MAX:
+        set_current_errstr("mount failed: too many 9P connections")
+        return P9C_EMFILE
+    c: Ptr[P9Conn] = _conn(free)
+    c[0].buf = kmalloc(cast[uint64](P9C_MSIZE))
+    if c[0].buf == 0:
+        set_current_errstr("mount failed: out of memory")
+        return P9C_ENOMEM
+    c[0].kind = kind
+    c[0].rp = rp
+    c[0].wp = wp
+    c[0].msize = P9C_MSIZE
+    c[0].fids = 1
+    c[0].dead = 0
+    c[0].owed = 0
+    c[0].rx_left = 0
+    c[0].refs = 0
+    c[0].calls = 0
+    i: uint32 = 0
+    while name[i] != 0 and i < 23:
+        c[0].name[i] = name[i]
+        i = i + 1
+    c[0].name[i] = 0
+    _transport_hold(c)
+    c[0].used = 1
+    p9_live = p9_live + 1
+    mutex_lock(&c[0].lock)
+    b: Ptr[uint8] = _b(c)
+    b[4] = cast[uint8](P9C_TVERSION)
+    _p16(b, 5, 0xFFFF)
+    o: uint32 = _p32(b, 7, P9C_MSIZE)
+    o = _pstr(b, o, "9P2000", 6)
+    r: int32 = _rpc(c, o)
+    if r >= 0:
+        ms: uint32 = _g32(b, 7)
+        if ms < 256 or ms > P9C_MSIZE or _g16(b, 11) != 6 or b[13] != 57 or b[14] != 80:
+            set_current_errstr("mount failed: the server does not speak 9P2000")
+            r = P9C_EIO
+        else:
+            c[0].msize = ms
+    if r >= 0:
+        o = _head(c, P9C_TATTACH, 0)
+        o = _p32(b, o, P9C_NOFID)
+        o = _pstr(b, o, "hmicro", 6)
+        o = _pstr(b, o, "", 0)
+        r = _rpc(c, o)
+    mutex_unlock(&c[0].lock)
+    if r < 0:
+        _close(c)
+        return r
+    return cast[int32](free)
+
+
+# Give up a connection p9c_connect returned if nothing refers to it.
+def p9c_discard(n: uint32):
+    p9c_get(cast[uint64](n))
+    p9c_put(cast[uint64](n))
+
+
+def _fid_new(c: Ptr[P9Conn]) -> int32:
+    f: uint32 = 1
+    while f < 32:
+        if (c[0].fids & (cast[uint32](1) << f)) == 0:
+            c[0].fids = c[0].fids | (cast[uint32](1) << f)
+            return cast[int32](f)
+        f = f + 1
+    return -1
+
+
+def _fid_free(c: Ptr[P9Conn], fid: uint32):
+    if fid != 0 and fid < 32:
+        c[0].fids = c[0].fids & (0xFFFFFFFF ^ (cast[uint32](1) << fid))
+
+
+# ---------------------------------------------------------------- operations
+# Walk from the root to `rel` ("" or "/a/b": the path below the mount point)
+# with a new fid.  skip_last != 0 stops at the directory that holds the last
+# name (for create) and stores where that name starts in last[0].  Returns
+# the fid, with the qid type of what it names in qt[0]; P9C_ENOENT when a name
+# on the way does not exist.
+def p9c_walk(n: uint32, rel: Ptr[uint8], skip_last: uint32, last: Ptr[uint32], qt: Ptr[uint32]) -> int32:
+    c: Ptr[P9Conn] = _conn(n)
+    mutex_lock(&c[0].lock)
+    fid: int32 = _fid_new(c)
+    if fid < 0:
+        mutex_unlock(&c[0].lock)
+        set_current_errstr("9P: too many files open on this mount")
+        return P9C_EMFILE
+    o: uint32 = _head(c, P9C_TWALK, 0)
+    b: Ptr[uint8] = _b(c)
+    o = _p32(b, o, cast[uint32](fid))
+    cnt_at: uint32 = o
+    o = o + 2
+    names: uint32 = 0
+    i: uint32 = 0
+    while rel[i] != 0:
+        while rel[i] == 47:
+            i = i + 1
+        st: uint32 = i
+        while rel[i] != 0 and rel[i] != 47:
+            i = i + 1
+        if i == st:
+            break
+        if skip_last != 0 and rel[i] == 0:
+            last[0] = st
+            break
+        if names == 16 or o + 2 + (i - st) + 16 > c[0].msize:
+            _fid_free(c, cast[uint32](fid))
+            mutex_unlock(&c[0].lock)
+            set_current_errstr("9P: path too deep or too long")
+            return P9C_EINVAL
+        o = _pstr(b, o, cast[Ptr[uint8]](cast[uint64](rel) + cast[uint64](st)), i - st)
+        names = names + 1
+    _p16(b, cnt_at, names)
+    r: int32 = _rpc(c, o)
+    if r >= 0:
+        nq: uint32 = _g16(b, 7)
+        if nq != names:
+            r = P9C_ENOENT                  # the fid was not made
+            set_current_errstr("file does not exist")
+        elif nq == 0:
+            qt[0] = P9C_QTDIR
+        else:
+            qt[0] = cast[uint32](b[9 + (nq - 1) * 13])
+    if r < 0:
+        _fid_free(c, cast[uint32](fid))
+        mutex_unlock(&c[0].lock)
+        return r
+    mutex_unlock(&c[0].lock)
+    return fid
+
+
+# Topen.  mode: 0 read, 1 write, 2 both, | 0x10 truncate.
+def p9c_open(n: uint32, fid: uint32, mode: uint32) -> int32:
+    c: Ptr[P9Conn] = _conn(n)
+    mutex_lock(&c[0].lock)
+    o: uint32 = _head(c, P9C_TOPEN, fid)
+    _b(c)[o] = cast[uint8](mode)
+    r: int32 = _rpc(c, o + 1)
+    mutex_unlock(&c[0].lock)
+    if r < 0:
+        return r
+    return 0
+
+
+# Tcreate in the directory `fid` names; afterwards the fid is the new file,
+# open with `mode`.  nlen bytes of `name`.
+def p9c_create(n: uint32, fid: uint32, name: Ptr[uint8], nlen: uint32, perm: uint32, mode: uint32) -> int32:
+    c: Ptr[P9Conn] = _conn(n)
+    mutex_lock(&c[0].lock)
+    o: uint32 = _head(c, P9C_TCREATE, fid)
+    b: Ptr[uint8] = _b(c)
+    o = _pstr(b, o, name, nlen)
+    o = _p32(b, o, perm)
+    b[o] = cast[uint8](mode)
+    r: int32 = _rpc(c, o + 1)
+    mutex_unlock(&c[0].lock)
+    if r < 0:
+        return r
+    return 0
+
+
+def p9c_read(n: uint32, fid: uint32, off: uint64, buf: Ptr[uint8], cnt: uint64) -> int64:
+    c: Ptr[P9Conn] = _conn(n)
+    if cnt > cast[uint64](c[0].msize - P9C_IOHDR):
+        cnt = cast[uint64](c[0].msize - P9C_IOHDR)
+    mutex_lock(&c[0].lock)
+    o: uint32 = _head(c, P9C_TREAD, fid)
+    b: Ptr[uint8] = _b(c)
+    o = _p32(b, o, cast[uint32](off))
+    o = _p32(b, o, cast[uint32](off >> 32))
+    o = _p32(b, o, cast[uint32](cnt))
+    r: int32 = _rpc(c, o)
+    got: int64 = cast[int64](r)
+    if r >= 0:
+        k: uint32 = _g32(b, 7)
+        if cast[uint64](k) > cnt or k + 11 > cast[uint32](r):
+            k = 0
+        rt_memcpy(cast[uint64](buf), c[0].buf + 11, cast[uint64](k))
+        got = cast[int64](k)
+    mutex_unlock(&c[0].lock)
+    return got
+
+
+def p9c_write(n: uint32, fid: uint32, off: uint64, buf: Ptr[uint8], cnt: uint64) -> int64:
+    c: Ptr[P9Conn] = _conn(n)
+    done: uint64 = 0
+    while done < cnt:
+        k: uint64 = cnt - done
+        if k > cast[uint64](c[0].msize - P9C_IOHDR):
+            k = cast[uint64](c[0].msize - P9C_IOHDR)
+        mutex_lock(&c[0].lock)
+        o: uint32 = _head(c, P9C_TWRITE, fid)
+        b: Ptr[uint8] = _b(c)
+        at: uint64 = off + done
+        o = _p32(b, o, cast[uint32](at))
+        o = _p32(b, o, cast[uint32](at >> 32))
+        o = _p32(b, o, cast[uint32](k))
+        rt_memcpy(c[0].buf + cast[uint64](o), cast[uint64](buf) + done, k)
+        r: int32 = _rpc(c, o + cast[uint32](k))
+        w: uint32 = 0
+        if r >= 0:
+            w = _g32(b, 7)
+        mutex_unlock(&c[0].lock)
+        if r < 0:
+            if done > 0:
+                return cast[int64](done)
+            return cast[int64](r)
+        if w == 0:
+            break
+        done = done + cast[uint64](w)
+    return cast[int64](done)
+
+
+def _fid_op(n: uint32, fid: uint32, t: uint32, release: uint32) -> int32:
+    c: Ptr[P9Conn] = _conn(n)
+    mutex_lock(&c[0].lock)
+    r: int32 = 0
+    if c[0].dead == 0:
+        r = _rpc(c, _head(c, t, fid))
+    if release != 0:
+        _fid_free(c, fid)
+    mutex_unlock(&c[0].lock)
+    if r < 0:
+        return r
+    return 0
+
+
+# Tclunk: the fid is free afterwards whatever the server says.
+def p9c_clunk(n: uint32, fid: uint32) -> int32:
+    return _fid_op(n, fid, P9C_TCLUNK, 1)
+
+
+# Forget a fid without telling the server (the caller cannot wait for it).
+def p9c_forget(n: uint32, fid: uint32):
+    c: Ptr[P9Conn] = _conn(n)
+    mutex_lock(&c[0].lock)
+    _fid_free(c, fid)
+    mutex_unlock(&c[0].lock)
+
+
+# Tremove: removes the file and clunks the fid.
+def p9c_remove(n: uint32, fid: uint32) -> int32:
+    return _fid_op(n, fid, P9C_TREMOVE, 1)
+
+
+# Tstat: the stat record (starting with its own size[2]) into buf.  Returns
+# its length, or a negative errno (-34 when it does not fit).
+def p9c_stat(n: uint32, fid: uint32, buf: Ptr[uint8], nbuf: uint64) -> int64:
+    c: Ptr[P9Conn] = _conn(n)
+    mutex_lock(&c[0].lock)
+    r: int32 = _rpc(c, _head(c, P9C_TSTAT, fid))
+    got: int64 = cast[int64](r)
+    if r >= 0:
+        b: Ptr[uint8] = _b(c)
+        sl: uint32 = _g16(b, 7)
+        if sl + 9 > cast[uint32](r) or sl < 43:
+            got = cast[int64](P9C_EIO)
+        elif cast[uint64](sl) > nbuf:
+            got = -34
+        else:
+            rt_memcpy(cast[uint64](buf), c[0].buf + 9, cast[uint64](sl))
+            got = cast[int64](sl)
+    mutex_unlock(&c[0].lock)
+    return got
+
+
+# Figures for /proc and the tests.
+def p9c_calls(n: uint32) -> uint64:
+    return p9_conns[n].calls

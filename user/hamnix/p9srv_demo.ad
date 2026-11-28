@@ -1,0 +1,675 @@
+# Hamnix Micro: copied from Hamnix user/p9srv_demo.ad at commit 1c5d976ac08fa89d58eb6a703db5f4153c5398a9
+# (GPL-3.0-or-later, Copyright David Hamner).  Local changes: this 3-line header only;
+# see fs/HAMNIX_ORIGIN.  Do not edit: fix it in Hamnix and copy again.
+# user/p9srv_demo.ad
+#
+# V4 / Phase D demo: minimum-viable userspace 9P2000 file server.
+#
+# WHAT THIS IS
+# ------------
+# A tiny test-fixture server that proves the userspace ↔ kernel 9P
+# loop closes end-to-end. It is NOT rio. It is NOT a window system.
+# It is a 150-line stub that exposes exactly one synthetic file:
+#
+#   /         QTDIR  qid.path=1   (the root)
+#   /hello    QTFILE qid.path=2   →  "p9demo says hi\n"  (15 bytes)
+#
+# WIRE TRANSPORT
+# --------------
+# fd 0 (stdin)  : we READ incoming T-messages here.
+# fd 1 (stdout) : we WRITE outgoing R-messages here.
+# fd 2 (stderr) : diagnostic banners only — never 9P bytes.
+#
+# The expected launch shape is from tests/test_p9srv_demo.ad:
+#
+#   sys_pipe(c2s)        # client→server T-msg pipe
+#   sys_pipe(s2c)        # server→client R-msg pipe
+#   spawn("/bin/p9srv_demo", argv, c2s_rfd, s2c_wfd, envp)
+#
+# spawn dup's c2s_rfd → child fd 0 and s2c_wfd → child fd 1, so
+# this binary reads T-msgs from stdin and emits R-msgs to stdout.
+# That is the SAME shape the kernel's 9P client would use if it were
+# pointed at a real bidirectional srvfd; we just split it into two
+# pipes today because Hamnix has no socketpair yet.
+#
+# DISPATCH
+# --------
+# Reads one T-msg per iteration (size[4] header, then the body),
+# decodes the type, builds the matching R-msg using lib/9p/9p.ad's
+# emitters, and writes it back. Supported types:
+#
+#   Tversion → Rversion("9P2000", msize=8192)
+#   Tattach  → Rattach (root qid, type=DMDIR, vers=0, path=1)
+#   Twalk    → Rwalk for the single-component walk "hello" only;
+#              anything else surfaces an Rerror.
+#   Topen    → Ropen (file qid, iounit=0)
+#   Tread    → Rread carrying "p9demo says hi\n" (offset 0); EOF on
+#              offset ≥ 15.
+#   Tclunk   → Rclunk
+#   anything else → Rerror "not implemented"
+#
+# FID TRACKING
+# ------------
+# This server is stateless: it doesn't enforce that the fid presented
+# at Topen/Tread matches the fid Twalk produced. The test fixture
+# only drives one fid at a time so this is fine; a real server would
+# need a per-fid table. The brief explicitly says "single-fid root +
+# single-fid /hello is enough."
+#
+# TERMINATION
+# -----------
+# When the client closes its end of the T-msg pipe, our next pipe_read
+# returns 0 (EOF); the loop exits and the program returns. The test
+# fixture sequences this by closing c2s_wfd after sending its final
+# Tclunk and waiting on the child.
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       user/p9srv_demo.ad -o build/user/p9srv_demo.elf
+#   scripts/build_user.sh's auto-discovery already lists it.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: uint64)
+# `post` mode (a `spawn`able daemon): publish ourselves on the kernel
+# /srv table so a later `mount /srv/<name> …` reaches us. We create a
+# bidirectional socketpair, post one end, and serve 9P over the other
+# (srv_rfd/srv_wfd) — fd 0/1 are left untouched.
+extern def sys_socketpair(domain: int32, type: int32, protocol: int32,
+                          sv: Ptr[int32]) -> int32
+extern def sys_srv_post(name: Ptr[char], srvfd: int32) -> int32
+
+from lib.9p.9p import (
+    P9Cursor, p9_cursor_init,
+    p9_decode_header,
+    p9_decode_tversion, p9_emit_rversion,
+    p9_decode_tattach,  p9_emit_rattach,
+    p9_decode_twalk,    p9_emit_rwalk,
+    p9_decode_topen,    p9_emit_ropen,
+    p9_decode_tread,    p9_emit_rread,
+    p9_decode_tclunk,   p9_emit_rclunk,
+    p9_decode_tauth,    p9_emit_rauth,
+    p9_decode_twrite,   p9_emit_rwrite,
+    p9_emit_rerror,
+    P9_QTDIR, P9_QTFILE, P9_QTAUTH,
+    P9_NOFID,
+    P9_TVERSION, P9_TATTACH, P9_TWALK, P9_TOPEN,
+    P9_TREAD, P9_TCLUNK, P9_TAUTH, P9_TWRITE,
+)
+
+# 9P scratch buffer. Tracks the kernel client's P9C_BUF_LEN (128 KiB,
+# sys/src/9/port/9p_client.ad) so the demo server can receive a full
+# msize-sized message from a real-fd attach. Top-level Array (nested-
+# frame quirk avoidance).
+SRV_BUF_CAP: uint64 = 131072
+srv_buf: Array[131072, uint8]
+
+# Payload for /hello — "p9demo says hi\n" (15 bytes).
+hello_bytes: Array[16, uint8] = "p9demo says hi\n"
+hello_len: uint64 = 15
+
+# Twalk decode scratch (top-level — wnames + wlens arrays sized to the
+# codec's P9_MAX_WELEM cap of 16). We only honour the single-component
+# walk "hello"; longer walks land on Rerror.
+walk_wnames: Array[16, Ptr[uint8]]
+walk_wlens:  Array[16, uint64]
+walk_qtypes: Array[16, uint8]
+walk_qvers:  Array[16, uint32]
+walk_qpaths: Array[16, uint64]
+
+
+from lib.p9 import spawn
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def _read_exact(fd: int32, buf: Ptr[uint8], want: uint64) -> int64:
+    # pipe_read may short-return; loop until we have `want` bytes or
+    # see EOF (n == 0) / error (n < 0). Returns total bytes read, 0
+    # on a clean EOF before any bytes, or a negative passthrough.
+    got: uint64 = 0
+    while got < want:
+        n: int64 = sys_read(fd, &buf[got], want - got)
+        if n < 0:
+            return n
+        if n == 0:
+            return cast[int64](got)
+        got = got + cast[uint64](n)
+    return cast[int64](got)
+
+
+def _peek_size(buf: Ptr[uint8]) -> uint32:
+    # size[4] is the first 4 bytes, little-endian.
+    b0: uint64 = cast[uint64](buf[0])
+    b1: uint64 = cast[uint64](buf[1])
+    b2: uint64 = cast[uint64](buf[2])
+    b3: uint64 = cast[uint64](buf[3])
+    return cast[uint32](b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+
+# Transport fds. The fixture launch wires fd 0 (T-msgs in) / fd 1
+# (R-msgs out); `post` mode serves over a single socketpair endpoint
+# instead — set srv_rfd = srv_wfd = that endpoint. Kept as globals so
+# the serve loop never has to thread an fd argument through every
+# emit helper.
+srv_rfd: int32 = 0
+srv_wfd: int32 = 1
+
+# F10-4 (#457) E2E: when launched as `p9srv_demo post-auth <name>` the
+# server requires the Plan 9 wire authentication handshake:
+#   * Tattach with afid == P9_NOFID         -> Rerror "auth required"
+#   * Tattach with afid in authed_afid set  -> Rattach OK
+#   * Tattach with afid not in set          -> Rerror "afid not authed"
+# Tauth allocates the afid slot; Twrite(afid, cred) marks it authed iff
+# the credential bytes equal AUTH_CRED ("authenticated\n" by default —
+# the kernel mediator writes the verified principal name as the cred,
+# but any non-empty cred is accepted in this demo to keep the policy
+# orthogonal to the principal lookup).
+AUTH_FID_CAP: uint64 = 8
+auth_mode: int32 = 0                      # 0 = legacy, 1 = auth-required, 2 = strict (cred must equal auth_expected_cred)
+auth_afid_used:   Array[8, int32]         # 1 == this afid slot is allocated
+auth_afid_value:  Array[8, uint32]        # the wire afid value
+auth_afid_done:   Array[8, int32]         # 1 == credential write OK
+# F10-4-test: when auth_mode == 2, the Twrite cred payload MUST equal
+# auth_expected_cred[0..auth_expected_len] byte-for-byte; non-matching
+# creds get Rerror "cred mismatch" and the afid stays un-authed. Used
+# by tests/test_p9_tauth_e2e.ad to drive the failure leg of
+# p9c_attach_authed_run from userland (the kernel sends the verified
+# uname as the cred; we configure the server to expect a DIFFERENT
+# uname to force the Twrite → Rerror path).
+auth_expected_cred: Array[64, uint8]
+auth_expected_len:  uint64 = 0
+
+
+def _send_rmsg(n: int32) -> int32:
+    if n <= 0:
+        return -1
+    sent: int64 = sys_write(srv_wfd, &srv_buf[0], cast[uint64](n))
+    if sent != cast[int64](n):
+        return -1
+    return 0
+
+
+# --- Tversion → Rversion ----------------------------------------------
+
+def _serve_tversion(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    ms: uint32 = 0
+    ver_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    ver_len: uint64 = 0
+    rc: int64 = p9_decode_tversion(&srv_buf[0], in_len,
+                                   &tg, &ms, &ver_ptr, &ver_len)
+    if rc < cast[int64](0):
+        return -1
+    reply_ms: uint32 = ms
+    if reply_ms > cast[uint32](SRV_BUF_CAP):
+        reply_ms = cast[uint32](SRV_BUF_CAP)
+    ver: Array[8, uint8]
+    ver[0] = 57    # '9'
+    ver[1] = 80    # 'P'
+    ver[2] = 50    # '2'
+    ver[3] = 48    # '0'
+    ver[4] = 48
+    ver[5] = 48
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_rversion(&c, tg, reply_ms, &ver[0], 6)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- Tauth → Rauth (F10-4) -------------------------------------------
+#
+# Allocate a fresh afid slot, return the auth-qid. The client is then
+# expected to Twrite the credential bytes to this afid before Tattach.
+
+def _auth_alloc_slot(afid: uint32) -> int32:
+    i: uint64 = 0
+    while i < AUTH_FID_CAP:
+        if auth_afid_used[i] == 0:
+            auth_afid_used[i]  = 1
+            auth_afid_value[i] = afid
+            auth_afid_done[i]  = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _auth_find_slot(afid: uint32) -> int32:
+    i: uint64 = 0
+    while i < AUTH_FID_CAP:
+        if auth_afid_used[i] != 0 and auth_afid_value[i] == afid:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _serve_tauth(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    afid: uint32 = 0
+    uname_p: Ptr[uint8] = cast[Ptr[uint8]](0)
+    uname_l: uint64 = 0
+    aname_p: Ptr[uint8] = cast[Ptr[uint8]](0)
+    aname_l: uint64 = 0
+    rc: int64 = p9_decode_tauth(&srv_buf[0], in_len,
+                                &tg, &afid,
+                                &uname_p, &uname_l,
+                                &aname_p, &aname_l)
+    if rc < cast[int64](0):
+        return -1
+    if auth_mode == 0:
+        # Legacy server: refuse Tauth honestly.
+        return _emit_rerror(tg, "p9demo: auth not required")
+    slot: int32 = _auth_alloc_slot(afid)
+    if slot < 0:
+        return _emit_rerror(tg, "p9demo: auth pool exhausted")
+    write_str(2, "[p9demo-auth] Rauth issued\n")
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_rauth(&c, tg, P9_QTAUTH, 0,
+                             cast[uint64](100) + cast[uint64](slot))
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- Twrite → Rwrite (F10-4 cred path) -------------------------------
+#
+# In auth_mode, a Twrite targeting a known afid is treated as the
+# credential write: any non-empty payload marks the slot "authed".
+# In legacy mode no /file is writable, so Twrite always Rerrors.
+
+def _serve_twrite(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    offset: uint64 = 0
+    count: uint32 = 0
+    data: Ptr[uint8] = cast[Ptr[uint8]](0)
+    rc: int64 = p9_decode_twrite(&srv_buf[0], in_len,
+                                 &tg, &fid, &offset,
+                                 &data, &count)
+    if rc < cast[int64](0):
+        return -1
+    if auth_mode != 0:
+        aslot: int32 = _auth_find_slot(fid)
+        if aslot >= 0:
+            # F10-4-test: strict mode (auth_mode == 2) compares the
+            # Twrite cred bytes against auth_expected_cred. A mismatch
+            # (including length mismatch) gets Rerror "cred mismatch",
+            # and the afid stays un-authed → the subsequent Tattach
+            # will also Rerror. This is the failure leg exercised by
+            # tests/test_p9_tauth_e2e.ad.
+            if auth_mode == 2:
+                cred_ok: int32 = 1
+                if cast[uint64](count) != auth_expected_len:
+                    cred_ok = 0
+                else:
+                    i: uint64 = 0
+                    while i < auth_expected_len:
+                        if data[i] != auth_expected_cred[i]:
+                            cred_ok = 0
+                            break
+                        i = i + 1
+                if cred_ok == 0:
+                    write_str(2, "[p9demo-strict] cred mismatch rejected\n")
+                    return _emit_rerror(tg, "p9demo: cred mismatch")
+                auth_afid_done[cast[uint64](aslot)] = 1
+                write_str(2, "[p9demo-strict] cred matched, afid authed\n")
+                c: P9Cursor
+                p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+                n: int32 = p9_emit_rwrite(&c, tg, count)
+                if n < 0:
+                    return -1
+                return _send_rmsg(n)
+            # Any non-empty credential marks the slot authed. (The
+            # kernel mediator writes the verified principal name as
+            # the cred; the demo server's policy is "trust the kernel
+            # mediator" since that's the trust root — see
+            # docs/audit_arch_shortcuts_2026-06-13.md §1.3.)
+            if count > 0:
+                auth_afid_done[cast[uint64](aslot)] = 1
+                write_str(2, "[p9demo-auth] afid marked authed\n")
+            c: P9Cursor
+            p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+            n: int32 = p9_emit_rwrite(&c, tg, count)
+            if n < 0:
+                return -1
+            return _send_rmsg(n)
+    # Not an afid (or legacy server): no writable file in this demo.
+    return _emit_rerror(tg, "p9demo: not writable")
+
+
+# --- Tattach → Rattach ------------------------------------------------
+
+def _serve_tattach(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    afid: uint32 = 0
+    uname_p: Ptr[uint8] = cast[Ptr[uint8]](0)
+    uname_l: uint64 = 0
+    aname_p: Ptr[uint8] = cast[Ptr[uint8]](0)
+    aname_l: uint64 = 0
+    rc: int64 = p9_decode_tattach(&srv_buf[0], in_len,
+                                  &tg, &fid, &afid,
+                                  &uname_p, &uname_l,
+                                  &aname_p, &aname_l)
+    if rc < cast[int64](0):
+        return -1
+    # F10-4 (#457) E2E: auth-required mode rejects un-authed Tattach.
+    # This is the GATE the existing structural test_p9_tauth.sh could
+    # not reach: a server-side check that the afid carries an actual
+    # authentication, not just a uname.
+    if auth_mode != 0:
+        if afid == P9_NOFID:
+            write_str(2, "[p9demo-auth] Tattach with NOFID rejected\n")
+            return _emit_rerror(tg, "p9demo: auth required")
+        aslot: int32 = _auth_find_slot(afid)
+        if aslot < 0:
+            write_str(2, "[p9demo-auth] Tattach with unknown afid rejected\n")
+            return _emit_rerror(tg, "p9demo: afid unknown")
+        if auth_afid_done[cast[uint64](aslot)] == 0:
+            write_str(2, "[p9demo-auth] Tattach with un-credentialed afid rejected\n")
+            return _emit_rerror(tg, "p9demo: afid not authed")
+        write_str(2, "[p9demo-auth] Tattach with authed afid OK\n")
+    # Root qid: DMDIR, vers=0, path=1.
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_rattach(&c, tg, P9_QTDIR, 0, 1)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- Twalk → Rwalk ----------------------------------------------------
+
+def _serve_twalk(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    newfid: uint32 = 0
+    nwname: uint16 = 0
+    rc: int64 = p9_decode_twalk(&srv_buf[0], in_len,
+                                &tg, &fid, &newfid,
+                                &nwname, &walk_wnames[0], &walk_wlens[0])
+    if rc < cast[int64](0):
+        return -1
+    # Clone walk (nwname == 0): succeed with zero qids — the newfid
+    # now references the same node as fid.
+    if nwname == 0:
+        c: P9Cursor
+        p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+        nout: int32 = p9_emit_rwalk(&c, tg, 0,
+                                    &walk_qtypes[0], &walk_qvers[0],
+                                    &walk_qpaths[0])
+        if nout < 0:
+            return -1
+        return _send_rmsg(nout)
+    # Only the single-component walk "hello" is honoured.
+    if nwname != 1:
+        return _emit_rerror(tg, "p9demo: unknown path depth")
+    name_p: Ptr[uint8] = walk_wnames[0]
+    if walk_wlens[0] != 5:
+        return _emit_rerror(tg, "p9demo: name not 'hello'")
+    if name_p[0] != 104 or name_p[1] != 101 or name_p[2] != 108 \
+            or name_p[3] != 108 or name_p[4] != 111:
+        return _emit_rerror(tg, "p9demo: name not 'hello'")
+    walk_qtypes[0] = P9_QTFILE
+    walk_qvers[0]  = 0
+    walk_qpaths[0] = 2                       # /hello
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    nout: int32 = p9_emit_rwalk(&c, tg, 1,
+                                &walk_qtypes[0], &walk_qvers[0],
+                                &walk_qpaths[0])
+    if nout < 0:
+        return -1
+    return _send_rmsg(nout)
+
+
+# --- Topen → Ropen ----------------------------------------------------
+
+def _serve_topen(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    mode: uint8 = 0
+    rc: int64 = p9_decode_topen(&srv_buf[0], in_len,
+                                &tg, &fid, &mode)
+    if rc < cast[int64](0):
+        return -1
+    # We don't track which fid was walked to /hello — single-file server,
+    # so any open succeeds against the file qid.
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_ropen(&c, tg, P9_QTFILE, 0, 2, 0)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- Tread → Rread ----------------------------------------------------
+
+def _serve_tread(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    offset: uint64 = 0
+    count: uint32 = 0
+    rc: int64 = p9_decode_tread(&srv_buf[0], in_len,
+                                &tg, &fid, &offset, &count)
+    if rc < cast[int64](0):
+        return -1
+    available: uint32 = 0
+    if offset < hello_len:
+        available = cast[uint32](hello_len - offset)
+    if available > count:
+        available = count
+    data_ptr: Ptr[uint8] = &hello_bytes[0]
+    if offset > 0 and offset < hello_len:
+        data_ptr = &hello_bytes[offset]
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_rread(&c, tg, data_ptr, available)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- Tclunk → Rclunk --------------------------------------------------
+
+def _serve_tclunk(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    rc: int64 = p9_decode_tclunk(&srv_buf[0], in_len, &tg, &fid)
+    if rc < cast[int64](0):
+        return -1
+    # F10-4: if the clunked fid is one of our auth slots, free it so a
+    # second mount on the same connection can re-Tauth without bumping
+    # the pool. (The kernel client clunks the afid after Tattach.)
+    if auth_mode != 0:
+        aslot: int32 = _auth_find_slot(fid)
+        if aslot >= 0:
+            au: uint64 = cast[uint64](aslot)
+            auth_afid_used[au] = 0
+            auth_afid_done[au] = 0
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_rclunk(&c, tg)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- Rerror -----------------------------------------------------------
+
+def _emit_rerror(tg: uint16, msg: Ptr[uint8]) -> int32:
+    mlen: uint64 = 0
+    while msg[mlen] != 0:
+        mlen = mlen + 1
+    c: P9Cursor
+    p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
+    n: int32 = p9_emit_rerror(&c, tg, msg, mlen)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+def _serve_unsupported(in_len: uint64) -> int32:
+    # Pull the tag out of the header for the Rerror reply, then surface
+    # a generic "not implemented" message.
+    sz: uint32 = 0
+    ty: uint8 = 0
+    tg: uint16 = 0
+    rc: int32 = p9_decode_header(&srv_buf[0], in_len, &sz, &ty, &tg)
+    if rc != 0:
+        return -1
+    return _emit_rerror(tg, "p9demo: not implemented")
+
+
+def _serve_one() -> int32:
+    # Returns 1 on a normal serve, 0 on clean EOF on stdin (client
+    # disconnected), -1 on any wire / decode error.
+    # 1) Read the 7-byte header.
+    h: int64 = _read_exact(srv_rfd, &srv_buf[0], 7)
+    if h == cast[int64](0):
+        return 0                                   # EOF — peer closed
+    if h != cast[int64](7):
+        return -1
+    sz: uint32 = _peek_size(&srv_buf[0])
+    if cast[uint64](sz) < 7 or cast[uint64](sz) > SRV_BUF_CAP:
+        return -1
+    # 2) Read the body (sz - 7 bytes) right after the header.
+    rest: uint64 = cast[uint64](sz) - 7
+    if rest > 0:
+        b: int64 = _read_exact(srv_rfd, &srv_buf[7], rest)
+        if b != cast[int64](rest):
+            return -1
+    # 3) Dispatch on type byte.
+    in_len: uint64 = cast[uint64](sz)
+    t: uint8 = srv_buf[4]
+    if t == P9_TVERSION:
+        if _serve_tversion(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TAUTH:
+        if _serve_tauth(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TWRITE:
+        if _serve_twrite(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TATTACH:
+        if _serve_tattach(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TWALK:
+        if _serve_twalk(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TOPEN:
+        if _serve_topen(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TREAD:
+        if _serve_tread(in_len) < 0:
+            return -1
+        return 1
+    if t == P9_TCLUNK:
+        if _serve_tclunk(in_len) < 0:
+            return -1
+        return 1
+    if _serve_unsupported(in_len) < 0:
+        return -1
+    return 1
+
+
+AF_UNIX:     int32 = 1
+SOCK_STREAM: int32 = 1
+post_sv:     Array[2, int32]
+
+
+def _cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        if a[i] != b[i]:
+            return 0
+        if a[i] == 0:
+            return 1
+        i = i + 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    write_str(2, "[p9demo] server starting\n")
+    # `p9srv_demo post <name>` — a spawnable daemon shape (§15): create
+    # a socketpair, publish ONE end on /srv/<name>, and serve 9P over
+    # the OTHER end directly (srv_rfd/srv_wfd point at it — we never
+    # touch fd 0/1, so a backgrounding shell's console stays its own).
+    # A later `mount /srv/<name>` sys_srv_open's the posted end and
+    # speaks 9P over it. Without `post` we keep the fixture shape (a
+    # launcher wires fd 0 / fd 1 at spawn time).
+    post_arg: int32 = 0
+    if argc >= 3 and _cstr_eq(cast[Ptr[uint8]](argv[1]), "post") != 0:
+        post_arg = 1
+    if argc >= 3 and _cstr_eq(cast[Ptr[uint8]](argv[1]), "post-auth") != 0:
+        post_arg = 1
+        auth_mode = 1
+        write_str(2, "[p9demo-auth] mode=auth-required\n")
+    # F10-4-test: post-auth-strict <name> <expected_cred> — auth-required
+    # PLUS the Twrite payload must equal <expected_cred> exactly. Used by
+    # the failure leg of tests/test_p9_tauth_e2e.ad: configure the
+    # server to expect cred="alice" while the kernel mediator writes
+    # cred="live" (the verified principal) → server Rerrors Twrite →
+    # p9c_attach_authed_run returns -1 → mount fails.
+    if argc >= 4 and _cstr_eq(cast[Ptr[uint8]](argv[1]), "post-auth-strict") != 0:
+        post_arg = 1
+        auth_mode = 2
+        # Copy argv[3] into auth_expected_cred (truncate to 64 bytes).
+        exp_p: Ptr[uint8] = cast[Ptr[uint8]](argv[3])
+        ei: uint64 = 0
+        while ei < 63:
+            b: uint8 = exp_p[ei]
+            if b == 0:
+                break
+            auth_expected_cred[ei] = b
+            ei = ei + 1
+        auth_expected_len = ei
+        write_str(2, "[p9demo-strict] mode=auth-strict expected=")
+        sys_write(2, &auth_expected_cred[0], auth_expected_len)
+        write_str(2, "\n")
+    if post_arg != 0:
+        srvname: Ptr[char] = cast[Ptr[char]](argv[2])
+        if sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &post_sv[0]) < 0:
+            write_str(2, "[p9demo] FAIL: socketpair\n")
+            return 1
+        # post_sv[0] -> the kernel 9P client reaches us via sys_srv_open;
+        # post_sv[1] -> our own serve transport (bidirectional).
+        if sys_srv_post(srvname, post_sv[0]) < 0:
+            write_str(2, "[p9demo] FAIL: srv_post\n")
+            return 1
+        srv_rfd = post_sv[1]
+        srv_wfd = post_sv[1]
+        write_str(2, "[p9demo] posted to /srv\n")
+    # Serve until the client closes its end. Each iteration handles
+    # exactly one T → R round trip. We log a diagnostic on the first
+    # successful serve so the test fixture has a marker proving the
+    # server got at least one Tversion through.
+    served: int32 = 0
+    while True:
+        rc: int32 = _serve_one()
+        if rc == 0:
+            write_str(2, "[p9demo] EOF, exiting\n")
+            return 0
+        if rc < 0:
+            write_str(2, "[p9demo] wire error, exiting\n")
+            return 1
+        if served == 0:
+            write_str(2, "[p9demo] served first request\n")
+            served = 1
+    return 0

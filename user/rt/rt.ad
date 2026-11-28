@@ -245,7 +245,23 @@ def sys_nslabel(op: int32, label: Ptr[uint8], to_path: Ptr[uint8], from_path: Pt
 
 
 def sys_srv_open(name: Ptr[uint8]) -> int32:
-    return cast[int32](hmicro_syscall(276, 0, 0, 0, 0, 0, 0))
+    return cast[int32](hmicro_syscall(276, cast[uint64](name), 0, 0, 0, 0, 0))
+
+
+def sys_srv_post(name: Ptr[uint8], srvfd: int32) -> int32:
+    return cast[int32](hmicro_syscall(275, cast[uint64](name), cast[uint64](cast[uint32](srvfd)), 0, 0, 0, 0))
+
+
+# Two connected descriptors in sv[0] and sv[1] (C ints); the arguments
+# before it are accepted for Hamnix's sake and ignored.
+def sys_socketpair(domain: int32, type: int32, protocol: int32, sv: Ptr[int32]) -> int32:
+    return cast[int32](hmicro_syscall(53, 0, 0, 0, cast[uint64](sv), 0, 0))
+
+
+# Hamnix Micro: open an existing file with a mode (0 read, 1 write, 2 both, | 16
+# truncate); Hamnix's open is read-only and its open_write truncates.
+def sys_open_mode(path: Ptr[uint8], mode: int32) -> int32:
+    return cast[int32](hmicro_syscall(519, cast[uint64](path), cast[uint64](cast[uint32](mode)), 0, 0, 0, 0))
 
 
 def sys_setuid_auth(authfd: int32) -> int32:
