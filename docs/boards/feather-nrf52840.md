@@ -75,7 +75,7 @@ writes words into a reserved erased page (NVMC) at each start-up stage and
 in the fault handler (exception number, CFSR, BFAR, stacked PC) can be read
 back over USB after a double-tap.
 
-Size is now a constraint on such boards: this image ends at 0xaa288, 11 KB below the limit (kernel code to 0x504b8, /bin 0x60000..0xa9b20). Newer Adafruit bootloaders
+Size is a constraint on such boards. The milestone-4 image ended at 0xaa288, 11 KB below the limit; the milestone-5 image is built with `-Oz` and ends at 0xa0af0, 49 KB below it (section 7a, "Milestone 5 update"). Newer Adafruit bootloaders
 raise the limit to 0xED000; updating the bootloader is the board owner's
 decision.
 
@@ -387,6 +387,92 @@ idle shell in Renode, 1000 with the periodic tick); `suspend [SECONDS] [-n]`
 x`), optional RTS (`CONSOLE_RTS_PIN` in `boards/feather_nrf52840/board.ad`).
 All UNTESTED ON HARDWARE; add to the bring-up checklist: paste a block of
 text, `idlestat 5`, `suspend 10`, `suspend 10 -n` with a current meter.
+
+### Milestone 5 update: size, pins, 9P (measured in Renode, 2026-11-28)
+
+**Nothing in this section has run on the board.** The image that ran on
+the real Feather was built at `-O2`; this one is built at `-Oz` (every C
+and Adder unit, kernel and programs), which changes inlining and stack use
+everywhere. The emulator suites pass; the stacks measured in Renode are
+below.
+
+**Flash.** With namespaces, device files and 9P the `-O2` kernel grew to
+228 KB and `/bin` to 323 KB: 70 KB over the bootloader's 0xAD000. Measured
+alternatives for kernel / `/bin`: `-O2` 228 / 323 KB, `-Os` 164 / 323 KB,
+`-Oz` 127 / 271 KB (the full program set). `board.mk` now sets `OPT ?= -Oz`.
+
+| | address | bytes |
+|--|--|--|
+| kernel code and constants | 0x26000..0x44ff8 | 126,968 |
+| unused (the `/bin` window must start on a 128 KB boundary for the MPU) | 0x44ff8..0x60000 | 110,600 |
+| `/bin`: 37 programs, run in place | 0x60000..0xa0230 | 262,704 |
+| `.data` initial values | 0xa0230..0xa0af0 | 2,240 |
+| **spare below 0xAD000** | 0xa0af0..0xad000 | **50,448** |
+
+Programs in `/bin` (bytes): hamsh 168,532; ptest 12,220; grep 10,180; vi
+8,872; exportfs 8,284; sort 4,176; cut 3,928; ls 3,724; cp 3,412; kill
+3,404; tr 3,272; idlestat 3,000; suspend 2,088; uniq 2,044; free 1,704;
+help 1,624; wc 1,560; cat 1,388; mv 1,356; seq 1,240; tail 1,236; date
+1,208; ps 1,196; sleep 1,096; keypress 1,080; head, df 984; tee 968;
+setdate 952; touch 904; od 888; mkdir 856; rm 840; hello 728; echo 712;
+halt, regprobe 568. **Left out:** `p9srv_demo` (10 KB; `exportfs` is the 9P
+server here), `srv` (no second serial port as a file on this board), `crel`
+(cannot be an RWPI program). Everything else fits, `vi` included. If room
+is needed again: `ptest` (a test program) and `vi` are the largest after
+the shell; moving `/bin` down to 0x40000 would need the kernel under
+104 KB.
+
+**RAM.** Kernel heap 48,064 bytes (was 49,408: the connection, `/srv`,
+device and channel tables are static data), 7,440 in use at boot, 42,032
+at the test session's peak. Each mounted 9P server takes a 1,048-byte
+message buffer from it; `exportfs` runs in a 12 KB block of the program
+arena. Beside the shell and a running `exportfs` there is room for the
+small programs (`cat`, `ls`, `echo`, `wc`, `seq`, `ps`), not for `grep`,
+`cp`, `sort` or `vi`. Stacks in the Renode session: init 1,648 of 3,072;
+hamsh user 1,672 of 8,192, kernel 1,872 of 4,096; the largest kernel stack
+of any process 1,904; largest user stack 7,140 of 8,192 (grep).
+
+**Pins.** `/dev/gpio/red`, `blue`, `button` and the header pins by nRF
+number are the GPIO registers ([`../devices.md`](../devices.md), "The
+Feather's pins"):
+
+```
+hamsh$ echo 1 > /dev/gpio/blue     # blue LED on
+hamsh$ echo 0 > /dev/gpio/blue
+hamsh$ echo 1 > /dev/gpio/red      # red LED: stops blinking and stays on
+hamsh$ cat /dev/gpio/button        # 1; 0 while the user switch is held
+```
+
+To check on the board: that the LEDs follow (both are active high per
+Adafruit's `LED_STATE_ON 1`), that `button` reads 0 when pressed, and a
+header pin with a meter.
+
+**Namespaces and 9P at the prompt** ([`../namespaces.md`](../namespaces.md),
+"On the Feather nRF52840"; [`../9p.md`](../9p.md)):
+
+```
+hamsh$ cat /proc/self/ns
+hamsh$ ns { bind -b /tmp/mybin /bin ; seq 3 }
+hamsh$ mkdir /tmp/ex ; echo one > /tmp/ex/a
+hamsh$ exportfs -s ex /tmp/ex &
+hamsh$ mount /srv/ex /n/ex ; cat /n/ex/a
+hamsh$ unmount /n/ex ; rm /srv/ex
+```
+
+and from the PC, with nothing else on the serial port:
+
+```
+$ tools/hm9p.py --tty /dev/ttyUSB0 ls /dev -- cat /proc/version -- write /dev/gpio/blue 1
+```
+
+The last is the least certain on real hardware: 9P requests of up to 280
+bytes arrive in one burst at 115200 baud and the UARTE takes them a byte
+per interrupt; Renode shows the protocol working on this image (16 checks,
+`tests/nrf52/renode_9p.sh`), not the timing. If it fails on the board the
+tool reports a timeout and the console may be left in wire mode: reset the
+board. Add to the bring-up checklist: `help`; the LED commands above;
+`cat /proc/self/ns`; the `ns { }` line; the `exportfs`/`mount` lines; then
+`hm9p.py ... cat /proc/version` from the PC.
 
 ## 8. How this board is put together
 

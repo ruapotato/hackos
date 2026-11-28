@@ -373,7 +373,14 @@ echo "[test] === 8. the shell: Hamnix's hamsh as a process on the UART console, 
 # "0 0 0" is never part of what was typed, and the harness waits for the n-th
 # one before it types the next command.
 rm -rf $B/panel-shell $B/panel-shell.bin; mkdir -p $B/panel-shell
-qemu_start $B/hmicro.elf $B/shell.out "$SDCARD -serial file:$B/panel-shell.bin"
+# The board's third UART (/dev/eia1) is a Unix socket, and at its other end
+# tools/hm9pd.py serves a directory of this machine with 9P: the "PC" that
+# the session mounts over a serial line.
+PCDIR=$B/9p-pcdir; rm -rf $PCDIR $B/eia1.sock; mkdir -p $PCDIR/sub
+echo 'a file on the PC' > $PCDIR/readme; echo 'pc-deep' > $PCDIR/sub/d
+qemu_start $B/hmicro.elf $B/shell.out "$SDCARD -serial file:$B/panel-shell.bin -serial unix:$B/eia1.sock,server=on,wait=off"
+python3 -I tools/hm9pd.py --unix $B/eia1.sock $PCDIR 2> $B/hm9pd.log &
+PCPID=$!
 m=0
 sh() {  # type one command line, then the marker command; wait for the marker
     m=$((m+1))
@@ -661,6 +668,26 @@ if wait_for "hamsh\$ "; then
     sh 'rm /srv/ex2'
     sh 'sleep 1'
     sh 'echo p9-jobs ; jobs ; echo p9-jobs-end'
+    # (a) over a serial device: the PC's directory, served by tools/hm9pd.py
+    # on the board's second serial line, posted in /srv with srv and mounted
+    sh 'srv /dev/eia1 pc'
+    sh 'mount /srv/pc /n/pc'
+    sh 'echo p9-pc ; ls /n/pc ; cat /n/pc/readme /n/pc/sub/d'
+    sh 'echo made-on-the-device > /n/pc/from-device'
+    sh 'seq 3 >> /n/pc/from-device'
+    sh 'mkdir /n/pc/newdir'
+    sh 'cp /bin/hello /n/pc/hello'
+    sh '/n/pc/hello ran-from-the-pc'
+    sh 'cat /proc/self/ns | grep /n/pc'
+    sh 'rm /n/pc/readme'
+    sh 'unmount /n/pc'
+    sh 'cat /n/pc/sub/d'
+    sh 'mount /srv/pc /n/again'
+    sh 'cat /n/again/sub/d | tr a-z A-Z'
+    sh 'unmount /n/again'
+    kill $PCPID 2>/dev/null; wait $PCPID 2>/dev/null
+    sh 'mount /srv/pc /n/dead'
+    sh 'rm /srv/pc'
     sh 'echo p9-ps ; ps | grep exportfs ; echo p9-ps-end'
     # power: how often the processor wakes while the system idles at the
     # prompt of a sleeping command, tickless and with the periodic tick;
@@ -822,7 +849,7 @@ expect "devices: ls /dev/sht4x" $S '^temperature$'
 expect "devices: text written to /dev/screen/text is on the screen (read back from /dev/screen/text)" $S '^Shown-On-Panel$'
 expect "devices: /dev/screen/data is the frame buffer, 48000 bytes" $S '^[0-9]+ [0-9]+ 48000$'
 expect "devices: text written to /dev/keys is typed on the emulated key matrix and runs as a command" $S '^Typed-Via-Dev-Keys$'
-expect "devices: ls /dev: console, null, zero, consctl and seven driver directories and files" $S '^11 11 [0-9]+$'
+expect "devices: ls /dev: console, null, zero, consctl, eia1 and seven driver directories and files" $S '^12 12 [0-9]+$'
 expect "help: /bin/help names the namespace commands" $S '^  namespace +bind \[-b\|-a\|-c\] SRC NAME +unmount NAME'
 expect "help: ... 9P and the device files" $S '^  9P +exportfs -s N DIR & +mount /srv/N NAME'
 # milestone 5: 9P
@@ -851,6 +878,15 @@ expect "9p: the server killed while mounted: an error, not a hang" $S '^cat: can
 seq_is p9-srv-empty 1 "p9-srv-end " "9p: rm /srv/NAME removes a posted server: /srv is empty"
 seq_is p9-jobs 1 "p9-jobs-end " "9p: exportfs ends by itself when its mount and its /srv name are gone; no job is left"
 seq_is p9-ps 1 "p9-ps-end " "9p: ... and no exportfs process"
+seq_is p9-pc 4 "readme sub a file on the PC pc-deep " "9p serial: srv /dev/eia1 pc; mount /srv/pc /n/pc: the PC's directory (tools/hm9pd.py on the second UART) listed and read"
+[ "$(tr '\n' ' ' < $PCDIR/from-device 2>/dev/null)" = "made-on-the-device 1 2 3 " ] && ok "9p serial: a file created and appended to on the device is on the PC" || bad "9p serial: $PCDIR/from-device is '$(cat $PCDIR/from-device 2>&1)'"
+[ -d $PCDIR/newdir ] && [ ! -e $PCDIR/readme ] && ok "9p serial: mkdir and rm reached the PC's directory" || bad "9p serial: mkdir/rm did not reach $PCDIR"
+cmp -s $PCDIR/hello $B/user/hello && ok "9p serial: cp /bin/hello to the PC: byte-identical there ($(stat -c %s $PCDIR/hello) bytes)" || bad "9p serial: the copied program differs"
+expect "9p serial: ... and it runs from the PC's directory" $S '^  arg: ran-from-the-pc$'
+expect "9p serial: /proc/self/ns shows the mount" $S '^mount /srv/pc /n/pc$'
+expect "9p serial: unmount" $S '^cat: cannot open /n/pc/sub/d: .*file does not exist'
+expect "9p serial: mounted again (a new Tversion on the same line)" $S '^PC-DEEP$'
+expect "9p serial: with nobody at the other end the mount fails after its 5 s, it does not hang" $S '^mount: .*(server has gone|9P)'
 # the same session as the fake e-paper panel showed it
 P=$B/panel-shell.txt
 python3 -I tests/display/panel2png.py $B/panel-shell.bin $B/panel-shell --font third_party/font8x8/font8x8_basic.h --yscale 2 --keep 3 > $P 2>&1; prc=$?

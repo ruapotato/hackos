@@ -72,7 +72,7 @@ Hamnix's `sys_*` stubs keeps its meaning. Hamnix Micro-only calls start at 512.
 | 19 | `sys_chdir(path)` | per process | same |
 | 20 | `sys_getcwd(buf, n)` | bytes including the NUL | same |
 | 21 | `sys_unlink(path)` | file or empty directory; **`-EBUSY` if the file is open or bound at an `/fd` name** | Hamnix removes an open file |
-| 22 | `sys_mkdir(path)` | tmpfs only | same |
+| 22 | `sys_mkdir(path)` | tmpfs, and a mounted 9P server (`Tcreate` with `DMDIR`) | same |
 | 23 | `sys_read_nb(fd, buf, n)` | > 0 bytes, 0 = nothing yet, -1 = end of file | same contract |
 | 260 | `sys_create(path, flags, mode)` | `mode & DMDIR` makes a directory, else create/truncate and open read-write | same |
 | 261 | `sys_stat_p9(path, buf, n)` | a 9P2000 stat record; bytes written | same record layout; uid/gid are the string `hmicro`; times are seconds |
@@ -129,7 +129,7 @@ names belongs to the namespace group; in Hamnix Micro to the process.)
 |--|--|--|
 | 278 | `sys_fdbind(pid, n, kind, arg)` | bind `/fd/n` of process `pid` (0 = the caller; otherwise a child of the caller). `kind`: 0 nothing, 1 console, 2 read end of pipe `arg`, 3 write end of pipe `arg`, 4 file channel `arg`, 5 whatever `/fd/arg` is bound to (dup), 6 file channel written at its end (append), 7 device or ROM-file channel `arg`. **A process can bind only what it holds** (`-EPERM` otherwise): a pipe it created with `pipechan` or already has at one of its names; a file it opened with `openchan` or already has bound. A child of `rfork` that has not exec'ed counts as its parent. A dup (5) of a file makes both names write at the end of the file, so `> file 2>&1` keeps the two streams in order |
 | 280 | `sys_pipechan()` | a new pipe (4 KiB), as a slot number for `fdbind`; it lives while a name is bound to either end |
-| 281 | `sys_openchan(path, mode)` | open a file as a channel for `fdbind`: mode 0 existing, 1 create or truncate, 2 create and keep. tmpfs files, devices, and (mode 0) the programs under `/bin`. The caller is granted the right to bind the result (until it ends or the file is removed; the kernel remembers 32 grants and overwrites the oldest) |
+| 281 | `sys_openchan(path, mode)` | open a file as a channel for `fdbind`: mode 0 existing, 1 create or truncate, 2 create and keep. tmpfs files, devices, (mode 0) the programs under `/bin`, and files on a mounted 9P server (the channel is then an open file on the server, counted per `/fd` name it is bound at and clunked with the last; one the opener does not bind is closed at its next `openchan` or when it ends). The caller is granted the right to bind the result (until it ends or the file is removed; the kernel remembers 32 grants and overwrites the oldest) |
 | 282 | `sys_nsid()` | the caller's namespace group, counted from 1: equal for processes that share a namespace |
 | 287, 324 | `sys_fdslot_kind(pid, n)`, `sys_fdslot_arg(pid, n)` | what a name is bound to |
 
@@ -183,7 +183,10 @@ cost.
 | 257 | `sys_bind(new, old, flag)` | afterwards the name `new` leads to what `old` names now (`old`: a path, resolved at once, or a server name `#X/...`). `flag`: `MREPL` 0 replaces what is bound at `new`, `MBEFORE` 1 and `MAFTER` 2 add a union member in front or behind; `MCREATE` 4: creates go to this member; `MCACHE` 8: stored, no effect; `MRDONLY` 16: changes through this binding fail with `-EROFS` | same arguments, flags and search order; errors are errno values (Hamnix: -1) |
 | 259 | `sys_unmount(new, old)` | `new` = 0: remove everything bound at `old`; else remove the one binding of a source and a mount point, in either order | Hamnix: mount point first |
 | 285 | `sys_nslabel(op, label, to, from)` | op 0: label the newest binding at `to`; op 1: remove the binding carrying `label` | same; `from` is not needed |
-| 258 | `sys_mount(srvfd, afd, old, flag, spec)` | attach a 9P server | see [`9p.md`](9p.md) |
+| 258 | `sys_mount(srvfd, afd, old, flag, spec)` | attach the 9P2000 server reached through `srvfd` (a socketpair end, or an open device file that carries bytes both ways) at the name `old`, with `bind`'s flags; `Tversion` and `Tattach` are done before it returns. `afd` and `spec` are ignored (no authentication, one tree per server). On success `srvfd` is closed. [`9p.md`](9p.md) | same arguments; Hamnix can authenticate through `afd` and leaves `srvfd` open |
+| 53 | `sys_socketpair(domain, type, protocol, sv)` | two descriptors, each reading what the other writes (two kernel pipes); the first three arguments are ignored | Hamnix's call, used by its servers the same way |
+| 275 | `sys_srv_post(name, fd)` | leave the socketpair end `fd` (or a readable and writable device file) in `/srv` under `name`; `-EEXIST`, `-ENOSPC` (8 names) | Hamnix records the poster's descriptor number; here `/srv` holds the end itself until `rm /srv/name` |
+| 276 | `sys_srv_open(name)` | a descriptor for what is posted as `/srv/name`, for `mount` | same |
 
 ### Accepted but empty
 
@@ -213,6 +216,8 @@ number returns `-ENOSYS` (-38) with the error string `unknown syscall`
   entries, shared copy-on-write between the processes that have not changed
   it, where Hamnix has a 10 KB table per namespace
   ([`namespaces.md`](namespaces.md)).
+* **9P is small too.** One request at a time per connection, four
+  connections, no cache, no authentication ([`9p.md`](9p.md)).
 * **Open modes.** As in Hamnix, `open` is read-only and `open_write` creates or
   truncates. The kernel-internal `vfs_open(path, mode)` also has read-write
   and append; only `create` exposes read-write to programs so far.
@@ -232,7 +237,9 @@ number returns `-ENOSYS` (-38) with the error string `unknown syscall`
 ## Not implemented (Hamnix has them)
 
 `pipe` (14; use `pipechan` + `fdbind`), `kill` (15; write to `/proc/<pid>/note`),
-`fd2path` (264), `wstat`/`fwstat` (266-267), `srv_open` (276),
+`fd2path` (264), `wstat`/`fwstat` (266-267), `notify`/`noted` (270-271: no
+program or library copied from Hamnix calls them, and none in Hamnix's
+`user/` or `lib/` does),
 `svc_publish` (291), `setuid_auth` (300), `clock_gettime` (307),
 `waitfds` (313), `listdir_records` (318), `chan_dir_mode` (319: `ls -l` falls
 back to the plain listing), sockets, services, graphics, and the rest.

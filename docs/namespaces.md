@@ -210,11 +210,11 @@ duplicated only when one of its users binds or unmounts.
 
 | | bytes |
 |--|--|
-| per thread: its group number | 4 (in the thread table) |
+| per thread: its group number | 4 (in the thread table; a thread's entry is 864 bytes in all) |
 | namespace groups | 8 each, 32 of them: 256 bytes of static data |
-| the boot namespace, 6 binds | 104 bytes of table in a 272-byte heap block |
+| the boot namespace, 7 binds | 122 bytes of table |
 | a process that inherits its namespace (`RFNAMEG` or not) | 0 bytes of heap |
-| the first bind in an inherited namespace (a private copy) | one heap block: 16 bytes of header plus the table, rounded up to 64; 224 bytes of heap for 7 binds |
+| the first bind in an inherited namespace (a private copy) | one heap block: 16 bytes of header plus the table, rounded up to 64; 224 bytes of heap for 8 binds |
 | one more bind | 9 bytes + the two names + 3 (30 bytes for `/tmp/nsu` -> `#t/tmp/nsb`); the block grows by 64 bytes when it is full |
 | limit of one table | 4096 bytes (about 225 short binds); 1024 on the Feather nRF52840 |
 

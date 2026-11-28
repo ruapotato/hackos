@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- a spare CMSDK APB UART as a device file: /dev/eia1 (Plan 9's
+# name for a serial port).  Bytes written go out of the port, a read returns
+# what has arrived (it waits for the first byte, five seconds at most, then
+# returns 0: so a mount of a line nobody answers on fails instead of
+# hanging; a 9P server there must answer within that time).  No line discipline, no
+# echo: the file is a plain byte channel, which is what a 9P connection to
+# another machine needs (`srv /dev/eia1 pc ; mount /srv/pc /n/pc`,
+# docs/9p.md).
+#
+# Only the QEMU boards have this so far (their UART2 at 0x40006000; UART0 is
+# the console, UART1 the fake panel).  The receiver is polled once per
+# scheduler tick: QEMU's model holds the sender while its one-byte receive
+# register is full, so nothing is lost, but a real UART at speed would need
+# its interrupt and a ring, as the console has (drivers/tty/console.ad).
+#   +0x00 DATA   +0x04 STATE (bit0 TX full, bit1 RX full)
+#   +0x08 CTRL (bit0 TX_EN, bit1 RX_EN)   +0x10 BAUDDIV
+
+from kernel.cpu import mmio_read32, mmio_write32
+from kernel.sched.core import thread_sleep, thread_killed
+from fs.devtree import devtree_add
+
+EIA_SILENCE: uint32 = 5000          # ticks (ms) after which a read gives up and returns 0
+
+
+def _eia_rd(base: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    got: uint64 = 0
+    idle: uint32 = 0
+    while got < n:
+        if (mmio_read32(base + 4) & 2) != 0:
+            buf[got] = cast[uint8](mmio_read32(base) & 255)
+            got = got + 1
+            idle = 0
+            continue
+        # nothing in the register: with bytes in hand, give the sender two
+        # ticks to deliver the next one, then return what there is
+        if got != 0 and idle >= 2:
+            break
+        thread_sleep(1)
+        idle = idle + 1
+        if idle >= EIA_SILENCE:
+            break                       # 0 bytes: the line is silent
+        if thread_killed() != 0:
+            if got != 0:
+                break
+            return -4
+    return cast[int64](got)
+
+
+def _eia_wr(base: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    i: uint64 = 0
+    while i < n:
+        while (mmio_read32(base + 4) & 1) != 0:
+            i = i
+        mmio_write32(base, cast[uint32](buf[i]))
+        i = i + 1
+    return cast[int64](n)
+
+
+# Register the UART at `base` as /dev/<path> ("eia1": a string constant).
+def cmsdk_eia_add(path: Ptr[uint8], base: uint64) -> int32:
+    mmio_write32(base + 0x10, 16)
+    mmio_write32(base + 8, 3)           # TX_EN | RX_EN, no interrupts
+    return devtree_add(path, cast[uint64](&_eia_rd), cast[uint64](&_eia_wr), base)

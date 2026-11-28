@@ -12,12 +12,17 @@
 # after the poster has closed its descriptor and until it is removed
 # (`rm /srv/name`).  New code: Hamnix's table is tied to its task and
 # descriptor structures.
+#
+# A device file that carries bytes both ways (a serial port) can be posted
+# too (`srv /dev/eia1 pc`): the entry then names the device, and whoever
+# opens it gets a descriptor on that device, for mount to speak 9P over.
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore
 from kernel.pipe import pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer
 
 SRV_MAX: uint32 = 8                 # = the dimension of srv_tab
 SRV_NAME: uint32 = 23
+SRV_DEVICE: int32 = -2              # an entry's wp when it is a device file: rp is the file's number (fs/devtree.ad)
 
 
 class SrvEntry:
@@ -76,8 +81,9 @@ def srv_post(name: Ptr[uint8], rp: int32, wp: int32) -> int32:
         k = k + 1
     srv_tab[i].used = 1
     cpu_irq_restore(irq)
-    pipe_inc_reader(rp)
-    pipe_inc_writer(wp)
+    if wp != SRV_DEVICE:
+        pipe_inc_reader(rp)
+        pipe_inc_writer(wp)
     return 0
 
 
@@ -99,8 +105,9 @@ def srv_remove(name: Ptr[uint8]) -> int32:
     cpu_irq_restore(irq)
     if i < 0:
         return -2
-    pipe_close_reader(srv_tab[i].rp)
-    pipe_close_writer(srv_tab[i].wp)
+    if srv_tab[i].wp != SRV_DEVICE:
+        pipe_close_reader(srv_tab[i].rp)
+        pipe_close_writer(srv_tab[i].wp)
     return 0
 
 

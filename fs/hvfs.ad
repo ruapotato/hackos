@@ -62,10 +62,10 @@ from fs.fat import fat_init, fat_lookup, fat_read, fat_listdir, fat_create, fat_
 from kernel.block.blk import blk_init
 from fs.ns import ns_init, ns_ref, ns_unref, ns_split, ns_add, ns_remove, ns_set_label, ns_remove_label, ns_walk, ns_create_target, ns_children, ns_render, ns_line_in, MORDER, NS_BIND
 from fs.p9c import p9c_init, p9c_connect, p9c_discard, p9c_get, p9c_put, p9c_name, p9c_find_name, p9c_walk, p9c_open, p9c_create, p9c_read, p9c_write, p9c_clunk, p9c_forget, p9c_remove, p9c_stat, P9C_PIPES, P9C_DEVICE
-from fs.srv import srv_find, srv_post, srv_get, srv_remove, srv_name_of, srv_name, SRV_MAX
+from fs.srv import srv_find, srv_post, srv_get, srv_remove, srv_name_of, srv_name, SRV_MAX, SRV_DEVICE
 from fs.ns import ns_conn_get, ns_conn_put, ns_conn_name, ns_conn_hooks, NS_MOUNT
 from kernel.pipe import pipe_readers, pipe_writers
-from fs.devtree import devtree_find, devtree_is_dir, devtree_list, devtree_read, devtree_write, dt_count
+from fs.devtree import devtree_find, devtree_is_dir, devtree_list, devtree_read, devtree_write, devtree_can, dt_count
 from fs.procfs import proc_lookup, proc_note_pid, proc_ns_pid, proc_pid_dir, proc_render, proc_listdir, proc_note, proc_set_time, proc_fat_mounted, proc_keys, PROC_BUF, PROC_REALTIME, PROC_POWER, PROC_KEYS
 from kernel.power import power_ctl
 from kernel.pipe import pipe_init, pipe_alloc_chan, pipe_valid, pipe_owner, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_release_unbound
@@ -1232,6 +1232,8 @@ def _open_locked(canon: Ptr[uint8], mode: uint32) -> int32:
         swp: int32 = 0
         if srv_get(_proc_rel(cast[Ptr[uint8]](vfs_fs_rel(_pc(canon)))), &srp, &swp) < 0:
             return _err(ENOENT, "file does not exist")
+        if swp == SRV_DEVICE:
+            return _install(OF_DEV, DEV_TREE + srp, ORDWR, 0, 0)
         return _sock_install(srp, swp)
     if kind == FS_KIND_PROC:
         return _proc_open(cast[Ptr[uint8]](vfs_fs_rel(_pc(canon))), wants_write)
@@ -2570,19 +2572,23 @@ def _fd_transport(fd: int32, kind: Ptr[uint32], rp: Ptr[int32], wp: Ptr[int32]) 
         elif f[0].kind == OF_DEV and f[0].slot >= DEV_TREE:
             kind[0] = P9C_DEVICE
             rp[0] = f[0].slot - DEV_TREE
-            wp[0] = 0
+            wp[0] = SRV_DEVICE
             r = 0
     mutex_unlock(&fs_lock)
     return r
 
 
-# srv_post(name, fd): leave the socket end `fd` in /srv under `name`.
+# srv_post(name, fd): leave the socket end `fd` in /srv under `name`; or,
+# when fd is an open device file that can be read and written (a serial
+# port), the device.
 def vfs_srv_post(name: Ptr[uint8], fd: int32) -> int32:
     kind: uint32 = 0
     rp: int32 = 0
     wp: int32 = 0
-    if _fd_transport(fd, &kind, &rp, &wp) < 0 or kind != P9C_PIPES:
-        return _err(EBADF, "srv_post: not one end of a socketpair")
+    if _fd_transport(fd, &kind, &rp, &wp) < 0:
+        return _err(EBADF, "srv_post: not one end of a socketpair, nor a device file")
+    if kind == P9C_DEVICE and (devtree_can(cast[uint32](rp), 0) == 0 or devtree_can(cast[uint32](rp), 1) == 0):
+        return _err(EBADF, "srv_post: the device cannot be both read and written")
     rc: int32 = srv_post(name, rp, wp)
     if rc == EEXIST:
         return _err(rc, "srv_post: the name is taken")
@@ -2600,7 +2606,11 @@ def vfs_srv_open(name: Ptr[uint8]) -> int32:
     if srv_get(name, &rp, &wp) < 0:
         return _err(ENOENT, "srv_open: no such server in /srv")
     mutex_lock(&fs_lock)
-    fd: int32 = _sock_install(rp, wp)
+    fd: int32 = 0
+    if wp == SRV_DEVICE:
+        fd = _install(OF_DEV, DEV_TREE + rp, ORDWR, 0, 0)
+    else:
+        fd = _sock_install(rp, wp)
     mutex_unlock(&fs_lock)
     return fd
 

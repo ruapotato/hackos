@@ -19,6 +19,7 @@ from drivers.display.dispfs import dispfs_init
 from drivers.i2c.sht4x_model import sht4x_model_attach
 from drivers.i2c.sht4xfs import sht4xfs_init
 from drivers.gpio.gpio_model import gpio_model_attach
+from drivers.tty.cmsdk_eia import cmsdk_eia_add
 from mm.slab import kheap
 from mm.heap import heap_total
 
@@ -125,9 +126,11 @@ def _keys_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
 # Emulated ones on this board: a Sensirion SHT4x on the I2C bus, read by the
 # vendor's C driver (/dev/sht4x/temperature, humidity, serial; the model's
 # values are set through /dev/model/sht4x), and eight GPIO pins
-# (/dev/gpio/0..7, /dev/model/gpio).  Called by the system image.
+# (/dev/gpio/0..7, /dev/model/gpio); and the board's third UART as the
+# serial port /dev/eia1.  Called by the system image.
 def board_devices_start() -> int32:
     if sht4x_model_attach() == 0:
         sht4xfs_init()
     gpio_model_attach()
+    cmsdk_eia_add("eia1", 0x40006000)   # UART2: a serial line of its own (docs/9p.md)
     return 0

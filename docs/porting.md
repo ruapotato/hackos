@@ -20,7 +20,7 @@ A board directory holds six files (`devices.ad`, below, is the sixth):
 
 | File | What |
 |--|--|
-| `board.mk` | `CPU`, `FPU`, `SOFT_DOUBLE`, `PROG_ABI`, `PROGS_SKIP`, `IMAGES`, `BOARD_ALL` (extra outputs: .hex, .uf2), `PROG_AFLAGS`, `BOARD_PATCHES`, `STACK_<prog>` / `STACK_DEFAULT_BOARD`, `LDFLAGS_BOARD` |
+| `board.mk` | `CPU`, `FPU`, `SOFT_DOUBLE`, `PROG_ABI`, `PROGS_SKIP` (the board's program set), `OPT` (`OPT ?= -Oz` where flash is short), `IMAGES`, `BOARD_ALL` (extra outputs: .hex, .uf2), `PROG_AFLAGS`, `BOARD_PATCHES`, `STACK_<prog>` / `STACK_DEFAULT_BOARD`, `LDFLAGS_BOARD` |
 | `vectors.S` | `hmicro_vectors` (16 + the chip's interrupt count, aligned to the power of two above its size) and whatever the boot path needs before it: Teensy the FlexSPI boot header, QEMU the reset-only table at 0. Included by `arch/armv7m/startup.S`. Optional `board_reset_early` (define `BOARD_RESET_EARLY`) for work before a stack exists |
 | `link.ld` | The memory map, with the section and symbol names of `boards/mps2_an500/link.ld` (`__vectors_start`, `__text_end`, `__data_load/start/end`, `__xbss_*`, `__bss_*`, `__stack_top`, `__fault_stack_top`, `__heap_start/end`, `__prog_start/end`, `__user_start/end`, `__ramdisk_*`) |
 | `board.ad` | The board functions below |
@@ -48,7 +48,7 @@ A board directory holds six files (`devices.ad`, below, is the sixth):
 | `board_tick_stop_for(ticks)`, `board_tick_resume()` | tickless idle (docs/power.md); return 0 to keep the periodic tick |
 | `board_suspend(ms, sources, res)` | suspend; return 0 when not supported |
 | `board_display_start()`, `board_input_start()` (in `devices.ad`, imported as `board.devices` by the system image) | put the console on a display / attach a keyboard (docs/display-input.md); return -1 without one |
-| `board_devices_start()` (also in `devices.ad`) | register the board's device files under `/dev` (docs/devices.md): its GPIO pins (`gpiofs_set_board`, `gpiofs_add`), sensors, anything a driver exposes with `devtree_add`. Every board gets `/dev/power/ctl` and `/dev/i2c/0` without doing anything; an I2C controller driver is made the bus's back end with `i2c_set_controller` |
+| `board_devices_start()` (also in `devices.ad`) | register the board's device files under `/dev` (docs/devices.md): its GPIO pins (`gpiofs_set_board`, `gpiofs_add`), sensors, anything a driver exposes with `devtree_add`. Every board gets `/dev/power/ctl`, `/dev/consctl` and `/dev/i2c/0` without doing anything; a second serial port becomes a file with two functions and `devtree_add` (`drivers/tty/cmsdk_eia.ad` is the QEMU boards'), and is then a line for 9P (`srv`, docs/9p.md); an I2C controller driver is made the bus's back end with `i2c_set_controller` |
 
 ## 3. A new board on a chip family Hamnix Micro knows
 
@@ -147,10 +147,21 @@ the Feather's values:
 | `fs/tmpfs.ad`, `mm/page_alloc.ad` | files in /, chunk size | 1024 / 128 / 32; 4 / 4 / 1 KB |
 | `fs/hvfs.ad` | directory listing snapshot (the limit: a listing is cut down to its length once made); open files in the system | 8 / 8 / 2 KB; 64 / 64 / 32 |
 | `fs/ns.ad` | bytes of one namespace's mount table (it grows by 64 as binds are made; docs/namespaces.md) | 4 / 4 / 1 KB |
+| `fs/p9c.ad`, `user/progs/exportfs.ad` | one 9P message: the kernel's buffer per mounted server, exportfs's two buffers | 4120 / 4120 / 1048 bytes |
 | `init/main.ad` | init thread stack | 16 / 16 / 3 KB |
 | `user/hamnix/hamsh.ad` | the shell's arenas and buffers | 1.5 MB / 218 KB / 104 KB of data |
 | `lib/regex.ad`, `user/hamnix/grep.ad`, `ls.ad`, `lib/passwd/passwd.ad` | grep's tables, ls's listing, the passwd table | see the patches |
 | `board.mk` | `STACK_<prog>`, `STACK_DEFAULT_BOARD` | 64 / 32 / 8 KB for the shell |
+
+**Flash is a knob too.** `OPT` is the C compiler's optimisation level for
+everything in the image (default `-O2`); the Feather sets `-Oz`, which
+halves its kernel (228 KB to 127 KB) and takes a fifth off `/bin`, because
+its bootloader drops everything at or above 0xAD000. `-Oz` makes LLVM call
+`__aeabi_llsl`, `__aeabi_llsr` and `__aeabi_lasr` for 64-bit shifts; they
+are in `arch/armv7m/aeabi.S`. `PROGS_SKIP` names the programs a board's
+`/bin` leaves out. Print the sizes with `llvm-size -A build/<board>/hmicro.elf`
+and `ls -l build/<board>/user`; `tests/nrf52/check_image.py` shows how a
+hard limit is checked.
 
 Measure, do not guess. The Feather's board prints a memory report at
 `halt` (kernel heap peak, failed allocations and the size of the last one,

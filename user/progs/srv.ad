@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- srv: post a device that leads to a 9P server in /srv.
+#
+#     srv DEVICE NAME        e.g.  srv /dev/eia1 pc
+#                                  mount /srv/pc /n/pc
+#
+# DEVICE is a file that carries bytes both ways: a serial port with a 9P
+# server at its other end (tools/hm9pd.py on a PC serves a directory).
+# Plan 9's srv dials a network address and posts the connection; a serial
+# line is the only "network" here.  The name stays until `rm /srv/NAME`.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open_mode(path: Ptr[uint8], mode: int32) -> int32
+extern def sys_srv_post(name: Ptr[uint8], srvfd: int32) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+
+
+def say(s: Ptr[uint8]):
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    sys_write(2, s, n)
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc != 3:
+        say("usage: srv DEVICE NAME   (then: mount /srv/NAME PATH)\n")
+        return 2
+    fd: int32 = sys_open_mode(cast[Ptr[uint8]](argv[1]), 2)
+    if fd < 0:
+        say("srv: cannot open the device\n")
+        return 1
+    if sys_srv_post(cast[Ptr[uint8]](argv[2]), fd) < 0:
+        e: Array[64, uint8]
+        e[0] = 0
+        sys_errstr(&e[0], 64)
+        say("srv: ")
+        say(&e[0])
+        say("\n")
+        return 1
+    return 0

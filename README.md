@@ -13,19 +13,24 @@ on top of a new kernel that needs no page tables.
 ## Status: milestone 5, emulators only
 
 **A shell prompt that runs real programs, each in a namespace of its own
-that `bind` rearranges; an editor, a display and a keyboard to run them on,
-and a processor that sleeps when there is nothing to do: all in
-emulators.** Hamnix Micro boots to Hamnix's shell, `hamsh`, on the
+that `bind` and `mount` rearrange; drivers that are files; 9P between the
+device's programs, and between the device and a PC over a serial line; an
+editor, a display and a keyboard, and a processor that sleeps when there
+is nothing to do: all in emulators.** Hamnix Micro boots to Hamnix's shell, `hamsh`, on the
 serial console. The shell is an unprivileged process loaded from a file; so
 are `ls`, `cat`, `grep`, `vi` and the other 30 programs it runs. It runs in
 QEMU's `mps2-an500` (Cortex-M7) and `mps2-an386` (Cortex-M4F) machines and,
-as the Feather nRF52840 image, in Renode. Nothing here has run on real
-hardware.
+as the Feather nRF52840 image, in Renode. On real hardware only the
+milestone-3 image has run (a Feather nRF52840, 2026-11-28); nothing of
+milestones 4 and 5 has.
 
 ```
 hamsh$ ls /bin | grep h | wc
 hamsh$ cat /proc/self/ns
 hamsh$ ns { bind -b /tmp/mybin /bin ; ls }
+hamsh$ echo 1 > /dev/gpio/blue
+hamsh$ exportfs -s ex /tmp &
+hamsh$ mount /srv/ex /n/ex
 hamsh$ vi /tmp/notes
 hamsh$ ptest loop &
 hamsh$ ps
@@ -54,7 +59,26 @@ New in milestone 5 (checked by `make test`, `make test-m4`,
   `/dev/screen/ctl`, `text` and `data`, `/dev/keys`, and the SHT4x as text
   (`cat /dev/sht4x/temperature`). On the QEMU boards the sensor and the
   pins are emulated and a hamsh script drives them with `echo` and `cat`
-  (`tests/scripts/devices.hsh`).
+  (`tests/scripts/devices.hsh`). On the Feather `/dev/gpio/red`, `blue`,
+  `button` and 21 header pins are the chip's GPIO registers: `echo 1 >
+  /dev/gpio/blue` switches the blue LED (in Renode so far).
+- **9P** ([`docs/9p.md`](docs/9p.md)). A 9P2000 client in the kernel:
+  the unmodified hamsh's `mount /srv/NAME PATH` attaches a server, and
+  everything below the path (open, read, write, create, remove, stat,
+  listings, `>` `>>` `<`, running a program) becomes 9P requests. Servers
+  post themselves in `/srv`: `exportfs`, a file server in Adder that serves
+  a directory of its own namespace, and Hamnix's `p9srv_demo`. Over a
+  serial line in both directions: `exportfs /dev/console` lends the
+  console's UART to a 9P session with a PC (`tools/hm9p.py ls /dev`,
+  `... write /dev/gpio/blue 1`; four zero bytes give the console back), and
+  `srv /dev/eia1 pc ; mount /srv/pc /n/pc` mounts a directory that
+  `tools/hm9pd.py` serves on the PC (QEMU boards only: they have the second
+  serial port). Both PC tools use only the Python standard library.
+- **The Feather image fits again.** Its bootloader (0.2.6) writes nothing at
+  or above 0xAD000. The board is now compiled with `-Oz`: kernel 127 KB,
+  `/bin` 263 KB with 37 programs, 50,448 bytes to spare
+  ([`docs/boards/feather-nrf52840.md`](docs/boards/feather-nrf52840.md)).
+- `/bin/help` lists the namespace, 9P and device commands.
 
 New in milestone 4:
 
@@ -153,9 +177,11 @@ FTHR840BOOT drive). It has the console on the TX/RX header pins (UARTE0,
 Two things are new for this chip. float64 is software (compiler-rt), as the M4F
 has no double-precision FPU. Programs are built ROPI/RWPI, so their code
 runs in place from flash and only their data and stacks take RAM: the
-shell, and a pipeline of five programs beside it, fit in 256 KB. **None of
-it has run on a Feather.** `make test-nrf52` boots the unchanged image in
-Renode's nRF52840 machine and runs a shell session there. It also checks every
+shell, and a pipeline of five programs beside it, fit in 256 KB. **The
+milestone-3 image ran on a Feather on 2026-11-28; later work has only run
+in Renode.** `make test-nrf52` boots the unchanged image in
+Renode's nRF52840 machine and runs a shell session there, and a 9P session
+from the host over the emulated console UART. It also checks every
 register constant against Nordic's headers, the image and the UF2 file
 against Adafruit's bootloader, and the pins against Adafruit's tables.
 Wiring (a USB-to-serial adapter or a Raspberry Pi), first power-up,
@@ -204,9 +230,16 @@ everything here from source, and runs:
    program, the FAT volume, a script file run by a second shell, jobs, kill,
    history, completion, namespaces (`ns { }`, unions, a program replaced
    for one command, `/proc/self/ns` replayed), a script that drives the
-   emulated devices through `/dev`, the editor, a command typed
-   on the emulated key matrix, idle and suspend measurements, a pasted block; and the same
-   session as the fake e-paper panel showed it.
+   emulated devices through `/dev`, 9P (Hamnix's demo server and
+   `exportfs` mounted from `/srv`, redirections onto the mount, a mount as a
+   union member and inside `ns { }`, a server killed while mounted; and a
+   directory of the host, served by `tools/hm9pd.py` on the board's second
+   UART, mounted, written to and compared on the host), the editor, a
+   command typed on the emulated key matrix, idle and suspend measurements,
+   a pasted block; and the same session as the fake e-paper panel showed it;
+9. 9P from the host: `tests/9p/host_test.py` types `exportfs /dev/console`
+   and uses the device's tree as a 9P client over the emulated console
+   UART (16 checks).
 
 Every check prints `PASS` or `FAIL`; the number of `PASS` lines must equal the
 number of checks in the source, so a check that does not run is a failure.
@@ -214,7 +247,7 @@ The kernel tests use QEMU's instruction counter as the clock, which makes the
 tick-exact timing checks independent of the host's load; the two typed
 sessions run in real time.
 
-`make test-m4` runs parts 5 and 8 again on QEMU's Cortex-M4F machine
+`make test-m4` runs parts 5, 8 and 9 again on QEMU's Cortex-M4F machine
 (`BOARD=qemu-m4`: single-precision FPU, software float64, 8-region MPU).
 
 Other targets: `make size`, `make measure` (code size of small functions
@@ -261,6 +294,11 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `mm/` | heap (`heap.ad`) and the allocation names Hamnix code expects |
 | `fs/hvfs.ad` | descriptors, path resolution through the caller's namespace, device files, `/bin`, `/fd` names, the FAT glue (Hamnix Micro) |
 | `fs/ns.ad` | namespaces: the per-process mount tables, shared copy-on-write; union search order; `/proc/<pid>/ns` |
+| `fs/p9c.ad`, `fs/srv.ad` | the kernel's 9P2000 client (what stands behind a mounted name); `/srv` |
+| `user/progs/exportfs.ad`, `srv.ad` | a 9P file server for a directory of its own namespace (to `/srv`, or over the console line); posting a serial device in `/srv` |
+| `tools/hm9p.py`, `tools/hm9pd.py` | the PC's side of 9P over a serial line: a client for the device's tree, a server for a PC directory (Python standard library) |
+| `tests/9p/host_test.py` | the device's tree used from the host over the console UART |
+| `drivers/tty/cmsdk_eia.ad` | a second UART as the device file `/dev/eia1` (QEMU boards) |
 | `fs/tmpfs.ad`, `fs/fat.ad`, `fs/vfs_mount.ad`, `lib/p9dir.ad`, `lib/9p/` | copied from Hamnix (`fs/HAMNIX_ORIGIN`); `tmpfs.ad` with a size patch |
 | `user/hamnix/` | Hamnix's shell and programs, copied; `hamsh.ad` with a size patch |
 | `lib/p9.ad`, `perror.ad`, `regex.ad`, `hamcomplete.ad`, `passwd/` | Hamnix libraries those programs import, copied |
@@ -281,7 +319,8 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `tests/imxrt/` | the Teensy checks: boot header, register and pin checkers, register models, the driver test image, the uSDHC test on QEMU's i.MX6UL, the Teensy memory test |
 | `docs/syscalls.md` | the system-call table and how it differs from Hamnix |
 | `docs/namespaces.md` | namespaces: examples, how lookup works, what it costs, differences from Hamnix |
-| `docs/devices.md` | the files under `/dev`, which board has which, how a driver adds one |
+| `docs/devices.md` | the files under `/dev`, which board has which, the Feather's pins, how a driver adds one |
+| `docs/9p.md` | 9P: mounting a server, `/srv`, `exportfs`, the device's tree from a PC and a PC's directory on the device; what is and is not tested |
 | `docs/boards/teensy41.md` | flashing, wiring, first power-up, bring-up checklist, memory |
 | `docs/boards/feather-nrf52840.md` | the same for the Feather nRF52840 |
 | `docs/porting.md` | what a new board, chip family or architecture needs |
@@ -322,7 +361,9 @@ linked. A C file works the same way (`user/progs/crel.c`).
 
 ## Known shortcomings
 
-- Nothing has run on hardware. The QEMU board's tables are sized for its
+- Only the milestone-3 image has run on hardware (a Feather nRF52840);
+  namespaces, device files, 9P, the `-Oz` build, tickless idle and the
+  editor have run in emulators only. The QEMU board's tables are sized for its
   16 MB; the Teensy 4.1's (1 MB) are smaller by per-board patches, with the
   limits listed in docs/boards/teensy41.md.
 - **No signals.** Ctrl-C ends the foreground command or pipeline (status
@@ -346,6 +387,16 @@ linked. A C file works the same way (`user/progs/crel.c`).
 - The display stack has only ever driven the fake panel; scrolling costs a
   full refresh per line. The keyboard layout is provisional. No SPI
   interface, no nRF52 I2C driver, no persistent file system on flash.
+- 9P: one request at a time per connection and no `Tflush`, so a slow
+  server holds up everyone using its mount; no authentication, no `wstat`
+  (`mv` across a mount copies and removes), four mounted servers at most.
+  `ls -l` of a 9P directory shows names only. The serial paths have never
+  seen a real line: only the QEMU boards have a second serial port as a
+  file, and the console's wire mode on a real UART at 115200 baud is
+  untested. No notes a process can catch (`notify`/`noted`): no program
+  taken from Hamnix uses them.
+- A union is only what was bound at a name (Hamnix's rule): `bind -a` onto
+  a directory with nothing bound hides the directory's own files.
 - A process is one thread. 32 threads and processes in all, 16 descriptors
   and 16 `/fd` names each, 16 pipes. hamsh quirks seen: no here-documents
   (`cat << EOF` is `cat` on the console); a word ending in `:` starts a

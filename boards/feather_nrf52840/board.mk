@@ -26,10 +26,12 @@ OPT ?= -Oz
 #                cannot have
 #   p9srv_demo   Hamnix's one-file 9P demo server (10 KB); exportfs is the 9P
 #                server here
+#   srv          posts a serial device in /srv; this board has no second
+#                serial port as a file yet
 # Everything else fits since the image is built with -Oz (below); the next to
 # go if room is needed: ptest (12 KB, a test program), vi (9 KB), sort, cut,
 # tr, idlestat (docs/boards/feather-nrf52840.md, size).
-PROGS_SKIP := crel p9srv_demo
+PROGS_SKIP := crel p9srv_demo srv
 BOARD_PATCHES := $(wildcard boards/feather_nrf52840/patches/*/*.patch boards/feather_nrf52840/patches/*/*/*.patch)
 # Application start of Adafruit's bootloader: after SoftDevice S140 6.1.1
 # (what the Feather nRF52840 ships with; INFO_UF2.TXT on its drive says
