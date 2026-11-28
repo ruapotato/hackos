@@ -1,0 +1,36 @@
+HackOS feather-nrf52840 size patch to user/hamnix/sort.ad (build/feather-nrf52840/root only).
+
+Reason: 256 KiB of RAM for everything; beside the shell a program gets at
+most 32 KiB.  sort keeps its input and a 256-byte slot per line in static
+data, 336 KiB as written.
+    input      64 KiB -> 4 KiB
+    lines      1024 -> 48 (of 256 bytes each: 12 KiB)
+More input than that is cut off, as before.  Only constants and array
+lengths change.
+
+--- a/user/hamnix/sort.ad
++++ b/user/hamnix/sort.ad
+@@ -31,18 +31,18 @@
+ extern def sys_close(fd: int32) -> int32
+ 
+ 
+-INPUT_CAP: uint64 = 65536
++INPUT_CAP: uint64 = 4096
+ LINE_CAP:  uint64 = 256
+-LINES_MAX: uint64 = 1024
++LINES_MAX: uint64 = 48
+ 
+ 
+ # Globals so the buffers don't blow the kernel-side user stack.
+-in_buf:    Array[65536, uint8]
++in_buf:    Array[4096, uint8]
+ # Pack lines into a single flat array: line i occupies
+ # [i*LINE_CAP .. i*LINE_CAP + lens[i]]. Avoids a real 2D type which the
+ # M16 backend doesn't carry yet.
+-lines_buf: Array[262144, uint8]      # LINES_MAX * LINE_CAP
+-lens:      Array[1024, uint64]
++lines_buf: Array[12288, uint8]      # LINES_MAX * LINE_CAP
++lens:      Array[48, uint64]
+ 
+ 
+ # --- flag state (globals so the compare core reads them without arg

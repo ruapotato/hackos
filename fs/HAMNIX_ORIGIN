@@ -39,3 +39,21 @@ ad23d93c2860deaa1f0537e1f7c9e2e161b1cdb6a95a6ebf528037be3c579120  lib/regex.ad
 #
 # FAT32 (milestone 3), over HackOS's block layer (kernel/block/blk.ad).
 325f7d6bf158ef7d1e65d17412b0c1659796779f0ebd6c48b1687ba44947cd40  fs/fat.ad
+#
+# More programs (milestone 4): coreutils that port cleanly, and Hamnix's vi.
+04de798ba8ad43a7dc38bc11a49f612aaa35e35a3a70a5fdd128e977547b1cd6  user/hamnix/mv.ad
+4ec5265b2aa34271948898c1e2238981038912339f19508f32823b51bed5a940  user/hamnix/touch.ad
+541508333d0d6abbe459efa0f93ba52ef688677503b9fa4b6e7ab642c1cac216  user/hamnix/tail.ad
+01c50f99b8c168d11a7f809f7ecbfc82bbe9ffd6c5781274387294d6163237d6  user/hamnix/sort.ad
+d5d1da60195defe0af361b50497a14a1b9c7b7ffed48833bc6df1c75a08f54b4  user/hamnix/uniq.ad
+85b889f3506cc49b8fb0888a2f9f35f2619f751c32d30c728670c79b79854b37  user/hamnix/tr.ad
+9fc2ee24d75c5a578ca36ce40dd4d6a95a8702a3737b685ffe662c9d6b3a4a44  user/hamnix/date.ad
+a77798e878ca725c66f655ecf5fd73923cfbbb121c5ca6f167d59f34a886f436  user/hamnix/df.ad
+de49be33496c3873d32b1fbc961262f12e16550a980682cb3be79ddbefef72e6  user/hamnix/free.ad
+04fc5676a0412164d6a444a81b4db7542cf4e19094ca046cc3e0dce5bc51b313  user/hamnix/ps.ad
+c248aaaca1e0093d07e7064caa45163707d7ad96da028f9033bc0ead5ca46961  user/hamnix/kill.ad
+1743b7eab9549fb7263293c3e34b9d8f1cbd5237921f7ffb770672f7421679f9  user/hamnix/od.ad
+21c3a2c75b4590287731b41437b6ab3d1a0ba7e0fdf10567824abea03b8806bc  user/hamnix/tee.ad
+020ec6df6ae60577344a9fa1750eceb46121ec4b43a466ae9b1cb9fe1b393399  user/hamnix/cut.ad
+f5466eb217293d42789ae2bb1da811c2755dc9b202b3caec9f8e6f078fe75140  user/hamnix/seq.ad
+b9443d2c5ac72cf9a5c0d138f3fd93246ef8fa1a1e56aa7792bb67661ac39436  user/hamnix/vi.ad

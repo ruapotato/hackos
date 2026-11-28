@@ -1,0 +1,31 @@
+HackOS teensy41 size patch to user/hamnix/vi.ad (build/teensy41/root only).
+
+Reason: the editor's line store is 4096 lines of 1024 bytes, 4 MiB of static
+data, sized for a PC.  The Teensy has 1 MiB of RAM for everything.
+    line store    4096 x 1024 bytes (4 MiB) -> 1024 x 128 bytes (128 KiB)
+A longer file is truncated on load and a longer line clipped, with the
+editor's own messages, as before.  Only constants and array lengths change.
+
+--- a/user/hamnix/vi.ad
++++ b/user/hamnix/vi.ad
+@@ -59,16 +59,16 @@
+ 
+ 
+ # --- editor capacity -------------------------------------------------
+-MAX_LINES: uint64 = 4096        # lines the buffer can hold
+-MAX_COLS:  uint64 = 1024        # bytes per line
++MAX_LINES: uint64 = 1024        # lines the buffer can hold
++MAX_COLS:  uint64 = 128         # bytes per line
+ SCREEN_ROWS: uint64 = 24        # visible text rows (status line is +1)
+ SCREEN_COLS: uint64 = 80        # visible columns (for horizontal clamp)
+ 
+ # Line storage: lines[i][0..len[i]) is the live content of line i.
+ # Flattened into one big buffer so the global stays a simple Array.
+ # 4096 * 1024 = 4 MiB of .bss — sized for editing real source files.
+-lines: Array[4194304, uint8]    # MAX_LINES * MAX_COLS, flattened
+-line_len: Array[4096, uint64]   # live byte count of each line
++lines: Array[131072, uint8]    # MAX_LINES * MAX_COLS, flattened
++line_len: Array[1024, uint64]   # live byte count of each line
+ num_lines: uint64 = 1           # number of lines in the buffer (>=1)
+ 
+ # Cursor + viewport.

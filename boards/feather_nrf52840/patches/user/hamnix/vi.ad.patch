@@ -1,0 +1,33 @@
+HackOS feather-nrf52840 size patch to user/hamnix/vi.ad (build/feather-nrf52840/root only).
+
+Reason: the nRF52840 has 256 KiB of RAM for everything, and beside the
+shell a program gets a block of at most 32 KiB (boards/feather_nrf52840/link.ld,
+docs/boards/feather-nrf52840.md).  The editor's line store is 4 MiB as written.
+    line store    4096 x 1024 bytes (4 MiB) -> 200 x 80 bytes (16,000 bytes)
+So on this board vi edits files of up to 200 lines of up to 79 characters;
+a longer file is truncated on load and a longer line clipped, with the
+editor's own messages.  Only constants and array lengths change.
+
+--- a/user/hamnix/vi.ad
++++ b/user/hamnix/vi.ad
+@@ -59,16 +59,16 @@
+ 
+ 
+ # --- editor capacity -------------------------------------------------
+-MAX_LINES: uint64 = 4096        # lines the buffer can hold
+-MAX_COLS:  uint64 = 1024        # bytes per line
++MAX_LINES: uint64 = 200         # lines the buffer can hold
++MAX_COLS:  uint64 = 80          # bytes per line
+ SCREEN_ROWS: uint64 = 24        # visible text rows (status line is +1)
+ SCREEN_COLS: uint64 = 80        # visible columns (for horizontal clamp)
+ 
+ # Line storage: lines[i][0..len[i]) is the live content of line i.
+ # Flattened into one big buffer so the global stays a simple Array.
+ # 4096 * 1024 = 4 MiB of .bss — sized for editing real source files.
+-lines: Array[4194304, uint8]    # MAX_LINES * MAX_COLS, flattened
+-line_len: Array[4096, uint64]   # live byte count of each line
++lines: Array[16000, uint8]    # MAX_LINES * MAX_COLS, flattened
++line_len: Array[200, uint64]   # live byte count of each line
+ num_lines: uint64 = 1           # number of lines in the buffer (>=1)
+ 
+ # Cursor + viewport.

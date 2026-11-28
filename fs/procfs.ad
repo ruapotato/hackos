@@ -1,0 +1,372 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# HackOS -- /proc: the kernel's state as text files.
+#
+# Hamnix's ps, free, df, date and its shell's `kill` are written against
+# files under /proc.  HackOS serves the ones they use, with its own content
+# (this file is new; Hamnix's procfs is a 9P server over its task table):
+#
+#   /proc/version       one line: system, board
+#   /proc/uptime        "<seconds>.<hundredths> <idle seconds>.<hundredths>"
+#   /proc/tasks         one line per thread and process (what `ps` prints)
+#   /proc/meminfo       "MemTotal: N kB" / "MemFree: N kB" first (what `free`
+#                       parses), then the kernel heap and the program arena
+#   /proc/mounts        "device mountpoint type options" (what `df` prints)
+#   /proc/realtime      "YYYY-MM-DDTHH:MM:SSZ <epoch>" or "unavailable 0"
+#                       (what `date` reads); WRITING a decimal number of
+#                       seconds since 1970 sets the clock (/bin/setdate)
+#   /proc/power         idle and wake-up statistics (kernel/power.ad); writing
+#                       "tickless 0" or "tickless 1" switches tickless idle
+#   /proc/<pid>/note    write-only: "kill", "interrupt", "hangup" or "term"
+#                       ends process <pid> with exit code 137, 130, 129 or 143
+#                       (Plan 9's notes as far as HackOS has them: nothing
+#                       can be caught)
+#
+# A read is a snapshot: the text is rendered into a buffer when the file is
+# opened (fs/hvfs.ad keeps it like a directory listing).
+
+from kernel.cpu import cpu_irq_save, cpu_irq_restore
+from kernel.sched.core import Thread, threads, sched_now, sched_kill_pid, thread_kstack_used, proc_ustack_used, sched_switches, THREAD_MAX, T_UNUSED, T_READY, T_RUNNING, T_BLOCKED, T_ZOMBIE, TF_PROC, TF_USER
+from mm.slab import kheap, uheap
+from mm.heap import heap_total, heap_free_bytes, heap_largest_free
+from mm.parena import pa_start, pa_end, pa_used, pa_peak
+from drivers.rtc.cmos import rtc_read_unix_time, rtc_set_unix_time, rtc_is_set
+from board.board import board_name
+from kernel.power import power_render
+
+PROC_BUF: uint64 = 2048
+
+PROC_VERSION: uint32 = 1
+PROC_UPTIME: uint32 = 2
+PROC_TASKS: uint32 = 3
+PROC_MEMINFO: uint32 = 4
+PROC_MOUNTS: uint32 = 5
+PROC_REALTIME: uint32 = 6
+PROC_POWER: uint32 = 7
+
+proc_fat_mounted: uint32 = 0        # set by fs/hvfs.ad: /sd exists
+proc_flash_mounted: uint32 = 0      # ... /flash exists
+
+
+class PBuf:
+    p: Ptr[uint8]
+    n: uint64
+    cap: uint64
+
+
+def pb_c(b: Ptr[PBuf], c: uint32):
+    if b[0].n < b[0].cap:
+        b[0].p[b[0].n] = cast[uint8](c)
+        b[0].n = b[0].n + 1
+
+
+def pb_s(b: Ptr[PBuf], s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0:
+        pb_c(b, cast[uint32](s[i]))
+        i = i + 1
+
+
+# Decimal, right-aligned in `width` columns (0 = no padding), padded with `pad`.
+def pb_u(b: Ptr[PBuf], v: uint64, width: uint32, pad: uint32):
+    d: Array[24, uint8]
+    n: uint32 = 0
+    if v == 0:
+        d[0] = 48
+        n = 1
+    while v != 0:
+        d[n] = cast[uint8](48 + v % 10)
+        v = v / 10
+        n = n + 1
+    w: uint32 = n
+    while w < width:
+        pb_c(b, pad)
+        w = w + 1
+    while n > 0:
+        n = n - 1
+        pb_c(b, cast[uint32](d[n]))
+
+
+# A name left-aligned in `width` columns.
+def pb_name(b: Ptr[PBuf], s: Ptr[uint8], width: uint32):
+    i: uint32 = 0
+    while s[i] != 0:
+        pb_c(b, cast[uint32](s[i]))
+        i = i + 1
+    while i < width:
+        pb_c(b, 32)
+        i = i + 1
+
+
+def _streq(a: Ptr[uint8], b: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while a[i] != 0 and a[i] == b[i]:
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+# Which file `rel` (the path below /proc) names; 0 = none.
+def proc_lookup(rel: Ptr[uint8]) -> uint32:
+    if _streq(rel, "version") != 0:
+        return PROC_VERSION
+    if _streq(rel, "uptime") != 0:
+        return PROC_UPTIME
+    if _streq(rel, "tasks") != 0:
+        return PROC_TASKS
+    if _streq(rel, "meminfo") != 0:
+        return PROC_MEMINFO
+    if _streq(rel, "mounts") != 0:
+        return PROC_MOUNTS
+    if _streq(rel, "realtime") != 0:
+        return PROC_REALTIME
+    if _streq(rel, "power") != 0:
+        return PROC_POWER
+    return 0
+
+
+# "<pid>/note" -> pid, else 0.
+def proc_note_pid(rel: Ptr[uint8]) -> uint32:
+    pid: uint32 = 0
+    i: uint32 = 0
+    while rel[i] >= 48 and rel[i] <= 57 and i < 9:
+        pid = pid * 10 + cast[uint32](rel[i] - 48)
+        i = i + 1
+    if i == 0 or _streq(cast[Ptr[uint8]](cast[uint64](rel) + cast[uint64](i)), "/note") == 0:
+        return 0
+    return pid
+
+
+# "<pid>" alone (a directory) -> pid, else 0.
+def proc_pid_dir(rel: Ptr[uint8]) -> uint32:
+    pid: uint32 = 0
+    i: uint32 = 0
+    while rel[i] >= 48 and rel[i] <= 57 and i < 9:
+        pid = pid * 10 + cast[uint32](rel[i] - 48)
+        i = i + 1
+    if i == 0 or rel[i] != 0:
+        return 0
+    t: uint32 = 0
+    while t < THREAD_MAX:
+        if threads[t].state != T_UNUSED and threads[t].tid == pid and (threads[t].flags & TF_PROC) != 0:
+            return pid
+        t = t + 1
+    return 0
+
+
+def _two(b: Ptr[PBuf], v: uint64):
+    pb_u(b, v, 2, 48)
+
+
+# Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm,
+# public domain), then the ISO form Hamnix's date expects.
+def _render_realtime(b: Ptr[PBuf]):
+    if rtc_is_set == 0:
+        pb_s(b, "unavailable 0\n")
+        return
+    t: uint64 = cast[uint64](rtc_read_unix_time())
+    days: uint64 = t / 86400
+    rem: uint64 = t % 86400
+    z: uint64 = days + 719468
+    era: uint64 = z / 146097
+    doe: uint64 = z - era * 146097
+    yoe: uint64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y: uint64 = yoe + era * 400
+    doy: uint64 = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp: uint64 = (5 * doy + 2) / 153
+    d: uint64 = doy - (153 * mp + 2) / 5 + 1
+    m: uint64 = mp + 3
+    if mp >= 10:
+        m = mp - 9
+    if m <= 2:
+        y = y + 1
+    pb_u(b, y, 4, 48)
+    pb_c(b, 45)
+    _two(b, m)
+    pb_c(b, 45)
+    _two(b, d)
+    pb_c(b, 84)
+    _two(b, rem / 3600)
+    pb_c(b, 58)
+    _two(b, (rem % 3600) / 60)
+    pb_c(b, 58)
+    _two(b, rem % 60)
+    pb_s(b, "Z ")
+    pb_u(b, t, 0, 32)
+    pb_c(b, 10)
+
+
+def _state_name(st: uint32) -> Ptr[uint8]:
+    if st == T_READY:
+        return "ready"
+    if st == T_RUNNING:
+        return "run"
+    if st == T_BLOCKED:
+        return "wait"
+    if st == T_ZOMBIE:
+        return "ended"
+    return "?"
+
+
+def _render_tasks(b: Ptr[PBuf]):
+    pb_s(b, "  PID  PPID STATE PRI KIND  MEM-KB  KSTK  USTK  TIME-MS NAME\n")
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        t: Ptr[Thread] = &threads[i]
+        if t[0].state != T_UNUSED:
+            pb_u(b, cast[uint64](t[0].tid), 5, 32)
+            pb_c(b, 32)
+            pb_u(b, cast[uint64](t[0].ppid), 5, 32)
+            pb_c(b, 32)
+            pb_name(b, _state_name(t[0].state), 6)
+            pb_u(b, cast[uint64](t[0].prio), 3, 32)
+            pb_c(b, 32)
+            mem: uint64 = 0
+            ustk: uint64 = 0
+            if (t[0].flags & TF_PROC) != 0:
+                pb_s(b, "proc ")
+                mem = cast[uint64](t[0].mem_hi - t[0].mem_lo)
+                if t[0].mem_base != 0:
+                    ustk = proc_ustack_used(t)
+            elif (t[0].flags & TF_USER) != 0:
+                pb_s(b, "user ")
+            else:
+                pb_s(b, "kern ")
+            pb_u(b, (mem + 1023) / 1024, 7, 32)
+            pb_c(b, 32)
+            ks: uint64 = 0
+            if t[0].kstack_base != 0:
+                ks = thread_kstack_used(t)
+            pb_u(b, ks, 5, 32)
+            pb_c(b, 32)
+            pb_u(b, ustk, 5, 32)
+            pb_c(b, 32)
+            pb_u(b, t[0].cpu_ticks, 8, 32)
+            pb_c(b, 32)
+            pb_s(b, &t[0].name[0])
+            pb_c(b, 10)
+        i = i + 1
+
+
+def _kb(b: Ptr[PBuf], label: Ptr[uint8], bytes: uint64):
+    pb_name(b, label, 16)
+    pb_u(b, bytes / 1024, 8, 32)
+    pb_s(b, " kB\n")
+
+
+def _render_meminfo(b: Ptr[PBuf]):
+    ktotal: uint64 = heap_total(&kheap)
+    kfreeb: uint64 = heap_free_bytes(&kheap)
+    ptotal: uint64 = cast[uint64](pa_end - pa_start)
+    _kb(b, "MemTotal:", ktotal + ptotal)
+    _kb(b, "MemFree:", kfreeb + (ptotal - pa_used))
+    _kb(b, "KernelHeap:", ktotal)
+    _kb(b, "KernelHeapFree:", kfreeb)
+    _kb(b, "KernelHeapPeak:", cast[uint64](kheap.peak_bytes))
+    _kb(b, "KernelHeapBlock:", heap_largest_free(&kheap))
+    _kb(b, "ProgArena:", ptotal)
+    _kb(b, "ProgArenaFree:", ptotal - pa_used)
+    _kb(b, "ProgArenaPeak:", pa_peak)
+
+
+def _render_mounts(b: Ptr[PBuf]):
+    pb_s(b, "tmpfs         /            tmpfs  rw\n")
+    pb_s(b, "rom           /bin         romfs  ro\n")
+    pb_s(b, "dev           /dev         devfs  rw\n")
+    pb_s(b, "fd            /fd          fd     rw\n")
+    pb_s(b, "proc          /proc        proc   rw\n")
+    if proc_fat_mounted != 0:
+        pb_s(b, "sd0           /sd          vfat   rw\n")
+    if proc_flash_mounted != 0:
+        pb_s(b, "flash0        /flash       lfs    rw\n")
+
+
+# Render file `which` into buf; returns the length.
+def proc_render(which: uint32, buf: Ptr[uint8], cap: uint64) -> uint64:
+    pb: PBuf
+    pb.p = buf
+    pb.n = 0
+    pb.cap = cap
+    b: Ptr[PBuf] = &pb
+    if which == PROC_VERSION:
+        pb_s(b, "HackOS 0.4 (")
+        pb_s(b, board_name())
+        pb_s(b, ")\n")
+    elif which == PROC_UPTIME:
+        ms: uint64 = sched_now()
+        idle: uint64 = threads[0].cpu_ticks
+        pb_u(b, ms / 1000, 0, 32)
+        pb_c(b, 46)
+        _two(b, (ms % 1000) / 10)
+        pb_c(b, 32)
+        pb_u(b, idle / 1000, 0, 32)
+        pb_c(b, 46)
+        _two(b, (idle % 1000) / 10)
+        pb_c(b, 10)
+    elif which == PROC_TASKS:
+        _render_tasks(b)
+    elif which == PROC_MEMINFO:
+        _render_meminfo(b)
+    elif which == PROC_MOUNTS:
+        _render_mounts(b)
+    elif which == PROC_REALTIME:
+        _render_realtime(b)
+    elif which == PROC_POWER:
+        pb.n = power_render(buf, cap)
+    return pb.n
+
+
+# The listing of /proc itself.
+def proc_listdir(buf: Ptr[uint8], cap: uint64) -> uint64:
+    pb: PBuf
+    pb.p = buf
+    pb.n = 0
+    pb.cap = cap
+    pb_s(&pb, "version\nuptime\ntasks\nmeminfo\nmounts\nrealtime\npower\n")
+    i: uint32 = 0
+    while i < THREAD_MAX:
+        if threads[i].state != T_UNUSED and (threads[i].flags & TF_PROC) != 0:
+            pb_u(&pb, cast[uint64](threads[i].tid), 0, 32)
+            pb_c(&pb, 10)
+        i = i + 1
+    return pb.n
+
+
+def _has(msg: Ptr[uint8], n: uint64, word: Ptr[uint8]) -> uint32:
+    i: uint64 = 0
+    while word[i] != 0:
+        if i >= n or msg[i] != word[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# A note written to /proc/<pid>/note.  0, -3 (no such process), -22 (a note
+# HackOS does not know).
+def proc_note(pid: uint32, msg: Ptr[uint8], n: uint64) -> int32:
+    code: uint32 = 0
+    if _has(msg, n, "kill") != 0:
+        code = 137
+    elif _has(msg, n, "interrupt") != 0:
+        code = 130
+    elif _has(msg, n, "hangup") != 0:
+        code = 129
+    elif _has(msg, n, "term") != 0:
+        code = 143
+    else:
+        return -22
+    return sched_kill_pid(pid, code)
+
+
+# Decimal seconds since 1970 written to /proc/realtime.
+def proc_set_time(msg: Ptr[uint8], n: uint64) -> int32:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < n and msg[i] >= 48 and msg[i] <= 57:
+        v = v * 10 + cast[uint64](msg[i] - 48)
+        i = i + 1
+    if i == 0:
+        return -22
+    rtc_set_unix_time(cast[int64](v))
+    return 0

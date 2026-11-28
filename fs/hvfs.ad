@@ -58,6 +58,8 @@ from drivers.tty.console import console_read, console_write
 from fs.vfs_mount import vfs_mount, vfs_umount, vfs_fs_kind, vfs_fs_rel, FS_KIND_TMPFS, FS_KIND_DEVFS, FS_KIND_CPIO, FS_KIND_PROCFS, FS_KIND_FAT
 from fs.fat import fat_init, fat_lookup, fat_read, fat_listdir, fat_create, fat_write, fat_delete
 from kernel.block.blk import blk_init
+from fs.procfs import proc_lookup, proc_note_pid, proc_pid_dir, proc_render, proc_listdir, proc_note, proc_set_time, proc_fat_mounted, PROC_BUF, PROC_REALTIME, PROC_POWER
+from kernel.power import power_ctl
 from kernel.pipe import pipe_init, pipe_alloc_chan, pipe_valid, pipe_owner, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_release_unbound
 from fs.tmpfs import tmpfs_lookup, tmpfs_open_for_write_t, tmpfs_read, tmpfs_write, tmpfs_size, tmpfs_ftruncate, tmpfs_unlink, tmpfs_rename, tmpfs_mkdir, tmpfs_listdir, tmpfs_path_is_dir, tmpfs_path_exists, tmpfs_mtime, tmpfs_is_dir, tmpfs_table, TmpfsEntry, TMPFS_MAX_FILES
 
@@ -100,9 +102,11 @@ OF_DEV: uint32 = 3
 OF_ROM: uint32 = 4                  # a file of /bin; slot = index into the ROM table
 OF_FDNAME: uint32 = 5               # "/fd/N"; slot = N, resolved at every read and write
 OF_FAT: uint32 = 6                  # a file on /sd open for reading: aux0 = first cluster, aux1 = size
+OF_PROCW: uint32 = 8                # a writable /proc file: slot = pid for <pid>/note, -1 realtime, -2 power
 OF_FATW: uint32 = 7                 # ... open for writing: dirbuf = its path on the volume, aux1 = size
 
 FS_KIND_ROM: uint32 = 1             # = FS_KIND_CPIO, "read-only baked root" in Hamnix's table
+FS_KIND_PROC: uint32 = 5            # = FS_KIND_EXT4 in Hamnix's table: HackOS has no ext4 and serves /proc (fs/procfs.ad) under this kind
 FS_KIND_FD: uint32 = 2              # = FS_KIND_PROCFS, names served by the kernel
 
 # What an /fd name is bound to (Hamnix's DEVFD_* values).
@@ -480,6 +484,48 @@ def _fdname_number(rel: Ptr[uint8]) -> int32:
     return n
 
 
+# /proc (fs/procfs.ad): a file's text is rendered when it is opened and kept
+# like a directory listing; <pid>/note and realtime can be opened for writing.
+def _proc_rel(rel: Ptr[uint8]) -> Ptr[uint8]:
+    if rel[0] == 47:                    # the path below a mount point starts with '/'
+        return cast[Ptr[uint8]](cast[uint64](rel) + 1)
+    return rel
+
+
+def _proc_open(rel0: Ptr[uint8], wants_write: uint32) -> int32:
+    rel: Ptr[uint8] = _proc_rel(rel0)
+    proc_fat_mounted = fat_mounted
+    which: uint32 = proc_lookup(rel)
+    if wants_write != 0:
+        npid: uint32 = proc_note_pid(rel)
+        if npid != 0:
+            return _install(OF_PROCW, cast[int32](npid), OWRITE, 0, 0)
+        if which == PROC_REALTIME:
+            return _install(OF_PROCW, -1, OWRITE, 0, 0)
+        if which == PROC_POWER:
+            return _install(OF_PROCW, -2, OWRITE, 0, 0)
+        if rel[0] == 0 or proc_pid_dir(rel) != 0:
+            return _err(EISDIR, "is a directory")
+        return _err(EROFS, "read-only file")
+    if which == 0 and rel[0] != 0 and proc_pid_dir(rel) == 0:
+        return _err(ENOENT, "file does not exist")
+    pb: uint64 = kmalloc(PROC_BUF)
+    if pb == 0:
+        return _err(ENOMEM, "out of memory")
+    pn: uint64 = 0
+    if rel[0] == 0:
+        pn = proc_listdir(cast[Ptr[uint8]](pb), PROC_BUF)
+    elif which == 0:
+        rt_memcpy(pb, cast[uint64]("note\n"), 5)
+        pn = 5
+    else:
+        pn = proc_render(which, cast[Ptr[uint8]](pb), PROC_BUF)
+    pfd: int32 = _install(OF_DIR, 0, OREAD, pb, pn)
+    if pfd < 0:
+        kfree(pb)
+    return pfd
+
+
 def _open_locked(canon: Ptr[uint8], mode: uint32) -> int32:
     kind: uint32 = vfs_fs_kind(_pc(canon))
     wants_write: uint32 = 0
@@ -557,6 +603,8 @@ def _open_locked(canon: Ptr[uint8], mode: uint32) -> int32:
         return _install(OF_FDNAME, fn, mode & 3, 0, 0)
     if kind == FS_KIND_FAT:
         return _fat_open(cast[Ptr[uint8]](vfs_fs_rel(_pc(canon))), mode, wants_write)
+    if kind == FS_KIND_PROC:
+        return _proc_open(cast[Ptr[uint8]](vfs_fs_rel(_pc(canon))), wants_write)
     tk: Array[272, uint8]
     _tkey(canon, &tk[0])
     if tmpfs_path_is_dir(_pc(&tk[0])) != 0:
@@ -839,11 +887,19 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
             return _err(EINVAL, "fdbind: no such /fd name to duplicate")
         if arg == fdnum:
             return 0
+        src: int32 = arg
         kind = t[0].fdn_kind[arg]
         pos = t[0].fdn_pos[arg]
         arg = t[0].fdn_arg[arg]
         if kind == DEVFD_NONE:
             return _err(EBADF, "fdbind: nothing is bound at the name to duplicate")
+        if kind == DEVFD_FILE:
+            # `> file 2>&1`: two names on one file.  Each name has its own
+            # position, so the two streams would overwrite each other;
+            # both names are made to write at the end of the file instead,
+            # which is what a shared position amounts to for writers.
+            kind = DEVFD_FILE_APPEND
+            t[0].fdn_kind[src] = DEVFD_FILE_APPEND
     if kind == DEVFD_PIPE_R or kind == DEVFD_PIPE_W:
         if pipe_valid(arg) == 0:
             return _err(EBADF, "fdbind: no such pipe")
@@ -1022,6 +1078,21 @@ def vfs_write(fd: int32, buf: Ptr[uint8], n: uint64) -> int64:
         fdn: int32 = f[0].slot
         mutex_unlock(&fs_lock)
         return _fdn_write(fdn, buf, n)
+    if f[0].kind == OF_PROCW:
+        pslot: int32 = f[0].slot
+        mutex_unlock(&fs_lock)
+        prc: int32 = 0
+        if pslot == -2:
+            prc = power_ctl(buf, n)
+        elif pslot < 0:
+            prc = proc_set_time(buf, n)
+        else:
+            prc = proc_note(cast[uint32](pslot), buf, n)
+        if prc == -3:
+            return cast[int64](_err(ESRCH, "note: no such process"))
+        if prc < 0:
+            return cast[int64](_err(EINVAL, "write: not understood (notes: kill, interrupt, hangup, term; realtime: seconds since 1970)"))
+        return cast[int64](n)
     if f[0].kind == OF_FATW:
         fw: int64 = fat_write(_pc(cast[Ptr[uint8]](f[0].dirbuf)), buf, f[0].pos, n)
         if fw > 0:
@@ -1309,6 +1380,15 @@ def vfs_stat(path: Ptr[uint8], buf: Ptr[uint8], nbuf: uint64) -> int64:
         if _fdname_number(frel) < 0:
             return cast[int64](_err(ENOENT, "file does not exist"))
         return _stat_encode(buf, nbuf, _basename(&canon[0]), 0, 0x3001 + cast[uint64](_fdname_number(frel)), DMDEVICE | 0x1B6, 0, 0)
+    if vfs_fs_kind(_pc(&canon[0])) == FS_KIND_PROC:
+        prel: Ptr[uint8] = _proc_rel(cast[Ptr[uint8]](vfs_fs_rel(_pc(&canon[0]))))
+        if prel[0] == 0:
+            return _stat_encode(buf, nbuf, "proc", QTDIR, 0x5000, DMDIR | 0x16D, 0, 0)
+        if proc_pid_dir(prel) != 0:
+            return _stat_encode(buf, nbuf, _basename(&canon[0]), QTDIR, 0x5100, DMDIR | 0x16D, 0, 0)
+        if proc_lookup(prel) == 0 and proc_note_pid(prel) == 0:
+            return cast[int64](_err(ENOENT, "file does not exist"))
+        return _stat_encode(buf, nbuf, _basename(&canon[0]), 0, 0x5001 + cast[uint64](proc_lookup(prel)), 0x124, 0, 0)
     if vfs_fs_kind(_pc(&canon[0])) == FS_KIND_FAT:
         srel: Ptr[uint8] = cast[Ptr[uint8]](vfs_fs_rel(_pc(&canon[0])))
         fcl: uint64 = 0
@@ -1486,10 +1566,12 @@ def vfs_init():
     vfs_mount("/dev", FS_KIND_DEVFS, 4, 0)
     vfs_mount("/bin", FS_KIND_ROM, 4, 0)
     vfs_mount("/fd", FS_KIND_FD, 3, 0)
+    vfs_mount("/proc", FS_KIND_PROC, 5, 0)
     pipe_init()
     tmpfs_mkdir("/root/dev")
     tmpfs_mkdir("/root/bin")
     tmpfs_mkdir("/root/fd")
+    tmpfs_mkdir("/root/proc")
     tmpfs_mkdir("/root/tmp")
     tmpfs_mkdir("/root/etc")
     sched_exit_hook = _vfs_thread_exit

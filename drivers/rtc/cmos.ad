@@ -12,8 +12,15 @@ from kernel.sched.core import sched_now
 rtc_base: int64 = 1795651200           # 2026-11-26 00:00:00 UTC
 
 
+# 0 until somebody has set the clock: no board has a clock HackOS reads yet,
+# so until then the time is a made-up epoch plus the uptime (file times use
+# it), and /proc/realtime says "unavailable" rather than show it as a date.
+rtc_is_set: uint32 = 0
+
+
 def rtc_set_unix_time(t: int64):
     rtc_base = t - cast[int64](sched_now() / 1000)
+    rtc_is_set = 1
 
 
 def rtc_read_unix_time() -> int64:
