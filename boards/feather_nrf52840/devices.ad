@@ -9,9 +9,49 @@
 # boards/mps2_an500/devices.ad does for the emulated ones.
 
 
+from board.board import led_pin
+from soc.nrf52840.soc import P0_BASE, P1_BASE
+from soc.nrf52.gpio import gpio_set, gpio_clear, gpio_out_level
+from drivers.gpio.gpiofs import gpiofs_set_board, gpiofs_add
+
+
 def board_display_start() -> int32:
     return -1
 
 
 def board_input_start() -> int32:
     return -1
+
+
+# ---- device files of this board (docs/devices.md) -------------------------
+# /dev/gpio/led: the red LED, the pin board.ad found for this Feather (P1.15
+# on the Express).  Reading gives the level the pin is driven to; writing 0
+# or 1 drives it, until the "led" thread toggles it again half a second
+# later (its blinking is the board's sign of life).  UNTESTED ON HARDWARE;
+# in Renode the file reads and writes the GPIO model's OUT register.
+def _led_base() -> uint64:
+    if led_pin >= 32:
+        return P1_BASE
+    return P0_BASE
+
+
+def _led_get(pin: uint32) -> uint32:
+    return gpio_out_level(_led_base(), led_pin)
+
+
+def _led_set(pin: uint32, level: uint32) -> int32:
+    if level != 0:
+        gpio_set(_led_base(), led_pin)
+    else:
+        gpio_clear(_led_base(), led_pin)
+    return 0
+
+
+def _led_dir(pin: uint32, out: uint32) -> int32:
+    return 0                            # it stays an output
+
+
+def board_devices_start() -> int32:
+    gpiofs_set_board(_led_get, _led_set, _led_dir)
+    gpiofs_add("gpio/led", 0)
+    return 0

@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- GPIO pins as files: /dev/gpio/<name>.
+#
+#     cat /dev/gpio/3            "0\n" or "1\n": the level at the pin
+#     echo out > /dev/gpio/3     make it an output
+#     echo in > /dev/gpio/3      make it an input
+#     echo 1 > /dev/gpio/3       drive it high (and make it an output)
+#     echo 0 > /dev/gpio/3
+#
+# A board says which pins exist and how to reach them: it sets the three
+# functions and calls gpiofs_add("gpio/3", 3) for each (the path must be a
+# string constant).  `pin` is whatever number the board's functions want.
+
+from fs.devtree import devtree_add, devtree_text, DtIn, dt_in, dt_end, dt_word
+
+gpio_get_fn: Fn[uint32, uint32]             # (pin) -> level
+gpio_set_fn: Fn[int32, uint32, uint32]      # (pin, level): drive the pin
+gpio_dir_fn: Fn[int32, uint32, uint32]      # (pin, 1 = output, 0 = input)
+gpio_fns: uint32 = 0
+
+
+def gpiofs_set_board(get: Fn[uint32, uint32], set: Fn[int32, uint32, uint32], dir: Fn[int32, uint32, uint32]):
+    gpio_get_fn = get
+    gpio_set_fn = set
+    gpio_dir_fn = dir
+    gpio_fns = 1
+
+
+def _rd(pin: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    text: Array[4, uint8]
+    text[0] = 48
+    if gpio_get_fn(cast[uint32](pin)) != 0:
+        text[0] = 49
+    text[1] = 10
+    return devtree_text(&text[0], 2, buf, n, pos)
+
+
+def _wr(pin: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    p: uint32 = cast[uint32](pin)
+    if dt_word(&s, "1") != 0:
+        gpio_set_fn(p, 1)
+    elif dt_word(&s, "0") != 0:
+        gpio_set_fn(p, 0)
+    elif dt_word(&s, "out") != 0:
+        gpio_dir_fn(p, 1)
+    elif dt_word(&s, "in") != 0:
+        gpio_dir_fn(p, 0)
+    else:
+        return -22
+    if dt_end(&s) == 0:
+        return -22
+    return cast[int64](n)
+
+
+def gpiofs_add(path: Ptr[uint8], pin: uint32) -> int32:
+    if gpio_fns == 0:
+        return -1
+    return devtree_add(path, cast[uint64](&_rd), cast[uint64](&_wr), cast[uint64](pin))

@@ -59,7 +59,7 @@ s = s.replace(old, '''    /* tests/imxrt/t41mem.sh: the Teensy 4.1's kernel heap
     ASSERT(__heap_end <= __prog_start, "heap overlaps the arena")''' % (heap // 16 * 16, arena))
 open(dst, 'w').write(s)
 PY
-ld.lld -T $B/link.ld --gc-sections -nostdlib -static -o $B/hmicro.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/c/font8x8.o $B/romfs.o $B/hmicro.o || exit 1
+ld.lld -T $B/link.ld --gc-sections -nostdlib -static -o $B/hmicro.elf build/startup.o build/aeabi.o build/cpu.o build/switch.o build/c/font8x8.o build/c/sht4x_i2c.o build/c/sensirion_i2c.o build/c/sensirion_common.o build/c/libc.o $B/romfs.o $B/hmicro.o || exit 1
 llvm-nm $B/hmicro.elf | awk '$3 ~ /^__(heap|prog)_(start|end)$/ {print "[t41mem]   " $3 " = 0x" $1}'
 
 QFLAGS="-M mps2-an500 -nographic -monitor none -serial stdio -no-reboot"

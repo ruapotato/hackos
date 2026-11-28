@@ -61,6 +61,7 @@ from fs.vfs_mount import vfs_mount, vfs_umount, vfs_fs_kind, vfs_fs_rel, FS_KIND
 from fs.fat import fat_init, fat_lookup, fat_read, fat_listdir, fat_create, fat_write, fat_delete
 from kernel.block.blk import blk_init
 from fs.ns import ns_init, ns_ref, ns_unref, ns_split, ns_add, ns_remove, ns_set_label, ns_remove_label, ns_walk, ns_create_target, ns_children, ns_render, ns_line_in, MORDER, NS_BIND
+from fs.devtree import devtree_find, devtree_is_dir, devtree_list, devtree_read, devtree_write, dt_count
 from fs.procfs import proc_lookup, proc_note_pid, proc_ns_pid, proc_pid_dir, proc_render, proc_listdir, proc_note, proc_set_time, proc_fat_mounted, proc_keys, PROC_BUF, PROC_REALTIME, PROC_POWER, PROC_KEYS
 from kernel.power import power_ctl
 from kernel.pipe import pipe_init, pipe_alloc_chan, pipe_valid, pipe_owner, pipe_inc_reader, pipe_inc_writer, pipe_close_reader, pipe_close_writer, pipe_read, pipe_write, pipe_release_unbound
@@ -143,6 +144,7 @@ extern def romfs_count()
 DEV_CONSOLE: int32 = 1
 DEV_NULL: int32 = 2
 DEV_ZERO: int32 = 3
+DEV_TREE: int32 = 16                # DEV_TREE + n: file n of the drivers' tree (fs/devtree.ad)
 
 VFS_NR_FDS: uint32 = 16             # per thread (Hamnix: 64 per task)
 VFS_NR_OPEN: uint32 = 64            # system-wide open files
@@ -290,7 +292,31 @@ def _dev_lookup(rel: Ptr[uint8]) -> int32:
         return DEV_NULL
     if _seq(rel, "/zero") != 0:
         return DEV_ZERO
+    tn: int32 = devtree_find(rel)
+    if tn >= 0:
+        return DEV_TREE + tn
     return 0
+
+
+# Reading and writing a file of the drivers' tree.  fs_lock is not held: a
+# driver may sleep.  A driver's error is its negative errno.
+def _tree_io(dev: int32, write: uint32, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    r: int64 = 0
+    if write != 0:
+        r = devtree_write(cast[uint32](dev - DEV_TREE), buf, n, pos)
+    else:
+        r = devtree_read(cast[uint32](dev - DEV_TREE), buf, n, pos)
+    if r == -9:
+        if write != 0:
+            return cast[int64](_err(EBADF, "write: this device file cannot be written"))
+        return cast[int64](_err(EBADF, "read: this device file cannot be read"))
+    if r == -22:
+        return cast[int64](_err(EINVAL, "device: not understood"))
+    if r == -5:
+        return cast[int64](_err(-5, "device: input/output error"))
+    if r < 0:
+        return cast[int64](_err(cast[int32](r), "device error"))
+    return r
 
 
 # ---------------------------------------------------------------- /bin (ROM)
@@ -642,6 +668,8 @@ def _key_kind(key: Ptr[uint8]) -> uint32:
         return 2
     if kind == FS_KIND_DEVFS and _dev_lookup(rel) != 0:
         return 1
+    if kind == FS_KIND_DEVFS and devtree_is_dir(rel) != 0:
+        return 2
     if kind == FS_KIND_ROM and _rom_lookup(rel) >= 0:
         return 1
     if kind == FS_KIND_FD and _fdname_number(rel) >= 0:
@@ -774,9 +802,11 @@ def _list_key(key: Ptr[uint8], buf: Ptr[uint8], cap: uint64, off: uint64) -> uin
             end = _list_add(buf, cap, end, "note")
             end = _list_add(buf, cap, end, "ns")
     elif kind == FS_KIND_DEVFS:
-        end = _list_add(buf, cap, end, "console")
-        end = _list_add(buf, cap, end, "null")
-        end = _list_add(buf, cap, end, "zero")
+        if rel[0] == 0:
+            end = _list_add(buf, cap, end, "console")
+            end = _list_add(buf, cap, end, "null")
+            end = _list_add(buf, cap, end, "zero")
+        end = devtree_list(rel, buf, cap, end)
     elif kind == FS_KIND_ROM:
         ri: uint32 = 0
         while ri < rom_count():
@@ -838,7 +868,7 @@ def _open_locked(canon: Ptr[uint8], mode: uint32) -> int32:
         wants_write = 1
     if kind == FS_KIND_DEVFS:
         rel: Ptr[uint8] = cast[Ptr[uint8]](vfs_fs_rel(_pc(canon)))
-        if rel[0] == 0:
+        if rel[0] == 0 or devtree_is_dir(rel) != 0:
             return _err(EISDIR, "is a directory")
         dev: int32 = _dev_lookup(rel)
         if dev == 0:
@@ -958,6 +988,13 @@ def _fdn_read(fdn: int32, buf: Ptr[uint8], n: uint64, nonblock: uint32) -> int64
     elif kind == DEVFD_CHAN and (arg & 0xFFFF) == DEV_ZERO:
         rt_memset(cast[uint64](buf), 0, n)
         return cast[int64](n)
+    elif kind == DEVFD_CHAN and (arg & 0xFFFF) >= DEV_TREE:
+        tr: int64 = _tree_io(arg & 0xFFFF, 0, buf, n, t[0].fdn_pos[fdn])
+        if tr > 0:
+            t[0].fdn_pos[fdn] = t[0].fdn_pos[fdn] + cast[uint64](tr)
+        if tr == 0 and nonblock != 0:
+            return -1
+        return tr
     elif kind != DEVFD_CHAN:
         return cast[int64](_err(EBADF, "read: nothing readable is bound at this /fd name"))
     if got == 0 and nonblock != 0:
@@ -998,6 +1035,11 @@ def _fdn_write(fdn: int32, buf: Ptr[uint8], n: uint64) -> int64:
     if kind == DEVFD_CHAN and (arg & CHAN_DEV) != 0:
         if (arg & 0xFFFF) == DEV_CONSOLE:
             console_write(buf, n)
+        elif (arg & 0xFFFF) >= DEV_TREE:
+            tw: int64 = _tree_io(arg & 0xFFFF, 1, buf, n, t[0].fdn_pos[fdn])
+            if tw > 0:
+                t[0].fdn_pos[fdn] = t[0].fdn_pos[fdn] + cast[uint64](tw)
+            return tw
         return cast[int64](n)
     return cast[int64](_err(EBADF, "write: nothing writable is bound at this /fd name"))
 
@@ -1179,6 +1221,8 @@ def vfs_fdbind(pid: int32, fdnum: int32, kind: int32, arg: int32) -> int32:
             idx: int32 = arg & 0xFFFF
             if (arg & CHAN_DEV) != 0 and (arg & CHAN_ROM) == 0 and idx >= DEV_CONSOLE and idx <= DEV_ZERO:
                 cok = 1
+            if (arg & CHAN_DEV) != 0 and (arg & CHAN_ROM) == 0 and idx >= DEV_TREE and cast[uint32](idx - DEV_TREE) < dt_count:
+                cok = 1
             if (arg & CHAN_ROM) != 0 and (arg & CHAN_DEV) == 0 and cast[uint32](idx) < rom_count():
                 cok = 1
         if cok == 0:
@@ -1291,6 +1335,15 @@ def vfs_read(fd: int32, buf: Ptr[uint8], n: uint64, nonblock: uint32) -> int64:
         if dev == DEV_ZERO:
             rt_memset(cast[uint64](buf), 0, n)
             return cast[int64](n)
+        if dev >= DEV_TREE:
+            # the position belongs to the open file; this thread is its only
+            # user while the call runs (a process is one thread)
+            tr: int64 = _tree_io(dev, 0, buf, n, f[0].pos)
+            if tr > 0:
+                f[0].pos = f[0].pos + cast[uint64](tr)
+            if tr == 0 and nonblock != 0:
+                return -1
+            return tr
         if nonblock != 0:
             return -1
         return 0
@@ -1337,6 +1390,11 @@ def vfs_write(fd: int32, buf: Ptr[uint8], n: uint64) -> int64:
         mutex_unlock(&fs_lock)
         if dev == DEV_CONSOLE:
             console_write(buf, n)
+        elif dev >= DEV_TREE:
+            tw: int64 = _tree_io(dev, 1, buf, n, f[0].pos)
+            if tw > 0:
+                f[0].pos = f[0].pos + cast[uint64](tw)
+            return tw
         return cast[int64](n)
     if f[0].kind == OF_FDNAME:
         fdn: int32 = f[0].slot
@@ -1404,7 +1462,7 @@ def vfs_lseek(fd: int32, off: int64, whence: uint32) -> int64:
     if f == cast[Ptr[OpenFile]](0):
         mutex_unlock(&fs_lock)
         return cast[int64](_err(EBADF, "lseek: bad fd"))
-    if f[0].kind == OF_DEV or f[0].kind == OF_FDNAME:
+    if (f[0].kind == OF_DEV and (f[0].slot < DEV_TREE or whence == SEEK_END)) or f[0].kind == OF_FDNAME:
         mutex_unlock(&fs_lock)
         return cast[int64](_err(ESPIPE, "lseek: not seekable"))
     base: int64 = 0
@@ -1635,7 +1693,7 @@ def _stat_key(canon: Ptr[uint8], name: Ptr[uint8], buf: Ptr[uint8], nbuf: uint64
     kind: uint32 = _kind(canon)
     if kind == FS_KIND_DEVFS:
         rel: Ptr[uint8] = cast[Ptr[uint8]](vfs_fs_rel(_pc(canon)))
-        if rel[0] == 0:
+        if rel[0] == 0 or devtree_is_dir(rel) != 0:
             return _stat_encode(buf, nbuf, name, QTDIR, 0x1000, DMDIR | 0x16D, 0, 0)
         dev: int32 = _dev_lookup(rel)
         if dev == 0:

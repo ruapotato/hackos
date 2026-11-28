@@ -1,0 +1,27 @@
+# Hamnix Micro test script (tests/run_all.sh types it into /tmp/dev.hsh and runs it
+# with hamsh): drive the emulated devices of the QEMU boards through their
+# files under /dev, with nothing but echo and cat.
+echo "ticks 26214 32768" > /dev/model/sht4x
+cat /dev/sht4x/temperature
+cat /dev/sht4x/humidity
+echo "ticks 4096 1024" > /dev/model/sht4x
+cat /dev/sht4x/temperature
+cat /dev/sht4x/humidity
+cat /dev/sht4x/serial
+echo "w 44 89" > /dev/i2c/0/ctl
+echo "r 44 6" > /dev/i2c/0/ctl
+cat /dev/i2c/0/ctl
+echo "r 20 1" > /dev/i2c/0/ctl
+cat /dev/i2c/0/ctl
+echo out > /dev/gpio/2
+for v in [1, 0, 1] { echo $v > /dev/gpio/2 ; cat /dev/gpio/3 | tr 10 HL }
+echo "drive 5 1" > /dev/model/gpio
+cat /dev/gpio/5 | tr 10 HL
+cat /dev/model/gpio | grep out
+cat /dev/screen/ctl
+echo "tickless 0" > /dev/power/ctl
+cat /dev/power/ctl | grep tickless
+echo "tickless 1" > /dev/power/ctl
+cat /dev/power/ctl | grep tickless
+ls /dev/sht4x
+exit 0

@@ -573,6 +573,21 @@ if wait_for "hamsh\$ "; then
     sh 'with bind("/tmp/ub", "/tmp/un") as p { cat /tmp/un/bfile | tr a-z A-Z }'
     sh 'cat /tmp/un/bfile'
     sh 'bind /nonexistent /tmp/un'
+    # ---- milestone 5: drivers as files.  tests/scripts/devices.hsh, typed
+    # into a file and run by a second shell, drives the emulated sensor, the
+    # I2C bus and the GPIO pins with echo and cat
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue;; esac
+        sh "echo '$line' >> /tmp/dev.hsh"
+    done < tests/scripts/devices.hsh
+    shn 'hamsh /tmp/dev.hsh'
+    sh 'echo devices-script $status'
+    sh 'echo Shown-On-Panel > /dev/screen/text'
+    sh 'cat /dev/screen/text | grep "^Shown"'
+    sh 'cat /dev/screen/data | wc'
+    shn 'echo echo Typed-Via-Dev-Keys > /dev/keys'; sleep 1.5
+    sh 'echo after-dev-keys'
+    sh 'ls /dev | wc'
     # power: how often the processor wakes while the system idles at the
     # prompt of a sleeping command, tickless and with the periodic tick;
     # then suspend, ended by a key and by its timer
@@ -715,6 +730,25 @@ expect "ns: ... and nothing else is reachable in it" $S '^cat: cannot open /tmp/
 expect "ns: \`with bind\` binds for the block" $S '^ONLY-B$'
 expect "ns: ... and unbinds at its end" $S '^cat: cannot open /tmp/un/bfile: .*file does not exist'
 expect "ns: bind of a source that does not exist fails with the kernel's error string" $S '^bind: bind failed: source does not resolve in this namespace$'
+# milestone 5: drivers as files
+expect "devices: the script ran to its end" $S '^devices-script 0$'
+expect "devices: cat /dev/sht4x/temperature (the model set to 25 C with echo)" $S '^24\.998$'
+expect "devices: cat /dev/sht4x/humidity" $S '^56\.500$'
+expect "devices: a negative temperature" $S '^-34\.063$'
+expect "devices: ... and humidity" $S '^-4\.047$'
+expect "devices: the sensor's serial number" $S '^0f3a9b2c$'
+expect "devices: the same sensor through /dev/i2c/0/ctl: write 89, read 6 bytes" $S '^0f 3a 06 9b 2c 2d$'
+expect "devices: an I2C address without a device" $S '^nack$'
+[ "$(grep -c '^H$' $S)" = 3 ] && [ "$(grep -c '^L$' $S)" = 1 ] && ok "devices: /dev/gpio/2 driven 1, 0, 1 in a loop reads H, L, H at the pin wired to it; a pin driven from outside reads H" \
+    || bad "devices: gpio levels: $(grep -c '^H$' $S) H and $(grep -c '^L$' $S) L, expected 3 and 1"
+expect "devices: the model shows pin 2 as an output at 1" $S '^2 out 1$'
+expect "devices: /dev/screen/ctl" $S '^size 800 480 depth 1 text 100 30 refreshes [0-9]+$'
+expect "devices: /dev/power/ctl switches tickless idle off" $S '^tickless: +0$'
+expect "devices: ls /dev/sht4x" $S '^temperature$'
+expect "devices: text written to /dev/screen/text is on the screen (read back from /dev/screen/text)" $S '^Shown-On-Panel$'
+expect "devices: /dev/screen/data is the frame buffer, 48000 bytes" $S '^[0-9]+ [0-9]+ 48000$'
+expect "devices: text written to /dev/keys is typed on the emulated key matrix and runs as a command" $S '^Typed-Via-Dev-Keys$'
+expect "devices: ls /dev: console, null, zero and seven driver directories and files" $S '^10 10 [0-9]+$'
 # the same session as the fake e-paper panel showed it
 P=$B/panel-shell.txt
 python3 -I tests/display/panel2png.py $B/panel-shell.bin $B/panel-shell --font third_party/font8x8/font8x8_basic.h --yscale 2 --keep 3 > $P 2>&1; prc=$?

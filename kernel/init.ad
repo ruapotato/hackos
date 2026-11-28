@@ -11,6 +11,7 @@ from kernel.mpu import mpu_init
 from mm.slab import mm_init
 from drivers.tty.console import console_init, uart0_rx_handler
 from fs.hvfs import vfs_init, vfs_fat_mount
+from drivers.devfiles import devfiles_init
 
 
 # Everything up to, but not including, the first thread switch.  Runs on the
@@ -24,3 +25,4 @@ def kernel_init():
     console_init()
     vfs_init()
     vfs_fat_mount()
+    devfiles_init()

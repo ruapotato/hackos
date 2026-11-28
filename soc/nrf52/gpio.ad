@@ -74,3 +74,9 @@ def gpio_toggle(port_base: uint64, pin: uint32):
 
 def gpio_read(port_base: uint64, pin: uint32) -> uint32:
     return (mmio_read32(port_base + GPIO_IN) >> (pin & 31)) & 1
+
+
+# What an output pin is driven to (its bit of OUT).  gpio_output()
+# disconnects the input buffer, so gpio_read() of such a pin reads 0.
+def gpio_out_level(port_base: uint64, pin: uint32) -> uint32:
+    return (mmio_read32(port_base + GPIO_OUT) >> (pin & 31)) & 1

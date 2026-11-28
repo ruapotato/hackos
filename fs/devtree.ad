@@ -1,0 +1,285 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- the device tree: drivers as files under #c (bound at /dev).
+#
+# A driver that wants to be reached from a program or from the shell does
+# not get a system call: it registers files (Plan 9's way, and what Hamnix's
+# sys/src/9/port/dev*.ad do with its Dev table).  A file is a path below
+# /dev and two functions:
+#
+#     devtree_add("i2c/0/ctl", &rd, &wr, arg)
+#
+#     rd(arg, buf, n, pos) -> bytes read (0 = end of file) or a negative errno
+#     wr(arg, buf, n, pos) -> bytes taken, or a negative errno
+#
+# Either may be 0 (a file that cannot be read, or written).  Directories are
+# not registered: "i2c" and "i2c/0" exist because a file lies below them.
+# A file that is a line or two of text renders it into a small buffer of its
+# own at every read and hands it to devtree_text(), which cuts out the part
+# the reader asked for; a control file takes one command per write and
+# ignores an empty line (the shell's echo writes the newline by itself).
+# fs/hvfs.ad opens these files like any other device file: descriptors,
+# /fd redirections (`echo x > /dev/gpio/3`), stat, directory listings.
+#
+# The table is fixed and small; paths are string constants of the drivers.
+
+from kernel.rt import rt_memcpy
+
+DT_MAX: uint32 = 32                 # = the dimension of dt_nodes
+DT_ENOENT: int64 = -2
+DT_EBADF: int64 = -9
+DT_EINVAL: int64 = -22
+
+
+class DevNode:
+    path: uint32                    # address of the path string, 0 = free
+    rd: uint32
+    wr: uint32
+    arg: uint32
+
+
+dt_nodes: Array[32, DevNode]
+dt_count: uint32 = 0
+
+
+def devtree_add(path: Ptr[uint8], rd: uint64, wr: uint64, arg: uint64) -> int32:
+    if dt_count >= DT_MAX:
+        return -1
+    dt_nodes[dt_count].path = cast[uint32](cast[uint64](path))
+    dt_nodes[dt_count].rd = cast[uint32](rd)
+    dt_nodes[dt_count].wr = cast[uint32](wr)
+    dt_nodes[dt_count].arg = cast[uint32](arg)
+    dt_count = dt_count + 1
+    return cast[int32](dt_count - 1)
+
+
+def _path(i: uint32) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](dt_nodes[i].path))
+
+
+# rel is the path below /dev with its leading slash ("/i2c/0/ctl").  The
+# file's number, or -1.
+def devtree_find(rel: Ptr[uint8]) -> int32:
+    if rel[0] != 47:
+        return -1
+    i: uint32 = 0
+    while i < dt_count:
+        p: Ptr[uint8] = _path(i)
+        k: uint32 = 0
+        while p[k] != 0 and p[k] == rel[k + 1]:
+            k = k + 1
+        if p[k] == 0 and rel[k + 1] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# How many bytes of node i's path the directory `rel` ("" = /dev itself,
+# "/i2c") covers, counting the slash after it; 0 if the node is not below it.
+def _below(i: uint32, rel: Ptr[uint8]) -> uint32:
+    p: Ptr[uint8] = _path(i)
+    if rel[0] == 0:
+        return 1
+    k: uint32 = 0
+    while rel[k + 1] != 0 and p[k] == rel[k + 1]:
+        k = k + 1
+    if rel[k + 1] == 0 and p[k] == 47:
+        return k + 2
+    return 0
+
+
+def devtree_is_dir(rel: Ptr[uint8]) -> uint32:
+    if rel[0] != 47:
+        return 0
+    i: uint32 = 0
+    while i < dt_count:
+        if _below(i, rel) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+# Append the names directly below directory `rel` to buf[0..off) as
+# "NAME\n" lines, each once.  Returns the new length.
+def devtree_list(rel: Ptr[uint8], buf: Ptr[uint8], cap: uint64, off: uint64) -> uint64:
+    start: uint64 = off
+    i: uint32 = 0
+    while i < dt_count:
+        b: uint32 = _below(i, rel)
+        if b != 0:
+            p: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](_path(i)) + cast[uint64](b) - 1)
+            l: uint64 = 0
+            while p[l] != 0 and p[l] != 47:
+                l = l + 1
+            # listed already? (the nodes of one directory are registered together)
+            seen: uint32 = 0
+            q: uint64 = start
+            while q < off and seen == 0:
+                e: uint64 = q
+                while e < off and buf[e] != 10:
+                    e = e + 1
+                if e - q == l:
+                    k: uint64 = 0
+                    while k < l and buf[q + k] == p[k]:
+                        k = k + 1
+                    if k == l:
+                        seen = 1
+                q = e + 1
+            if seen == 0 and off + l + 1 <= cap:
+                rt_memcpy(cast[uint64](buf) + off, cast[uint64](p), l)
+                buf[off + l] = 10
+                off = off + l + 1
+        i = i + 1
+    return off
+
+
+def devtree_read(i: uint32, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    if i >= dt_count:
+        return DT_ENOENT
+    if dt_nodes[i].rd == 0:
+        return DT_EBADF
+    f: Fn[int64, uint64, Ptr[uint8], uint64, uint64] = cast[Fn[int64, uint64, Ptr[uint8], uint64, uint64]](cast[uint64](dt_nodes[i].rd))
+    return f(cast[uint64](dt_nodes[i].arg), buf, n, pos)
+
+
+def devtree_write(i: uint32, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    if i >= dt_count:
+        return DT_ENOENT
+    if dt_nodes[i].wr == 0:
+        return DT_EBADF
+    f: Fn[int64, uint64, Ptr[uint8], uint64, uint64] = cast[Fn[int64, uint64, Ptr[uint8], uint64, uint64]](cast[uint64](dt_nodes[i].wr))
+    return f(cast[uint64](dt_nodes[i].arg), buf, n, pos)
+
+
+def devtree_can(i: uint32, write: uint32) -> uint32:
+    if i >= dt_count:
+        return 0
+    if write != 0:
+        return cast[uint32](dt_nodes[i].wr != 0)
+    return cast[uint32](dt_nodes[i].rd != 0)
+
+
+# ---- helpers for the drivers' read and write functions ----------------------
+# The part of text[0..len) a read of n bytes at pos gets.
+def devtree_text(text: Ptr[uint8], len: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    if pos >= len:
+        return 0
+    if n > len - pos:
+        n = len - pos
+    rt_memcpy(cast[uint64](buf), cast[uint64](text) + pos, n)
+    return cast[int64](n)
+
+
+class DtOut:
+    p: Ptr[uint8]
+    n: uint64
+    cap: uint64
+
+
+def dt_c(o: Ptr[DtOut], c: uint32):
+    if o[0].n < o[0].cap:
+        o[0].p[o[0].n] = cast[uint8](c)
+        o[0].n = o[0].n + 1
+
+
+def dt_s(o: Ptr[DtOut], s: Ptr[uint8]):
+    i: uint32 = 0
+    while s[i] != 0:
+        dt_c(o, cast[uint32](s[i]))
+        i = i + 1
+
+
+def dt_u(o: Ptr[DtOut], v: uint64):
+    d: Array[24, uint8]
+    k: uint32 = 0
+    if v == 0:
+        d[0] = 48
+        k = 1
+    while v != 0:
+        d[k] = cast[uint8](48 + v % 10)
+        v = v / 10
+        k = k + 1
+    while k > 0:
+        k = k - 1
+        dt_c(o, cast[uint32](d[k]))
+
+
+# Two hexadecimal digits.
+def dt_x2(o: Ptr[DtOut], v: uint32):
+    h: Ptr[uint8] = "0123456789abcdef"
+    dt_c(o, cast[uint32](h[(v >> 4) & 15]))
+    dt_c(o, cast[uint32](h[v & 15]))
+
+
+# A scanner for the words of a command line written to a control file.
+class DtIn:
+    p: Ptr[uint8]
+    n: uint64
+    i: uint64
+
+
+def dt_in(s: Ptr[DtIn], buf: Ptr[uint8], n: uint64):
+    s[0].p = buf
+    s[0].n = n
+    s[0].i = 0
+
+
+def _skip(s: Ptr[DtIn]):
+    while s[0].i < s[0].n and (s[0].p[s[0].i] == 32 or s[0].p[s[0].i] == 9 or s[0].p[s[0].i] == 10 or s[0].p[s[0].i] == 13):
+        s[0].i = s[0].i + 1
+
+
+# Nothing but blanks left?
+def dt_end(s: Ptr[DtIn]) -> uint32:
+    _skip(s)
+    if s[0].i >= s[0].n:
+        return 1
+    return 0
+
+
+# Is the next word `w`?  If so it is consumed.
+def dt_word(s: Ptr[DtIn], w: Ptr[uint8]) -> uint32:
+    _skip(s)
+    k: uint64 = 0
+    while w[k] != 0:
+        if s[0].i + k >= s[0].n or s[0].p[s[0].i + k] != w[k]:
+            return 0
+        k = k + 1
+    e: uint64 = s[0].i + k
+    if e < s[0].n and s[0].p[e] != 32 and s[0].p[e] != 9 and s[0].p[e] != 10 and s[0].p[e] != 13:
+        return 0
+    s[0].i = e
+    return 1
+
+
+# The next word as a number: decimal, or hexadecimal with `hex` != 0 or a
+# "0x" prefix.  ok[0] = 0 when there is none.
+def dt_num(s: Ptr[DtIn], hex: uint32, ok: Ptr[uint32]) -> uint64:
+    _skip(s)
+    v: uint64 = 0
+    digits: uint32 = 0
+    if s[0].i + 1 < s[0].n and s[0].p[s[0].i] == 48 and (s[0].p[s[0].i + 1] == 120 or s[0].p[s[0].i + 1] == 88):
+        hex = 1
+        s[0].i = s[0].i + 2
+    while s[0].i < s[0].n:
+        c: uint32 = cast[uint32](s[0].p[s[0].i])
+        d: uint32 = 99
+        if c >= 48 and c <= 57:
+            d = c - 48
+        elif hex != 0 and c >= 97 and c <= 102:
+            d = c - 87
+        elif hex != 0 and c >= 65 and c <= 70:
+            d = c - 55
+        if d == 99:
+            break
+        if hex != 0:
+            v = v * 16 + cast[uint64](d)
+        else:
+            v = v * 10 + cast[uint64](d)
+        digits = digits + 1
+        s[0].i = s[0].i + 1
+    if digits == 0 or (s[0].i < s[0].n and s[0].p[s[0].i] != 32 and s[0].p[s[0].i] != 9 and s[0].p[s[0].i] != 10 and s[0].p[s[0].i] != 13):
+        ok[0] = 0
+    else:
+        ok[0] = 1
+    return v

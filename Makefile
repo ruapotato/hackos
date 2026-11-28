@@ -74,7 +74,11 @@ SOFT_DOUBLE   := 0
 PROG_ABI      := pie
 PROGS_SKIP    :=
 BOARD_COBJS   :=
+BOARD_SHT4X   := 0
 include boards/$(BOARD_DIR)/board.mk
+ifeq ($(BOARD_SHT4X),1)
+COBJS_hmicro = $(COBJS_SHT4X)
+endif
 
 CPUFLAGS := --target=$(TRIPLE) -mcpu=$(CPU) -mfpu=$(FPU) -mfloat-abi=hard -mthumb
 ifeq ($(CPU),cortex-m4)
@@ -94,6 +98,9 @@ CFLAGS  := $(CPUFLAGS) $(OPT) -std=c11 -ffreestanding -nostdlibinc -fno-pic -ffu
            -Wall -Wextra -isystem lib/cshim/include -include lib/cshim/include/hmicro_libc_rename.h
 C_SHT4X := third_party/sensirion-sht4x
 COBJS_ktest := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common.o $(B)/c/interop.o $(B)/c/libc.o
+# The system image of a board whose devices.ad binds the SHT4x driver
+# (BOARD_SHT4X := 1 in board.mk; drivers/i2c/sht4xfs.ad) links it too.
+COBJS_SHT4X := $(B)/c/sht4x_i2c.o $(B)/c/sensirion_i2c.o $(B)/c/sensirion_common.o $(B)/c/libc.o
 # C objects every image of a board links (BOARD_COBJS in board.mk): the
 # glyph table of a board that has a display (drivers/display/font8x8.c).
 C_FONT := third_party/font8x8

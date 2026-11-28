@@ -18,6 +18,7 @@
 
 from soc.imxrt.reg import reg_rd, reg_wr
 from soc.imxrt.delay import delay_us
+from drivers.i2c.bus import I2C_OK, I2C_NACK
 
 LPI2C_PARAM: uint64 = 0x04
 LPI2C_MCR: uint64 = 0x10
@@ -69,8 +70,8 @@ LPI2C_CMD_START: uint32 = 0x400      # unchecked: RM command code 100b, (repeate
 LPI2C_FILT: uint32 = 2               # unchecked: driver policy, glitch filter in module clocks
 LPI2C_TIMEOUT_US: uint32 = 20000     # unchecked: driver policy (one byte at 100 kHz is 90 us)
 
-I2C_OK: int32 = 0                    # unchecked: result code shared with drivers/i2c/bus.ad
-I2C_NACK: int32 = -1                 # unchecked: result code shared with drivers/i2c/bus.ad
+# I2C_OK (0) and I2C_NACK (-1) are the software bus's (drivers/i2c/bus.ad),
+# which every system image has since it serves /dev/i2c/0.
 I2C_ARB_LOST: int32 = -2             # unchecked: result code
 I2C_TIMEOUT: int32 = -3              # unchecked: result code
 I2C_FIFO_ERR: int32 = -4             # unchecked: result code

@@ -121,6 +121,13 @@ sh rm /tmp/ua
 sh rm /tmp/ub
 sh rm /tmp/un
 sh free
+# milestone 5: drivers as files (this board: the power file, the I2C bus
+# with nothing on it, the red LED)
+sh ls /dev
+sh cat /dev/gpio/led | tr 10 HL
+sh echo "r 44 1" > /dev/i2c/0/ctl
+sh cat /dev/i2c/0/ctl
+sh cat /dev/power/ctl | grep tickless
 # the editor (200 lines of 79 characters on this board)
 shn vi /tmp/edit.txt
 sleep 1

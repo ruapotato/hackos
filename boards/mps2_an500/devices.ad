@@ -14,6 +14,11 @@ from drivers.input.keymap import keymap_init, keymap_find
 from drivers.input.tca8418 import tca8418_init
 from drivers.input.tca8418_model import tca_model_attach, tca_model_key
 from fs.procfs import proc_keys_fn, proc_keys_set
+from fs.devtree import devtree_add
+from drivers.display.dispfs import dispfs_init
+from drivers.i2c.sht4x_model import sht4x_model_attach
+from drivers.i2c.sht4xfs import sht4xfs_init
+from drivers.gpio.gpio_model import gpio_model_attach
 from mm.slab import kheap
 from mm.heap import heap_total
 
@@ -67,6 +72,7 @@ def board_display_start() -> int32:
         board_tee_set = 1
         board_halt_fn = _dev_halt
         board_halt_set = 1
+        dispfs_init()                   # /dev/screen/ctl, text, data
     return r
 
 
@@ -105,4 +111,23 @@ def board_input_start() -> int32:
         return -1
     proc_keys_fn = _board_type_keys
     proc_keys_set = 1
+    devtree_add("keys", 0, cast[uint64](&_keys_wr), 0)
+    return 0
+
+
+# /dev/keys (and /proc/keys): text written there is typed on the matrix.
+def _keys_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    _board_type_keys(buf, n)
+    return cast[int64](n)
+
+
+# ---- other devices, as files under /dev (docs/devices.md) ------------------
+# Emulated ones on this board: a Sensirion SHT4x on the I2C bus, read by the
+# vendor's C driver (/dev/sht4x/temperature, humidity, serial; the model's
+# values are set through /dev/model/sht4x), and eight GPIO pins
+# (/dev/gpio/0..7, /dev/model/gpio).  Called by the system image.
+def board_devices_start() -> int32:
+    if sht4x_model_attach() == 0:
+        sht4xfs_init()
+    gpio_model_attach()
     return 0

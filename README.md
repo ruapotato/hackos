@@ -48,6 +48,13 @@ New in milestone 5 (checked by `make test`, `make test-m4`,
   `enter` and `with bind` work; `/proc/<pid>/ns` shows a process's
   namespace as commands that rebuild it. A process that only inherits its
   namespace costs no memory: tables are shared until someone changes them.
+- **Drivers as files** ([`docs/devices.md`](docs/devices.md)). A driver
+  registers files under `/dev` instead of getting a system call:
+  `/dev/i2c/0/ctl` and `data`, `/dev/gpio/<pin>`, `/dev/power/ctl`,
+  `/dev/screen/ctl`, `text` and `data`, `/dev/keys`, and the SHT4x as text
+  (`cat /dev/sht4x/temperature`). On the QEMU boards the sensor and the
+  pins are emulated and a hamsh script drives them with `echo` and `cat`
+  (`tests/scripts/devices.hsh`).
 
 New in milestone 4:
 
@@ -185,9 +192,10 @@ everything here from source, and runs:
 3. static checks on the linked images (vector tables, the empty null-guard
    area, constants in read-only memory, no undefined symbols);
 4. the run-time self-test from milestone 1 (arithmetic, FPU, start-up);
-5. the kernel tests: one image, 229 counted checks, including processes
+5. the kernel tests: one image, 243 counted checks, including processes
    (isolation, faults, spawn, rfork, exec, wait), pipes, FAT, namespaces
-   (bind, unions, rfork's namespace flags), power (tickless idle, suspend), the display stack and the keyboard stack, with console
+   (bind, unions, rfork's namespace flags), device files, power (tickless
+   idle, suspend), the display stack and the keyboard stack, with console
    input typed into the emulated UART by the harness; then the fake panel's
    output is turned into PNG frames and the text read back from the pixels;
 6. a scripted session with the kernel monitor (`build/monitor.elf`);
@@ -195,7 +203,8 @@ everything here from source, and runs:
 8. a scripted session with the shell: pipelines, redirections, a faulting
    program, the FAT volume, a script file run by a second shell, jobs, kill,
    history, completion, namespaces (`ns { }`, unions, a program replaced
-   for one command, `/proc/self/ns` replayed), the editor, a command typed
+   for one command, `/proc/self/ns` replayed), a script that drives the
+   emulated devices through `/dev`, the editor, a command typed
    on the emulated key matrix, idle and suspend measurements, a pasted block; and the same
    session as the fake e-paper panel showed it.
 
@@ -260,7 +269,9 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `user/progs/` | Hamnix Micro's own programs: `hello`, `halt`, the process test program, a C program |
 | `user/sys.ad`, `user/faults.ad` | unprivileged code that is part of the kernel test image |
 | `drivers/tty/console.ad` | UART console with line discipline |
-| `drivers/i2c/` | software I2C bus, Sensirion platform layer and driver declarations |
+| `drivers/i2c/` | software I2C bus, Sensirion platform layer and driver declarations; the bus and the SHT4x as files (`i2cfs.ad`, `sht4xfs.ad`), the emulated SHT4x |
+| `fs/devtree.ad`, `drivers/devfiles.ad` | the registry of driver files under `/dev`; the files every board has |
+| `drivers/gpio/` | GPIO pins as files; eight emulated pins |
 | `init/main.ad`, `init/monitor*.ad` | the system image (init + shell); the kernel monitor image |
 | `scripts/mkromfs.sh` | generates the table of ROM files |
 | `third_party/` | vendor code with licences and upstream records: Sensirion's C driver; NXP's RT1062 device files, read as data by the checks |
@@ -270,6 +281,7 @@ Hamnix code are applied (`scripts/mkroot.sh`). The default is
 | `tests/imxrt/` | the Teensy checks: boot header, register and pin checkers, register models, the driver test image, the uSDHC test on QEMU's i.MX6UL, the Teensy memory test |
 | `docs/syscalls.md` | the system-call table and how it differs from Hamnix |
 | `docs/namespaces.md` | namespaces: examples, how lookup works, what it costs, differences from Hamnix |
+| `docs/devices.md` | the files under `/dev`, which board has which, how a driver adds one |
 | `docs/boards/teensy41.md` | flashing, wiring, first power-up, bring-up checklist, memory |
 | `docs/boards/feather-nrf52840.md` | the same for the Feather nRF52840 |
 | `docs/porting.md` | what a new board, chip family or architecture needs |

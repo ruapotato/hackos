@@ -173,3 +173,10 @@ against its SI70xx sensor model; that is the next step for buses).
   through model, bus, driver and map;
 - from the shell: `keypress -n echo ...` types a command on the matrix and
   the shell runs it.
+
+## As files
+
+Since milestone 5 the display and the keyboard are also reached through
+`/dev`: `/dev/screen/ctl`, `/dev/screen/text`, `/dev/screen/data` and
+`/dev/keys` (and the I2C bus the scanner sits on: `/dev/i2c/0/ctl`). See
+[`devices.md`](devices.md). `/proc/screen` and `/proc/keys` remain.

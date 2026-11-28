@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- the I2C bus as files: /dev/i2c/0/ctl and /dev/i2c/0/data.
+#
+#   ctl   write one command per line (numbers after w, r and addr are
+#         hexadecimal, a count is decimal):
+#             w ADDR BYTE...     write the bytes to the device at ADDR
+#             r ADDR COUNT       read COUNT bytes (1..32) from it
+#             addr ADDR          the device `data` talks to
+#             count COUNT        how many bytes one read of `data` fetches
+#         read: "addr 44 count 6\n" and the result of the last transfer:
+#         "ok\n", "nack\n", or the bytes read, "66 66 5d 80 00 a2\n"
+#   data  binary: a write is one I2C write of those bytes to the current
+#         address; a read (from position 0) is one I2C read of `count` bytes
+#
+#     echo 'w 44 fd' > /dev/i2c/0/ctl       # SHT4x: measure, high precision
+#     echo 'r 44 6' > /dev/i2c/0/ctl
+#     cat /dev/i2c/0/ctl
+#
+# There is one bus (drivers/i2c/bus.ad: emulated devices, or the board's
+# controller), and no lock around it: a driver that owns a device and a
+# script that pokes the same device at the same time see each other's
+# transfers, as on the wires.
+
+from drivers.i2c.bus import i2c_read, i2c_write
+from fs.devtree import devtree_add, devtree_text, DtOut, dt_c, dt_s, dt_u, dt_x2, DtIn, dt_in, dt_end, dt_word, dt_num
+
+I2CFS_MAX: uint32 = 32
+i2cfs_addr: uint32 = 0
+i2cfs_count: uint32 = 1
+i2cfs_res: Array[112, uint8]
+i2cfs_res_len: uint64 = 0
+
+
+def _res(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0:
+        i2cfs_res[i] = s[i]
+        i = i + 1
+    i2cfs_res_len = i
+
+
+def _ctl_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    text: Array[160, uint8]
+    o: DtOut
+    o.p = &text[0]
+    o.n = 0
+    o.cap = 160
+    dt_s(&o, "addr ")
+    dt_x2(&o, i2cfs_addr)
+    dt_s(&o, " count ")
+    dt_u(&o, cast[uint64](i2cfs_count))
+    dt_c(&o, 10)
+    i: uint64 = 0
+    while i < i2cfs_res_len:
+        dt_c(&o, cast[uint32](i2cfs_res[i]))
+        i = i + 1
+    return devtree_text(&text[0], o.n, buf, n, pos)
+
+
+def _ctl_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    ok: uint32 = 0
+    data: Array[32, uint8]
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    if dt_word(&s, "addr") != 0:
+        a: uint64 = dt_num(&s, 1, &ok)
+        if ok == 0 or a > 127 or dt_end(&s) == 0:
+            return -22
+        i2cfs_addr = cast[uint32](a)
+        return cast[int64](n)
+    if dt_word(&s, "count") != 0:
+        c: uint64 = dt_num(&s, 0, &ok)
+        if ok == 0 or c == 0 or c > cast[uint64](I2CFS_MAX) or dt_end(&s) == 0:
+            return -22
+        i2cfs_count = cast[uint32](c)
+        return cast[int64](n)
+    if dt_word(&s, "w") != 0:
+        wa: uint64 = dt_num(&s, 1, &ok)
+        if ok == 0 or wa > 127:
+            return -22
+        k: uint32 = 0
+        while dt_end(&s) == 0:
+            b: uint64 = dt_num(&s, 1, &ok)
+            if ok == 0 or b > 255 or k >= I2CFS_MAX:
+                return -22
+            data[k] = cast[uint8](b)
+            k = k + 1
+        if i2c_write(cast[uint32](wa), &data[0], k) == 0:
+            _res("ok\n")
+        else:
+            _res("nack\n")
+        return cast[int64](n)
+    if dt_word(&s, "r") != 0:
+        ra: uint64 = dt_num(&s, 1, &ok)
+        if ok == 0 or ra > 127:
+            return -22
+        rc: uint64 = dt_num(&s, 0, &ok)
+        if ok == 0 or rc == 0 or rc > cast[uint64](I2CFS_MAX) or dt_end(&s) == 0:
+            return -22
+        if i2c_read(cast[uint32](ra), &data[0], cast[uint32](rc)) != 0:
+            _res("nack\n")
+            return cast[int64](n)
+        o: DtOut
+        o.p = &i2cfs_res[0]
+        o.n = 0
+        o.cap = 112
+        j: uint64 = 0
+        while j < rc:
+            if j != 0:
+                dt_c(&o, 32)
+            dt_x2(&o, cast[uint32](data[j]))
+            j = j + 1
+        dt_c(&o, 10)
+        i2cfs_res_len = o.n
+        return cast[int64](n)
+    return -22
+
+
+def _data_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    if pos != 0:
+        return 0
+    c: uint64 = cast[uint64](i2cfs_count)
+    if c > n:
+        c = n
+    if i2c_read(i2cfs_addr, buf, cast[uint32](c)) != 0:
+        return -5
+    return cast[int64](c)
+
+
+def _data_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    if n > 255:
+        return -22
+    if i2c_write(i2cfs_addr, buf, cast[uint32](n)) != 0:
+        return -5
+    return cast[int64](n)
+
+
+def i2cfs_init():
+    _res("")
+    devtree_add("i2c/0/ctl", cast[uint64](&_ctl_rd), cast[uint64](&_ctl_wr), 0)
+    devtree_add("i2c/0/data", cast[uint64](&_data_rd), cast[uint64](&_data_wr), 0)

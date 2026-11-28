@@ -94,6 +94,18 @@ def dispcon_sync():
 
 
 # The screen as text (/proc/screen).
+# Ask for a refresh soon (something drew into the frame buffer).
+def dispcon_kick():
+    if dc_panel < 0:
+        return
+    irq: uint32 = cpu_irq_save()
+    if dc_pending == 0:
+        dc_pending = 1
+        if sched_running != 0:
+            wq_wake_all(&dc_wq)
+    cpu_irq_restore(irq)
+
+
 def dispcon_text(out: Ptr[uint8], cap: uint64) -> uint64:
     return textcon_text(out, cap)
 

@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- eight emulated GPIO pins, for boards without real ones to spare
+# and for the tests.  Pins 0 and 1 are wired together, and 2 and 3: an input
+# reads what the output at the other end of its wire drives.  Any input can
+# also be driven from outside:
+#
+#     echo 'drive 5 1' > /dev/model/gpio
+#     cat /dev/model/gpio          one line per pin: "5 in 1"
+
+from drivers.gpio.gpiofs import gpiofs_set_board, gpiofs_add
+from fs.devtree import devtree_add, devtree_text, DtOut, dt_c, dt_s, dt_u, DtIn, dt_in, dt_end, dt_word, dt_num
+
+GM_PINS: uint32 = 8
+gm_out: Array[8, uint8]             # 1 = the pin is an output
+gm_level: Array[8, uint8]           # what it drives when it is one
+gm_ext: Array[8, uint8]             # what the outside drives it to when it is an input
+gm_sets: uint64 = 0                 # statistics
+
+
+def _wire(pin: uint32) -> uint32:
+    if pin < 4:
+        return pin ^ 1
+    return pin
+
+
+def gm_get(pin: uint32) -> uint32:
+    if pin >= GM_PINS:
+        return 0
+    if gm_out[pin] != 0:
+        return cast[uint32](gm_level[pin])
+    w: uint32 = _wire(pin)
+    if w != pin and gm_out[w] != 0:
+        return cast[uint32](gm_level[w])
+    return cast[uint32](gm_ext[pin])
+
+
+def gm_set(pin: uint32, level: uint32) -> int32:
+    if pin >= GM_PINS:
+        return -1
+    gm_out[pin] = 1
+    gm_level[pin] = cast[uint8](level & 1)
+    gm_sets = gm_sets + 1
+    return 0
+
+
+def gm_dir(pin: uint32, out: uint32) -> int32:
+    if pin >= GM_PINS:
+        return -1
+    gm_out[pin] = cast[uint8](out & 1)
+    return 0
+
+
+def _m_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    text: Array[96, uint8]
+    o: DtOut
+    o.p = &text[0]
+    o.n = 0
+    o.cap = 96
+    p: uint32 = 0
+    while p < GM_PINS:
+        dt_u(&o, cast[uint64](p))
+        if gm_out[p] != 0:
+            dt_s(&o, " out ")
+        else:
+            dt_s(&o, " in ")
+        dt_u(&o, cast[uint64](gm_get(p)))
+        dt_c(&o, 10)
+        p = p + 1
+    return devtree_text(&text[0], o.n, buf, n, pos)
+
+
+def _m_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    ok: uint32 = 0
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    if dt_word(&s, "drive") == 0:
+        return -22
+    p: uint64 = dt_num(&s, 0, &ok)
+    if ok == 0 or p >= cast[uint64](GM_PINS):
+        return -22
+    v: uint64 = dt_num(&s, 0, &ok)
+    if ok == 0 or v > 1 or dt_end(&s) == 0:
+        return -22
+    gm_ext[p] = cast[uint8](v)
+    return cast[int64](n)
+
+
+def gpio_model_attach():
+    gpiofs_set_board(gm_get, gm_set, gm_dir)
+    gpiofs_add("gpio/0", 0)
+    gpiofs_add("gpio/1", 1)
+    gpiofs_add("gpio/2", 2)
+    gpiofs_add("gpio/3", 3)
+    gpiofs_add("gpio/4", 4)
+    gpiofs_add("gpio/5", 5)
+    gpiofs_add("gpio/6", 6)
+    gpiofs_add("gpio/7", 7)
+    devtree_add("model/gpio", cast[uint64](&_m_rd), cast[uint64](&_m_wr), 0)

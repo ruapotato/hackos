@@ -13,3 +13,5 @@ SOFT_DOUBLE := 1
 # This board has a display (a fake e-paper panel, drivers/display/): its
 # images link the glyph table.
 BOARD_COBJS := $(B)/c/font8x8.o
+# The emulated SHT4x is read by Sensirion's C driver (devices.ad).
+BOARD_SHT4X := 1

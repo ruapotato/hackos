@@ -39,6 +39,10 @@ from fs.hvfs import fs_lock
 from fs.hvfs import vfs_bind, vfs_unmount, vfs_nslabel, vfs_ns_split, vfs_stat, vfs_chdir
 from fs.ns import ns_stat, ns_render, ns_tab_copies, ns_tabs_live, NS_TAB_MAX, MREPL, MBEFORE, MAFTER, MCREATE, MRDONLY
 from kernel.sched.core import current_thread
+from drivers.i2c.sht4x_model import sht4x_model_attach, sht4x_model_plug
+from drivers.i2c.sht4xfs import sht4xfs_init
+from drivers.gpio.gpio_model import gpio_model_attach, gm_sets
+from fs.devtree import dt_count
 from kernel.sync import mutex_dead_released
 from kernel.sched.core import sched_bad_stacks, pw_tick_irqs, pw_ticks_skipped, pw_idle_sleeps, SCHED_TICKLESS
 from kernel.power import power_suspend, pw_suspend_wakes, WAKE_TIMER, WAKE_CONSOLE
@@ -1739,8 +1743,10 @@ def ns_put(path: Ptr[uint8], text: Ptr[uint8]) -> int32:
     n: uint64 = 0
     while text[n] != 0:
         n = n + 1
-    vfs_write(fd, text, n)
+    w: int64 = vfs_write(fd, text, n)
     vfs_close(fd)
+    if w < 0:
+        return cast[int32](w)
     return 0
 
 
@@ -1826,8 +1832,8 @@ def ns_thread(arg: uint64) -> int64:
     check(cast[uint32](vfs_bind("/tmp/nsu", "/tmp/nsa", MRDONLY) == 0 and ns_is("/tmp/nsu/onlya", "A") == 1 and ns_put("/tmp/nsu/x", "X") == -30 and vfs_unlink("/tmp/nsu/onlya") == -30 and vfs_mkdir("/tmp/nsu/d") == -30 and ns_is("/tmp/nsa/onlya", "A") == 1), "bind MRDONLY: reads pass, create, remove and mkdir through the binding fail with EROFS")
     vfs_unmount(cast[Ptr[uint8]](0), "/tmp/nsu")
     # servers by name, and a label
-    check(cast[uint32](ns_is("#c", "console\nnull\nzero\n") == 1 and ns_is("#t/tmp/nsa/onlya", "A") == 1 and vfs_open("#q/x", OREAD) == -2 and ns_put("#q/x", "X") == -2), "a server can be named directly (#c, #t/...); an unknown one does not exist")
-    check(cast[uint32](vfs_bind("/n/devices", "#c", MREPL) == 0 and ns_is("/n", "devices\n") == 1 and ns_is("/n/devices", "console\nnull\nzero\n") == 1 and vfs_chdir("/n") == 0 and vfs_stat("devices", &ns_io[0], 256) > 0 and vfs_chdir("/") == 0), "a mount point shows up in its parent's listing though no file system holds the parent; cd and stat work there")
+    check(cast[uint32](ns_is("#c", "console\nnull\nzero\npower\ni2c\n") == 1 and ns_is("#t/tmp/nsa/onlya", "A") == 1 and vfs_open("#q/x", OREAD) == -2 and ns_put("#q/x", "X") == -2), "a server can be named directly (#c, #t/...); an unknown one does not exist")
+    check(cast[uint32](vfs_bind("/n/devices", "#c", MREPL) == 0 and ns_is("/n", "devices\n") == 1 and ns_is("/n/devices", "console\nnull\nzero\npower\ni2c\n") == 1 and vfs_chdir("/n") == 0 and vfs_stat("devices", &ns_io[0], 256) > 0 and vfs_chdir("/") == 0), "a mount point shows up in its parent's listing though no file system holds the parent; cd and stat work there")
     check(cast[uint32](vfs_nslabel(0, "devs", "/n/devices") == 0 and vfs_nslabel(1, "nolabel", cast[Ptr[uint8]](0)) == -2 and vfs_nslabel(1, "devs", cast[Ptr[uint8]](0)) == 0 and vfs_open("/n/devices/null", OREAD) == -2), "nslabel: a binding is labelled and then removed by its label")
     # the namespace as text
     vfs_bind("/tmp/nsu", "/tmp/nsa", MREPL)
@@ -1878,7 +1884,7 @@ def test_ns():
     base: uint32 = ns_entries()
     nt: Ptr[Thread] = thread_create("ns", cast[uint64](&ns_thread), 0, 2, 8192, 0)
     join(nt[0].tid)
-    check(cast[uint32](ns_entries() == base and vfs_open("/tmp/nsu/onlya", OREAD) == -2 and ns_is("/tmp/nsa/onlya", "A") == 1 and ns_is("/dev", "console\nnull\nzero\n") == 1), "ns: none of that thread's binds reached the boot namespace")
+    check(cast[uint32](ns_entries() == base and vfs_open("/tmp/nsu/onlya", OREAD) == -2 and ns_is("/tmp/nsa/onlya", "A") == 1 and ns_is("/dev", "console\nnull\nzero\npower\ni2c\n") == 1), "ns: none of that thread's binds reached the boot namespace")
     check(cast[uint32](ns_tabs_live == tabs0), "ns: a group's table is freed with its last thread")
     code: int64 = run_prog("/bin/ptest", "ns", nul, nul)
     printk1("   ptest ns -> %d\n", cast[uint64](code))
@@ -1901,6 +1907,64 @@ def test_ns():
     check(cast[uint32](ns_entries() == base and ns_tabs_live == tabs0 and kheap.n_live == live0), "ns: the boot namespace is as it was; nothing left allocated")
 
 
+# ============================================================ 18. device files
+def test_devfiles():
+    printk0("-- 18. drivers as files under /dev (fs/devtree.ad)\n")
+    open0: uint32 = vfs_open_count()
+    live0: uint32 = kheap.n_live
+    n0: uint32 = dt_count
+    # every board has these (drivers/devfiles.ad); the emulated sensor and
+    # pins are what the QEMU boards' system image adds (board.devices)
+    check(cast[uint32](n0 == 3 and ns_is("/dev", "console\nnull\nzero\npower\ni2c\n") == 1 and ns_is("/dev/i2c", "0\n") == 1 and ns_is("/dev/i2c/0", "ctl\ndata\n") == 1), "devtree: /dev lists the built-in devices and the drivers' directories; directories exist because files lie below them")
+    sht4x_model_attach()
+    sht4xfs_init()
+    gpio_model_attach()
+    check(cast[uint32](ns_is("/dev", "console\nnull\nzero\npower\ni2c\nmodel\nsht4x\ngpio\n") == 1 and ns_is("/dev/sht4x", "temperature\nhumidity\nserial\n") == 1 and vfs_chdir("/dev/gpio") == 0 and vfs_stat("7", &ns_io[0], 256) > 0 and vfs_stat("8", &ns_io[0], 256) == -2 and vfs_chdir("/") == 0 and vfs_open("/dev/gpio", OWRITE) == -21), "devtree: a driver's files appear when it registers them; cd, stat, a directory cannot be written")
+    # the sensor as text files, through the vendor's C driver and the I2C bus
+    check(cast[uint32](ns_put("/dev/model/sht4x", "ticks 26214 32768\n") == 0 and ns_is("/dev/sht4x/temperature", "24.998\n") == 1 and ns_is("/dev/sht4x/humidity", "56.500\n") == 1 and ns_is("/dev/sht4x/serial", "0f3a9b2c\n") == 1), "sht4x: temperature and humidity read as text (25 C, 56.5 %RH set in the model), the serial number")
+    check(cast[uint32](ns_put("/dev/model/sht4x", "ticks 4096 1024") == 0 and ns_is("/dev/sht4x/temperature", "-34.063\n") == 1 and ns_is("/dev/sht4x/humidity", "-4.047\n") == 1), "sht4x: negative values")
+    i2c_detach(0x44)
+    efd: int32 = vfs_open("/dev/sht4x/temperature", OREAD)
+    er: int64 = vfs_read(efd, &ns_io[0], 16, 0)
+    vfs_close(efd)
+    check(cast[uint32](efd >= 0 and er == -5 and ns_err_is("device: input/output error") == 1), "sht4x: a sensor that does not answer is an error for the reader, not a number")
+    sht4x_model_plug()
+    # the bus itself
+    check(cast[uint32](ns_put("/dev/i2c/0/ctl", "w 44 89") == 0 and ns_put("/dev/i2c/0/ctl", "r 44 6\n") == 0 and ns_is("/dev/i2c/0/ctl", "addr 00 count 1\n0f 3a 06 9b 2c 2d\n") == 1), "i2c: ctl takes 'w ADDR BYTES' and 'r ADDR COUNT' and shows what was read (the sensor's serial number with its checksums)")
+    check(cast[uint32](ns_put("/dev/i2c/0/ctl", "r 20 1") == 0 and ns_is("/dev/i2c/0/ctl", "addr 00 count 1\nnack\n") == 1 and ns_put("/dev/i2c/0/ctl", "r 44 99") == -22 and ns_put("/dev/i2c/0/ctl", "fly") == -22 and ns_err_is("device: not understood") == 1), "i2c: an address nobody answers at is 'nack'; a command that is not one is refused")
+    ns_put("/dev/i2c/0/ctl", "addr 44")
+    ns_put("/dev/i2c/0/ctl", "count 6")
+    cmd: Array[4, uint8]
+    cmd[0] = 0x89
+    fd: int32 = vfs_open("/dev/i2c/0/data", ORDWR)
+    w: int64 = vfs_write(fd, &cmd[0], 1)
+    vfs_lseek(fd, 0, 0)
+    r: int64 = vfs_read(fd, &ns_io[0], 64, 0)
+    r2: int64 = vfs_read(fd, &ns_io[32], 64, 0)
+    vfs_close(fd)
+    check(cast[uint32](fd >= 0 and w == 1 and r == 6 and r2 == 0 and ns_io[0] == 0x0F and ns_io[1] == 0x3A and ns_io[3] == 0x9B and ns_io[4] == 0x2C), "i2c: data is the binary side: a write is one transfer to the current address, a read fetches 'count' bytes")
+    # pins
+    s0: uint64 = gm_sets
+    check(cast[uint32](ns_put("/dev/gpio/0", "out") == 0 and ns_put("/dev/gpio/0", "1\n") == 0 and ns_is("/dev/gpio/1", "1\n") == 1 and ns_put("/dev/gpio/0", "0") == 0 and ns_is("/dev/gpio/1", "0\n") == 1 and gm_sets == s0 + 2), "gpio: a pin driven through its file is read back at the pin wired to it")
+    check(cast[uint32](ns_is("/dev/gpio/5", "0\n") == 1 and ns_put("/dev/model/gpio", "drive 5 1") == 0 and ns_is("/dev/gpio/5", "1\n") == 1 and ns_put("/dev/gpio/5", "up") == -22 and ns_put("/dev/gpio/5", "\n") == 0), "gpio: an input follows what the outside drives it to; a wrong word is refused, an empty line ignored")
+    # every board's power file
+    check(cast[uint32](ns_put("/dev/power/ctl", "tickless 0") == 0 and SCHED_TICKLESS == 0 and ns_put("/dev/power/ctl", "tickless 1\n") == 0 and SCHED_TICKLESS == 1 and ns_put("/dev/power/ctl", "tickless 7") == -22), "power: /dev/power/ctl switches tickless idle")
+    fd = vfs_open("/dev/power/ctl", OREAD)
+    r = vfs_read(fd, &ns_io[0], 10, 0)
+    r2 = vfs_lseek(fd, 0, 0)
+    w = vfs_read(fd, &ns_io[16], 10, 0)
+    vfs_close(fd)
+    check(cast[uint32](r == 10 and w == 10 and line_is(&ns_io[0], 10, "uptime_ms:") == 1 and line_is(&ns_io[16], 10, "uptime_ms:") == 1 and r2 == 0 and ns_put("/dev/sht4x/serial", "x") == -9), "devtree: a text file is rendered at every read and can be read again after lseek; a file without a write function refuses a write")
+    # a union of device trees: /dev can be extended like any directory
+    vfs_mkdir("/tmp/mydev")
+    ns_put("/tmp/mydev/extra", "E")
+    check(cast[uint32](vfs_bind("/dev", "/tmp/mydev", MAFTER) == 0 and ns_is("/dev/extra", "E") == 1 and ns_is("/dev/gpio/5", "1\n") == 1 and vfs_unmount("/dev", "/tmp/mydev") == 0 and vfs_open("/dev/extra", OREAD) == -2), "devtree: /dev is a directory like any other: a second tree can be bound after it and taken away again")
+    vfs_unlink("/tmp/mydev/extra")
+    vfs_unlink("/tmp/mydev")
+    i2c_detach(0x44)
+    check(cast[uint32](vfs_open_count() == open0 and kheap.n_live == live0), "devtree: nothing left open or allocated")
+
+
 def runner(arg: uint64) -> int64:
     vfs_open_stdio()
     test_boot()
@@ -1916,6 +1980,7 @@ def runner(arg: uint64) -> int64:
     test_pipes()
     test_fat()
     test_ns()
+    test_devfiles()
     bench_switch()
     bench_proc()
     test_power()

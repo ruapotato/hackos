@@ -16,7 +16,7 @@ in `docs/boards/` say how each was checked without the board.
 sources in which `board` is `boards/<dir>`. Kernel code imports
 `board.board`, and a board's size patches are applied to copies there.
 
-A board directory holds five files:
+A board directory holds six files (`devices.ad`, below, is the sixth):
 
 | File | What |
 |--|--|
@@ -48,6 +48,7 @@ A board directory holds five files:
 | `board_tick_stop_for(ticks)`, `board_tick_resume()` | tickless idle (docs/power.md); return 0 to keep the periodic tick |
 | `board_suspend(ms, sources, res)` | suspend; return 0 when not supported |
 | `board_display_start()`, `board_input_start()` (in `devices.ad`, imported as `board.devices` by the system image) | put the console on a display / attach a keyboard (docs/display-input.md); return -1 without one |
+| `board_devices_start()` (also in `devices.ad`) | register the board's device files under `/dev` (docs/devices.md): its GPIO pins (`gpiofs_set_board`, `gpiofs_add`), sensors, anything a driver exposes with `devtree_add`. Every board gets `/dev/power/ctl` and `/dev/i2c/0` without doing anything; an I2C controller driver is made the bus's back end with `i2c_set_controller` |
 
 ## 3. A new board on a chip family Hamnix Micro knows
 
@@ -144,7 +145,8 @@ the Feather's values:
 | `kernel/proc.ad` | exec argument buffer | 4 / 4 / 1 KB |
 | `kernel/pipe.ad` | pipe buffer | 4 / 4 / 1 KB |
 | `fs/tmpfs.ad`, `mm/page_alloc.ad` | files in /, chunk size | 1024 / 128 / 32; 4 / 4 / 1 KB |
-| `fs/hvfs.ad` | directory listing snapshot | 8 / 8 / 2 KB |
+| `fs/hvfs.ad` | directory listing snapshot (the limit: a listing is cut down to its length once made); open files in the system | 8 / 8 / 2 KB; 64 / 64 / 32 |
+| `fs/ns.ad` | bytes of one namespace's mount table (it grows by 64 as binds are made; docs/namespaces.md) | 4 / 4 / 1 KB |
 | `init/main.ad` | init thread stack | 16 / 16 / 3 KB |
 | `user/hamnix/hamsh.ad` | the shell's arenas and buffers | 1.5 MB / 218 KB / 104 KB of data |
 | `lib/regex.ad`, `user/hamnix/grep.ad`, `ls.ad`, `lib/passwd/passwd.ad` | grep's tables, ls's listing, the passwd table | see the patches |

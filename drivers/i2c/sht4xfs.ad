@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- the SHT4x humidity and temperature sensor as text files:
+#
+#     /dev/sht4x/temperature     "25.000\n"   degrees Celsius
+#     /dev/sht4x/humidity        "56.500\n"   percent relative humidity
+#     /dev/sht4x/serial          "0f3a9b2c\n"
+#
+# Opening and reading one of the first two makes one high-precision
+# measurement with the vendor's C driver (third_party/sensirion-sht4x,
+# through drivers/i2c/sht4x.ad), about 10 ms.  A sensor that does not answer
+# or fails its checksum is an input/output error for the reader.  The image
+# must link the driver's C objects (COBJS_hmicro in the board's board.mk).
+
+from drivers.i2c.sht4x import sht4x_init, sht4x_measure_high_precision, sht4x_serial_number, SHT4X_ADDR_A
+from fs.devtree import devtree_add, devtree_text, DtOut, dt_c, dt_s, dt_u, dt_x2
+
+shf_ready: uint32 = 0
+shf_text: Array[32, uint8]          # what the reader at position 0 was given
+shf_len: uint64 = 0
+shf_t: Array[1, int32]              # C int32 cells (see drivers/i2c/sht4x.ad)
+shf_rh: Array[1, int32]
+shf_sn: Array[1, uint32]
+
+
+# value in thousandths -> "[-]N.NNN\n"
+def _milli(o: Ptr[DtOut], v: int32):
+    u: uint32 = cast[uint32](v)
+    if v < 0:
+        dt_c(o, 45)
+        u = cast[uint32](0 - v)
+    dt_u(o, cast[uint64](u / 1000))
+    dt_c(o, 46)
+    f: uint32 = u % 1000
+    dt_c(o, 48 + f / 100)
+    dt_c(o, 48 + (f / 10) % 10)
+    dt_c(o, 48 + f % 10)
+    dt_c(o, 10)
+
+
+# which: 0 temperature, 1 humidity, 2 serial number
+def _rd(which: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    if pos == 0:
+        if shf_ready == 0:
+            sht4x_init(cast[uint8](SHT4X_ADDR_A))
+            shf_ready = 1
+        o: DtOut
+        o.p = &shf_text[0]
+        o.n = 0
+        o.cap = 32
+        if which == 2:
+            if sht4x_serial_number(&shf_sn[0]) != 0:
+                return -5
+            dt_x2(&o, shf_sn[0] >> 24)
+            dt_x2(&o, shf_sn[0] >> 16)
+            dt_x2(&o, shf_sn[0] >> 8)
+            dt_x2(&o, shf_sn[0])
+            dt_c(&o, 10)
+        else:
+            if sht4x_measure_high_precision(&shf_t[0], &shf_rh[0]) != 0:
+                return -5
+            if which == 0:
+                _milli(&o, shf_t[0])
+            else:
+                _milli(&o, shf_rh[0])
+        shf_len = o.n
+    return devtree_text(&shf_text[0], shf_len, buf, n, pos)
+
+
+def sht4xfs_init():
+    devtree_add("sht4x/temperature", cast[uint64](&_rd), 0, 0)
+    devtree_add("sht4x/humidity", cast[uint64](&_rd), 0, 1)
+    devtree_add("sht4x/serial", cast[uint64](&_rd), 0, 2)

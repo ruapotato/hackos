@@ -15,3 +15,9 @@ def board_display_start() -> int32:
 
 def board_input_start() -> int32:
     return -1
+
+
+# Device files of this board beyond the ones every board has
+# (drivers/devfiles.ad: /dev/power/ctl, /dev/i2c/0): none yet.
+def board_devices_start() -> int32:
+    return 0

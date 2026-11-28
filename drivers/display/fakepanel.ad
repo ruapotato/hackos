@@ -110,8 +110,9 @@ def _fake_refresh(fbp: uint64, x: uint32, y: uint32, w: uint32, h: uint32, kind:
         row: Ptr[uint8] = cast[Ptr[uint8]](f[0].buf + cast[uint64]((y + j) * f[0].stride + off))
         i: uint32 = 0
         while i < rowbytes:
-            _o(cast[uint32](row[i]))
-            sum = sum + cast[uint32](row[i])
+            b: uint32 = cast[uint32](row[i])    # read once: the console may draw into the buffer meanwhile
+            _o(b)
+            sum = sum + b
             i = i + 1
         j = j + 1
     _o16(sum & 0xFFFF)

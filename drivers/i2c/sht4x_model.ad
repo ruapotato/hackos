@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- an emulated SHT4x on the software I2C bus (drivers/i2c/bus.ad),
+# for boards without the part and for the tests.
+#
+# Protocol (Sensirion SHT4x data sheet): the host writes one command byte,
+# waits, then reads 6 bytes: T ticks (big endian) + CRC, RH ticks + CRC, or for
+# the serial-number command two 16-bit words each followed by its CRC.  CRC-8,
+# polynomial 0x31, initial value 0xFF.
+#
+# /dev/model/sht4x sets what the sensor measures:
+#     echo 'ticks 26214 32768' > /dev/model/sht4x     # 25.0 C, 56.5 %RH
+# (the data sheet's raw values: T = -45 + 175 * ticks / 65535 C,
+# RH = -6 + 125 * ticks / 65535 %).  Reading it shows them and the counters.
+
+from drivers.i2c.bus import i2c_attach
+from fs.devtree import devtree_add, devtree_text, DtOut, dt_c, dt_s, dt_u, DtIn, dt_in, dt_end, dt_word, dt_num
+
+fk_cmd: uint32 = 0
+fk_t: uint32 = 0
+fk_rh: uint32 = 0
+fk_serial: uint32 = 0x0F3A9B2C
+fk_bad_crc: uint32 = 0
+fk_resets: uint32 = 0
+fk_writes: uint32 = 0
+fk_reads: uint32 = 0
+
+
+def fk_crc(hi: uint32, lo: uint32) -> uint32:
+    crc: uint32 = 0xFF
+    k: uint32 = 0
+    while k < 2:
+        if k == 0:
+            crc = crc ^ hi
+        else:
+            crc = crc ^ lo
+        b: uint32 = 0
+        while b < 8:
+            if (crc & 0x80) != 0:
+                crc = ((crc << 1) ^ 0x31) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+            b = b + 1
+        k = k + 1
+    return crc
+
+
+def fk_write(data: Ptr[uint8], n: uint32) -> int32:
+    fk_writes = fk_writes + 1
+    if n != 1:
+        return -1
+    fk_cmd = cast[uint32](data[0])
+    if fk_cmd == 0x94:
+        fk_resets = fk_resets + 1
+    return 0
+
+
+def fk_put_word(out: Ptr[uint8], off: uint32, w: uint32):
+    out[off] = cast[uint8]((w >> 8) & 0xFF)
+    out[off + 1] = cast[uint8](w & 0xFF)
+    c: uint32 = fk_crc((w >> 8) & 0xFF, w & 0xFF)
+    if fk_bad_crc != 0:
+        c = c ^ 0x5A
+    out[off + 2] = cast[uint8](c)
+
+
+def fk_read(data: Ptr[uint8], n: uint32) -> int32:
+    fk_reads = fk_reads + 1
+    if n != 6:
+        return -1
+    if fk_cmd == 0x89:
+        fk_put_word(data, 0, fk_serial >> 16)
+        fk_put_word(data, 3, fk_serial & 0xFFFF)
+        return 0
+    if fk_cmd == 0xFD or fk_cmd == 0xF6 or fk_cmd == 0xE0:
+        fk_put_word(data, 0, fk_t)
+        fk_put_word(data, 3, fk_rh)
+        return 0
+    return -1
+
+
+def _m_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    text: Array[96, uint8]
+    o: DtOut
+    o.p = &text[0]
+    o.n = 0
+    o.cap = 96
+    dt_s(&o, "ticks ")
+    dt_u(&o, cast[uint64](fk_t))
+    dt_c(&o, 32)
+    dt_u(&o, cast[uint64](fk_rh))
+    dt_s(&o, " writes ")
+    dt_u(&o, cast[uint64](fk_writes))
+    dt_s(&o, " reads ")
+    dt_u(&o, cast[uint64](fk_reads))
+    dt_c(&o, 10)
+    return devtree_text(&text[0], o.n, buf, n, pos)
+
+
+def _m_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    ok: uint32 = 0
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    if dt_word(&s, "ticks") == 0:
+        return -22
+    t: uint64 = dt_num(&s, 0, &ok)
+    if ok == 0 or t > 65535:
+        return -22
+    rh: uint64 = dt_num(&s, 0, &ok)
+    if ok == 0 or rh > 65535 or dt_end(&s) == 0:
+        return -22
+    fk_t = cast[uint32](t)
+    fk_rh = cast[uint32](rh)
+    return cast[int64](n)
+
+
+# The emulated sensor on the bus at 0x44.
+def sht4x_model_plug() -> int32:
+    return i2c_attach(0x44, cast[uint64](&fk_write), cast[uint64](&fk_read))
+
+
+# ... and its file under /dev/model.
+def sht4x_model_attach() -> int32:
+    if sht4x_model_plug() != 0:
+        return -1
+    devtree_add("model/sht4x", cast[uint64](&_m_rd), cast[uint64](&_m_wr), 0)
+    return 0

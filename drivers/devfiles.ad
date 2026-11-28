@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- the device files every board has (fs/devtree.ad has the rest of
+# the story; a board adds its own in boards/<board>/devices.ad):
+#
+#   /dev/power/ctl    read: the idle and wake-up counters (kernel/power.ad,
+#                     the text of /proc/power); write: "tickless 0" or
+#                     "tickless 1"
+#   /dev/i2c/0/ctl, /dev/i2c/0/data     the I2C bus (drivers/i2c/i2cfs.ad)
+
+from mm.slab import kmalloc, kfree
+from kernel.power import power_render, power_ctl
+from drivers.i2c.i2cfs import i2cfs_init
+from fs.devtree import devtree_add, devtree_text, DtIn, dt_in, dt_end
+
+PW_TEXT: uint64 = 768
+
+
+def _pw_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    t: uint64 = kmalloc(PW_TEXT)
+    if t == 0:
+        return -12
+    l: uint64 = power_render(cast[Ptr[uint8]](t), PW_TEXT)
+    r: int64 = devtree_text(cast[Ptr[uint8]](t), l, buf, n, pos)
+    kfree(t)
+    return r
+
+
+def _pw_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    if power_ctl(buf, n) < 0:
+        return -22
+    return cast[int64](n)
+
+
+def devfiles_init():
+    devtree_add("power/ctl", cast[uint64](&_pw_rd), cast[uint64](&_pw_wr), 0)
+    i2cfs_init()

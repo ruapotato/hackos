@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 David Hamner
+# Hamnix Micro -- the display as files, on a board whose console is on one
+# (drivers/display/dispcon.ad):
+#
+#   /dev/screen/ctl    read:  "size 800 480 depth 1 text 100 30 refreshes 12\n"
+#                      write: "refresh"  send the whole frame again
+#                             "clear"    empty the text screen
+#   /dev/screen/text   read:  the characters on the text cells, a line per row
+#                             (what /proc/screen shows)
+#                      write: text for the text screen, as the console would
+#                             print it (it does not go to the UART)
+#   /dev/screen/data   the frame buffer: size[1] bytes per row * size[2] rows,
+#                      most significant bit left, 0 = black at depth 1.
+#                      Readable and writable at any position (lseek); a write
+#                      is shown at the next refresh, which it also requests.
+
+from mm.slab import kmalloc, kfree
+from kernel.rt import rt_memcpy
+from drivers.display.fb import fb_dirty
+from drivers.display.dispcon import dispcon_putc, dispcon_text, dispcon_kick, dc_fb, dc_panel, dc_flushes
+from drivers.display.textcon import tc_cols, tc_rows
+from fs.devtree import devtree_add, devtree_text, DtOut, dt_c, dt_s, dt_u, DtIn, dt_in, dt_end, dt_word
+
+
+def _ctl_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    text: Array[96, uint8]
+    o: DtOut
+    o.p = &text[0]
+    o.n = 0
+    o.cap = 96
+    dt_s(&o, "size ")
+    dt_u(&o, cast[uint64](dc_fb.w))
+    dt_c(&o, 32)
+    dt_u(&o, cast[uint64](dc_fb.h))
+    dt_s(&o, " depth ")
+    dt_u(&o, cast[uint64](dc_fb.bpp))
+    dt_s(&o, " text ")
+    dt_u(&o, cast[uint64](tc_cols))
+    dt_c(&o, 32)
+    dt_u(&o, cast[uint64](tc_rows))
+    dt_s(&o, " refreshes ")
+    dt_u(&o, dc_flushes)
+    dt_c(&o, 10)
+    return devtree_text(&text[0], o.n, buf, n, pos)
+
+
+def _ctl_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    s: DtIn
+    dt_in(&s, buf, n)
+    if dt_end(&s) != 0:
+        return cast[int64](n)
+    if dt_word(&s, "refresh") != 0:
+        fb_dirty(&dc_fb, 0, 0, dc_fb.w, dc_fb.h)
+        dispcon_kick()
+    elif dt_word(&s, "clear") != 0:
+        dispcon_putc(27)                # ESC [ 2 J  ESC [ H
+        dispcon_putc(91)
+        dispcon_putc(50)
+        dispcon_putc(74)
+        dispcon_putc(27)
+        dispcon_putc(91)
+        dispcon_putc(72)
+    else:
+        return -22
+    return cast[int64](n)
+
+
+def _text_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    cap: uint64 = cast[uint64](tc_cols + 1) * cast[uint64](tc_rows) + 16
+    t: uint64 = kmalloc(cap)
+    if t == 0:
+        return -12
+    l: uint64 = dispcon_text(cast[Ptr[uint8]](t), cap)
+    r: int64 = devtree_text(cast[Ptr[uint8]](t), l, buf, n, pos)
+    kfree(t)
+    return r
+
+
+def _text_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    i: uint64 = 0
+    while i < n:
+        if buf[i] == 10:
+            dispcon_putc(13)
+        dispcon_putc(cast[uint32](buf[i]))
+        i = i + 1
+    return cast[int64](n)
+
+
+def _data_rd(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    return devtree_text(cast[Ptr[uint8]](dc_fb.buf), cast[uint64](dc_fb.size), buf, n, pos)
+
+
+def _data_wr(arg: uint64, buf: Ptr[uint8], n: uint64, pos: uint64) -> int64:
+    size: uint64 = cast[uint64](dc_fb.size)
+    if pos >= size:
+        return -28
+    if n > size - pos:
+        n = size - pos
+    rt_memcpy(dc_fb.buf + pos, cast[uint64](buf), n)
+    fb_dirty(&dc_fb, 0, 0, dc_fb.w, dc_fb.h)
+    dispcon_kick()
+    return cast[int64](n)
+
+
+# Called by a board after dispcon_start() succeeded.
+def dispfs_init():
+    if dc_panel < 0:
+        return
+    devtree_add("screen/ctl", cast[uint64](&_ctl_rd), cast[uint64](&_ctl_wr), 0)
+    devtree_add("screen/text", cast[uint64](&_text_rd), cast[uint64](&_text_wr), 0)
+    devtree_add("screen/data", cast[uint64](&_data_rd), cast[uint64](&_data_wr), 0)
