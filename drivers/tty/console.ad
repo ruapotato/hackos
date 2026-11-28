@@ -16,14 +16,27 @@
 #     CR or LF          deliver the line, terminated by "\n"
 # In raw mode every byte is delivered at once, unechoed (what Hamnix's shell
 # expects from its console).
+#
+# Fast input (a pasted block).  Received bytes wait in a ring of CON_RING
+# bytes for a reader.  A reader that is slower than the line (the shell
+# redraws its prompt at every keystroke) would let the ring overflow, so at
+# CON_HIGH bytes the console asks the board to hold the sender off
+# (board_console_rx_throttle(1): stop taking bytes from the UART, so that
+# its hardware flow control, or the emulator's, pushes back; and XOFF where
+# the board sends one) and lets it go again at CON_LOW.  Where the board can
+# do nothing, bytes beyond a full ring are dropped and counted
+# (con_rx_dropped), as before.  While input is held, Ctrl-C is not seen
+# either: it is a byte in the same stream.
 
 from kernel.cpu import cpu_irq_save, cpu_irq_restore, mmio_read32, mmio_write32, mmio_write8
 from kernel.sched.core import WaitQueue, wq_init, wq_wait, wq_wake_all, sched_running, sched_in_handler, sched_kill_group, thread_killed, tty_fg_pgid, WAIT_FOREVER
 from kernel.sync import Mutex, mutex_init, mutex_register, mutex_lock, mutex_unlock
-from board.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack
+from board.board import board_console_putc, board_console_rx_ready, board_console_getc, board_console_rx_irq_enable, board_console_rx_irq_ack, board_console_rx_throttle
 
 CON_RING: uint32 = 1024
 CON_LINE: uint32 = 256
+CON_HIGH: uint32 = 512              # ring fill at which the sender is held off
+CON_LOW: uint32 = 256               # ... and let go again
 CON_COOKED: uint32 = 1
 CON_RAW: uint32 = 0
 
@@ -40,6 +53,9 @@ con_rx_bytes: uint64 = 0           # statistics
 con_rx_dropped: uint64 = 0
 con_rx_irqs: uint64 = 0            # receive interrupts taken
 con_ready: uint32 = 0
+con_throttled: uint32 = 0          # the sender is being held off
+con_throttles: uint64 = 0          # how often that happened
+con_ring_max: uint32 = 0           # the fullest the ring has been
 
 
 def console_init():
@@ -90,6 +106,12 @@ def _ring_put(c: uint32):
         return
     con_ring[(con_head + con_count) % CON_RING] = cast[uint8](c)
     con_count = con_count + 1
+    if con_count > con_ring_max:
+        con_ring_max = con_count
+    if con_count >= CON_HIGH and con_throttled == 0:
+        con_throttled = 1
+        con_throttles = con_throttles + 1
+        board_console_rx_throttle(1)
 
 
 def _commit_line():
@@ -202,5 +224,11 @@ def console_read(buf: Ptr[uint8], n: uint64, nonblock: uint32) -> int64:
         got = got + 1
         if c == 10 and con_mode == CON_COOKED:
             break
+    if con_throttled != 0 and con_count <= CON_LOW:
+        # room again: let the sender go, and take what the UART already holds
+        con_throttled = 0
+        board_console_rx_throttle(0)
+        while con_throttled == 0 and board_console_rx_ready() != 0:
+            console_input(board_console_getc())
     cpu_irq_restore(irq)
     return cast[int64](got)

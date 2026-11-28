@@ -407,6 +407,11 @@ if wait_for "hamsh\$ "; then
     sh "echo 'exit 5' >> /tmp/s.hsh"
     shn 'hamsh /tmp/s.hsh'
     sh 'echo script status $status'
+    # a pasted block: 60 command lines in one write, more than the console's
+    # input ring would hold if the sender were not held off
+    paste=""; for i in $(seq -w 1 60); do paste="${paste}echo paste line x$i >> /tmp/paste\\r"; done
+    say "$paste"
+    sh 'wc < /tmp/paste'
     say 'halt 0\r'
 else
     bad "the shell never printed its prompt"
@@ -456,6 +461,7 @@ n40k="$(grep -c '^157 627 40000$' $S)"
 [ "$n40k" = 2 ] && ok "shell: cp card -> tmpfs -> card, 40000 bytes each way" || bad "shell: the 40000-byte copies were counted $n40k times, expected 2"
 expect "shell: a program run from the card" $S '^from the card 2$'
 expect "shell: rm on the card" $S '^cat: cannot open /sd/BACK.BIN: .*file does not exist'
+expect "shell: a pasted block of 60 command lines (2 KB in one write): every line ran, in order" $S '^60 180 900$'
 nmark="$(grep -c '^0 0 0$' $S)"
 [ "$nmark" = "$m" ] && ok "shell: all $m commands were answered" || bad "shell: $nmark of $m commands answered"
 

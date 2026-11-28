@@ -5,15 +5,29 @@
 #
 # EasyDMA moves bytes between the UARTE and RAM; it cannot read flash, so
 # both directions go through one-byte buffers in .bss (Data RAM).
-#   transmit  polled: the byte is put in the TX buffer, STARTTX, then ENDTX
-#             is waited for (one character time, 87 us at 115200), with a
-#             limit: a UARTE that never finishes costs UARTE_TX_SPINS polls
-#             per character and then STOPTX, not a hang.
+#   transmit  polled, one byte per DMA transfer.  Interrupts are masked only
+#             while the transfer is set up, NOT for the character time (87 us
+#             at 115200): the receive interrupt stays live while the system
+#             prints.  A printer that interrupts another (a handler's echo
+#             or fault report, a preempting thread) first waits for the byte
+#             in flight (ENDTX), so two transfers never overlap.  A UARTE
+#             that never finishes costs UARTE_TX_SPINS polls and a STOPTX,
+#             not a hang.
 #   receive   one byte per DMA transfer: STARTRX with MAXCNT 1; ENDRX
 #             interrupts; uarte_getc takes the byte and starts the next
 #             transfer.  Bytes that arrive in between wait in the UARTE's
-#             RX FIFO (product specification: "UARTE ... reception"), so a
-#             late interrupt loses nothing until that FIFO is full.
+#             RX FIFO (product specification, UARTE reception), so a late
+#             interrupt loses nothing until that FIFO is full; when it is,
+#             ERRORSRC.OVERRUN says so and uarte_rx_overruns counts it.
+#             Longer buffers were considered and not used: bytes would have
+#             to be counted through RXDRDY, which merges when the handler is
+#             late, and Renode's model (the only place this code has run)
+#             moves one queued byte per STARTRX.
+#   hold      uarte_rx_hold(base, 1): the next ENDRX does not restart the
+#             receiver.  The FIFO then fills, and with hardware flow control
+#             enabled (uarte_hwfc) the UARTE itself raises RTS: the sender
+#             stops, nothing is lost.  Without it, what the FIFO cannot hold
+#             is an overrun.  uarte_rx_hold(base, 0) starts it again.
 #             ERROR is enabled as an interrupt too, so overrun, parity,
 #             framing and break are cleared (ERRORSRC is write-1-to-clear)
 #             instead of leaving the line pending.
@@ -54,6 +68,8 @@ UARTE_PSEL_CONNECT_MSK: uint32 = 0x80000000    # hdr: UARTE_PSEL_TXD_CONNECT_Msk
 UARTE_PSEL_PORT_SHIFT: uint32 = 5        # hdr: UARTE_PSEL_TXD_PORT_Pos
 UARTE_INT_ENDRX: uint32 = 0x10           # hdr: UARTE_INTENSET_ENDRX_Msk
 UARTE_INT_ERROR: uint32 = 0x200          # hdr: UARTE_INTENSET_ERROR_Msk
+UARTE_CONFIG_HWFC: uint32 = 1            # hdr: UARTE_CONFIG_HWFC_Msk
+UARTE_ERRORSRC_OVERRUN: uint32 = 1       # hdr: UARTE_ERRORSRC_OVERRUN_Msk
 UARTE_CONFIG_8N1: uint32 = 0             # unchecked: HWFC off, PARITY excluded, one stop bit: all fields 0 (UARTE_CONFIG_*_Disabled/Excluded/One are 0)
 UARTE_TX_SPINS: uint32 = 200000          # unchecked: policy -- polls of ENDTX per character (>> 87 us at 64 MHz)
 
@@ -62,6 +78,10 @@ ua_rx: Array[2, uint32]
 uarte_tx_timeouts: uint64 = 0            # characters given up on
 uarte_rx_errors: uint64 = 0              # ERROR events cleared
 uarte_last_errorsrc: uint32 = 0
+uarte_rx_overruns: uint64 = 0            # of them: the RX FIFO was full (bytes lost)
+ua_tx_started: Array[2, uint32]          # a byte has been started and ENDTX not yet consumed
+ua_rx_held: Array[2, uint32]             # do not restart the receiver (uarte_rx_hold)
+ua_rx_idle: Array[2, uint32]             # the receiver is waiting to be restarted
 
 
 def _idx(base: uint64) -> uint32:
@@ -96,25 +116,49 @@ def uarte_init(base: uint64, txd_pin: uint32, rxd_pin: uint32, baud_reg: uint32)
     mmio_write32(base + UARTE_ENABLE, UARTE_ENABLE_ENABLED)
 
 
-# One byte, polled.  Interrupts are masked while the DMA buffer is in use, so
-# a handler that prints cannot overwrite it half-way.
+# Hardware flow control: RTS (an output of this side: "you may send") and
+# CTS (an input: "I may send") on the given pins; a pin number of 0xFF leaves
+# that line unused.  Call after uarte_init, before the receiver is started;
+# the RTS pin must be a GPIO output driven high (not ready) by the caller.
+def uarte_hwfc(base: uint64, rts_pin: uint32, cts_pin: uint32):
+    mmio_write32(base + UARTE_ENABLE, UARTE_ENABLE_DISABLED)
+    if rts_pin != 0xFF:
+        mmio_write32(base + UARTE_PSEL_RTS, uarte_psel(rts_pin))
+    if cts_pin != 0xFF:
+        mmio_write32(base + UARTE_PSEL_CTS, uarte_psel(cts_pin))
+    mmio_write32(base + UARTE_CONFIG, UARTE_CONFIG_8N1 | UARTE_CONFIG_HWFC)
+    mmio_write32(base + UARTE_ENABLE, UARTE_ENABLE_ENABLED)
+
+
+# Wait for the byte in flight, if there is one.  Any context.
+def _tx_wait(base: uint64, i: uint32):
+    n: uint32 = 0
+    while ua_tx_started[i] != 0 and mmio_read32(base + UARTE_EVENTS_ENDTX) == 0:
+        n = n + 1
+        if n >= UARTE_TX_SPINS:
+            mmio_write32(base + UARTE_TASKS_STOPTX, 1)
+            uarte_tx_timeouts = uarte_tx_timeouts + 1
+            ua_tx_started[i] = 0
+            return
+
+
+# One byte, polled.  Interrupts are masked while the transfer is set up (and,
+# only if somebody else's byte is still in flight, until that one is out),
+# then the character time is waited for with interrupts enabled.
 def uarte_putc(base: uint64, c: uint32):
     i: uint32 = _idx(base)
     irq: uint32 = cpu_irq_save()
+    _tx_wait(base, i)
     ua_tx[i] = c & 0xFF
     mmio_write32(base + UARTE_EVENTS_ENDTX, 0)
     mmio_write32(base + UARTE_TXD_PTR, cast[uint32](cast[uint64](&ua_tx[i])))
     mmio_write32(base + UARTE_TXD_MAXCNT, 1)
     mmio_write32(base + UARTE_TASKS_STARTTX, 1)
-    n: uint32 = 0
-    while mmio_read32(base + UARTE_EVENTS_ENDTX) == 0:
-        n = n + 1
-        if n >= UARTE_TX_SPINS:
-            mmio_write32(base + UARTE_TASKS_STOPTX, 1)
-            uarte_tx_timeouts = uarte_tx_timeouts + 1
-            break
-    mmio_write32(base + UARTE_EVENTS_ENDTX, 0)
+    ua_tx_started[i] = 1
     cpu_irq_restore(irq)
+    # ENDTX stays set when this returns: it is what tells the next printer,
+    # in whatever context, that the line is free.
+    _tx_wait(base, i)
 
 
 # Every byte uarte_putc hands over has finished when it returns (ENDTX), so
@@ -133,24 +177,49 @@ def uarte_rx_irq_enable(base: uint64):
     mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
     mmio_write32(base + UARTE_EVENTS_ERROR, 0)
     mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX | UARTE_INT_ERROR)
+    ua_rx_held[_idx(base)] = 0
+    ua_rx_idle[_idx(base)] = 0
     _rx_start(base, _idx(base))
 
 
+# Hold the receiver (1) or let it run (0).  Call with interrupts masked or
+# from the receive handler.  A hold takes effect at the next ENDRX: that
+# byte is still delivered, and then the receiver is not restarted.  While it
+# waits, EVENTS_ENDRX is left SET with its interrupt disabled: the event is
+# what says "this transfer is over, nothing is being received", for the
+# hardware (bytes go to the FIFO) and for Renode's model (which otherwise
+# keeps writing bytes behind a buffer whose event was cleared).
+def uarte_rx_hold(base: uint64, on: uint32):
+    i: uint32 = _idx(base)
+    ua_rx_held[i] = on
+    if on == 0 and ua_rx_idle[i] != 0:
+        ua_rx_idle[i] = 0
+        mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+        mmio_write32(base + UARTE_INTENSET, UARTE_INT_ENDRX)
+        _rx_start(base, i)
+
+
 def uarte_rx_ready(base: uint64) -> uint32:
-    if mmio_read32(base + UARTE_EVENTS_ENDRX) != 0:
+    if ua_rx_idle[_idx(base)] == 0 and mmio_read32(base + UARTE_EVENTS_ENDRX) != 0:
         return 1
     return 0
 
 
-# The received byte; the next transfer is started.  A transfer that ended
-# with nothing in it (AMOUNT 0: STOPRX) gives 0x100, which the caller drops.
+# The received byte; the next transfer is started (unless held).  A transfer
+# that ended with nothing in it (AMOUNT 0: STOPRX) gives 0x100, which the
+# caller drops.  The byte is read BEFORE the event is cleared, and the
+# restart follows the clear at once: between the two nothing is in progress.
 def uarte_getc(base: uint64) -> uint32:
     i: uint32 = _idx(base)
-    mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
     c: uint32 = 0x100
     if mmio_read32(base + UARTE_RXD_AMOUNT) != 0:
         c = ua_rx[i] & 0xFF
-    _rx_start(base, i)
+    if ua_rx_held[i] != 0:
+        mmio_write32(base + UARTE_INTENCLR, UARTE_INT_ENDRX)
+        ua_rx_idle[i] = 1
+    else:
+        mmio_write32(base + UARTE_EVENTS_ENDRX, 0)
+        _rx_start(base, i)
     return c
 
 
@@ -160,3 +229,5 @@ def uarte_clear_errors(base: uint64):
         uarte_last_errorsrc = mmio_read32(base + UARTE_ERRORSRC)
         mmio_write32(base + UARTE_ERRORSRC, uarte_last_errorsrc)
         uarte_rx_errors = uarte_rx_errors + 1
+        if (uarte_last_errorsrc & UARTE_ERRORSRC_OVERRUN) != 0:
+            uarte_rx_overruns = uarte_rx_overruns + 1

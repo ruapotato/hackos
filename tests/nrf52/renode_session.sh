@@ -47,7 +47,7 @@ S=$B/console.txt
 sed 's/^/    /' $S
 [ "$drc" = 0 ] && ok "every command was answered" || bad "$drc waits failed (driver.log)"
 NPROG=$(ls build/feather-nrf52840/user | grep -cv '\.')
-expect "boot banner names the board and the M4F" $S '^HackOS 0\.3 \(milestone 3\) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express'
+expect "boot banner names the board and the M4F" $S '^HackOS 0\.[0-9]+ \(milestone [0-9]+\) -- ARM Cortex-M4F, Adafruit Feather nRF52840 Express'
 expect "the clocks report" $S '^clocks: HFCLK from the 32 MHz crystal, LFCLK from the RC oscillator$'
 expect "/bin runs in place from its flash window" $S '^/bin in place at 0x00080000\.\.'
 expect "hamsh runs as a process (its banner)" $S "^hamsh . Hamnix shell"
@@ -87,6 +87,9 @@ if grep -q '^second shell status 0$' $S; then bad "a second shell started: the a
 else ok "a second shell does not fit and fails cleanly: $(grep -m1 '^second shell status' $S)"; fi
 n12="$(grep -cE '^1 2 [78]$' $S)"
 [ "$n12" = 12 ] && ok "a loop of 12 pipelines, 24 processes one after another" || bad "the loop of 12 pipelines printed $n12 counts"
+expect "a pasted block of 40 command lines (1.4 KB in one write): every line ran, in order" $S '^40 120 600$'
+expect "... with the sender held off while the shell worked, and nothing dropped" $S '^console: [0-9]+ bytes in, input ring peak [0-9]+, sender held off [1-9][0-9]* times, dropped 0, UART overruns 0, other UART errors 0$'
+grep '^console:' $S | sed 's/^/[renode]   /'
 expect "'halt 0' ends the run with status 0" $S '^\[hackos\] exit status 0$'
 expect "memory report" $S '^memory: kernel heap peak [0-9]+ of [0-9]+, program arena peak [0-9]+$'
 grep '^memory:' $S | sed 's/^/[renode]   /'

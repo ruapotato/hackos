@@ -28,10 +28,11 @@ from kernel.cpu import mmio_read32, mmio_write32
 from kernel.print import kputs, kput_u64, kput_hex32
 from kernel.sched.core import Thread, threads, thread_create, thread_sleep, systick_handler, proc_ustack_used, thread_kstack_used, reap_kstack_max, proc_ustack_max, proc_ustack_max_name, THREAD_MAX, T_UNUSED, TF_PROC
 from mm.slab import kheap
+from drivers.tty.console import con_rx_bytes, con_rx_dropped, con_throttles, con_ring_max
 from mm.heap import heap_last_fail_size
 from mm.parena import pa_peak, pa_n_fail
 from soc.nrf52840.soc import UARTE0_BASE, UARTE0_IRQ, RTC1_BASE, RTC1_IRQ, P0_BASE, P1_BASE, FICR_INFO_PART, FICR_INFO_VARIANT, FICR_INFO_RAM, FICR_INFO_FLASH, FICR_DEVICEID0, FICR_DEVICEID1, nvic_enable, nrf52840_system_init, nrf52840_clocks_start, hfxo_ok, lfclk_ok, ficr, reset_reason, reset_reason_clear
-from soc.nrf52.uarte import uarte_init, uarte_putc, uarte_flush, uarte_rx_irq_enable, uarte_rx_ready, uarte_getc, uarte_clear_errors, UARTE_BAUD_115200
+from soc.nrf52.uarte import uarte_init, uarte_putc, uarte_flush, uarte_rx_irq_enable, uarte_rx_ready, uarte_getc, uarte_clear_errors, uarte_rx_hold, uarte_hwfc, uarte_rx_overruns, uarte_rx_errors, UARTE_BAUD_115200
 from soc.nrf52.gpio import gpio_output, gpio_input, gpio_set, gpio_clear, gpio_toggle, PULL_UP, DRIVE_S0S1
 from soc.nrf52.rtc import rtc_tick_start, rtc_tick_ack
 from soc.nrf52.delay import delay_init, delay_us
@@ -54,6 +55,20 @@ CFG_BOARD_ID: uint32 = 208           # unchecked: CFG_BOOTLOADER_BOARD_ID, same
 ID_EXPRESS: uint32 = 0x239A0029      # unchecked: USB VID 0x239A, UF2 PID 0x0029 (board.h, Express)
 ID_SENSE: uint32 = 0x239A0087        # unchecked: UF2 PID 0x0087 (board.h, Sense)
 XIP_WINDOW: uint32 = 0x00080000      # unchecked: = __romfs_window in link.ld (asserted by check_image.py)
+
+# Flow control of the console, for input faster than the shell takes it (a
+# pasted block).  Two ways, both optional on the other side:
+#   XON/XOFF   on by default: XOFF (0x13) when the input ring is half full,
+#              XON (0x11) when it has drained.  The terminal must honour it
+#              (`picocom --flow x`, `stty ixon`); one that does not just
+#              ignores the two bytes.
+#   RTS        off by default (CONSOLE_RTS_PIN = 0xFF).  Set it to a free
+#              pin (for example 6 = P0.06, the Feather's D11) and wire that
+#              pin to the adapter's CTS: the UARTE then stops the sender in
+#              hardware while HackOS is not taking bytes, and nothing can be
+#              lost.  UNTESTED ON HARDWARE.
+CONSOLE_XONXOFF: uint32 = 1          # unchecked: policy
+CONSOLE_RTS_PIN: uint32 = 0xFF       # unchecked: policy -- no RTS line by default
 
 led_pin: uint32 = 47
 board_id: uint32 = 0
@@ -123,6 +138,9 @@ def board_console_init():
     gpio_output(P0_BASE, PIN_TX, 1, DRIVE_S0S1)         # idle high before ENABLE
     gpio_input(P0_BASE, PIN_RX, PULL_UP)                 # a floating RX reads idle, not noise
     uarte_init(UARTE0_BASE, PIN_TX, PIN_RX, UARTE_BAUD_115200)
+    if CONSOLE_RTS_PIN != 0xFF:
+        gpio_output(P0_BASE, CONSOLE_RTS_PIN, 1, DRIVE_S0S1)     # not ready until the receiver runs
+        uarte_hwfc(UARTE0_BASE, CONSOLE_RTS_PIN, 0xFF)
 
 
 def board_console_putc(c: uint32):
@@ -140,6 +158,18 @@ def board_console_rx_ready() -> uint32:
 
 def board_console_getc() -> uint32:
     return uarte_getc(UARTE0_BASE) & 0xFF
+
+
+# Hold the sender off / let it go (drivers/tty/console.ad).
+def board_console_rx_throttle(on: uint32):
+    if on != 0:
+        uarte_rx_hold(UARTE0_BASE, 1)
+        if CONSOLE_XONXOFF != 0:
+            uarte_putc(UARTE0_BASE, 0x13)
+    else:
+        if CONSOLE_XONXOFF != 0:
+            uarte_putc(UARTE0_BASE, 0x11)
+        uarte_rx_hold(UARTE0_BASE, 0)
 
 
 def board_console_rx_irq_ack():
@@ -305,6 +335,19 @@ def board_late_init():
 # Before the run ends: what memory the session needed (the high-water marks
 # tests/nrf52/renode_session.sh and docs/boards/feather-nrf52840.md quote).
 def _mem_report():
+    kputs("console: ")
+    kput_u64(con_rx_bytes)
+    kputs(" bytes in, input ring peak ")
+    kput_u64(cast[uint64](con_ring_max))
+    kputs(", sender held off ")
+    kput_u64(con_throttles)
+    kputs(" times, dropped ")
+    kput_u64(con_rx_dropped)
+    kputs(", UART overruns ")
+    kput_u64(uarte_rx_overruns)
+    kputs(", other UART errors ")
+    kput_u64(uarte_rx_errors - uarte_rx_overruns)
+    kputs("\n")
     kputs("memory: kernel heap peak ")
     kput_u64(cast[uint64](kheap.peak_bytes))
     kputs(" of ")
@@ -337,6 +380,14 @@ def _mem_report():
             kput_u64(cast[uint64](t[0].stack_top - t[0].mem_lo))
             kputs(", kernel stack ")
             kput_u64(thread_kstack_used(t))
+            kputs("\n")
+        elif t[0].state != T_UNUSED and (t[0].flags & TF_PROC) == 0:
+            kputs("memory: kernel thread ")
+            kputs(&t[0].name[0])
+            kputs(": stack ")
+            kput_u64(thread_kstack_used(t))
+            kputs(" of ")
+            kput_u64(t[0].kstack_size - 1024)
             kputs("\n")
         i = i + 1
 

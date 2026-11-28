@@ -110,6 +110,13 @@ def board_console_getc() -> uint32:
     return lpuart_getc(LPUART6_BASE) & 0xFF
 
 
+# Hold the sender off / let it go (drivers/tty/console.ad).  Not done on
+# this board: Serial1 has no flow-control pins wired, so a ring that is
+# full drops bytes and counts them (con_rx_dropped).
+def board_console_rx_throttle(on: uint32):
+    return
+
+
 def board_console_rx_irq_ack():
     lpuart_clear_errors(LPUART6_BASE)
 

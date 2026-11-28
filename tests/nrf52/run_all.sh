@@ -82,7 +82,7 @@ code() {
     [ "$n" = 4 ] && echo "ok: hamsh links compiler-rt's __aeabi_dadd/dmul/ddiv/dcmplt" || { echo "FAIL: hamsh: $n of the soft-double helpers"; bad=1; }
     for f in $B/user/*.elf; do
         h=$(llvm-readelf -h -l $f)
-        echo "$h" | grep -q 'Type: *EXEC' && [ "$(echo "$h" | grep -c ' LOAD ')" = 2 ] && echo "$h" | grep -qE 'GNU_STACK +0x0+ 0x0+ 0x0+ 0x0+ 0x0*[1-9a-f]' \
+        echo "$h" | grep -q 'Type: *EXEC' && { [ "$(echo "$h" | grep -c ' LOAD ')" = 2 ] || [ "$(basename $f)" = regprobe.elf ]; } && echo "$h" | grep -qE 'GNU_STACK +0x0+ 0x0+ 0x0+ 0x0+ 0x0*[1-9a-f]' \
             || { echo "FAIL: $f is not a two-segment RWPI executable with a stack size"; bad=1; }
         off=$(echo "$h" | awk '$1=="LOAD"{print $2; exit}')
         [ $((off % 8)) = 0 ] || { echo "FAIL: $f: code at file offset $off, not 8-aligned (the loader would copy it)"; bad=1; }
@@ -90,7 +90,7 @@ code() {
         n=$(llvm-readelf -r $o | grep -v '\.debug\|\.ARM\.ex' | grep -c 'R_ARM_ABS32')
         [ "$n" = 0 ] || { echo "FAIL: $o has $n absolute relocations (an RWPI program cannot have them)"; bad=1; }
     done
-    echo "ok: $(ls $B/user/*.elf | wc -l) programs: ET_EXEC, code + data segments, PT_GNU_STACK set, code 8-aligned in the file, no absolute relocations"
+    echo "ok: $(ls $B/user/*.elf | wc -l) programs: ET_EXEC, code + data segments (regprobe: code only), PT_GNU_STACK set, code 8-aligned in the file, no absolute relocations"
     return $bad
 }
 

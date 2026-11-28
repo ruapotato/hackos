@@ -54,5 +54,8 @@ shn hamsh /tmp/s.hsh
 sh echo second shell status $status
 sh for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] { echo loop $i | wc }
 sh ls /tmp | wc
+# a pasted block: 40 command lines (1.4 KB) in one write to the UART
+paste 40 echo paste line x%02d >> /tmp/paste
+sh wc < /tmp/paste
 shn halt 0
 end exit status

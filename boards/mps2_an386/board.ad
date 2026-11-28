@@ -160,5 +160,17 @@ def board_console_getc() -> uint32:
     return mmio_read32(0x40004000) & 255
 
 
+# Hold the sender off / let it go (drivers/tty/console.ad).  With the receive
+# interrupt off nobody reads DATA, STATE.RXFULL stays set, and QEMU's UART
+# model stops taking bytes from its input until it is read again: the
+# emulator's own back-pressure.  (A real CMSDK UART has no flow control and
+# would overrun; this board exists only in QEMU.)
+def board_console_rx_throttle(on: uint32):
+    if on != 0:
+        mmio_write32(0x40004008, 0x3)    # TX_EN | RX_EN
+    else:
+        mmio_write32(0x40004008, 0xB)    # ... | RX_INTEN
+
+
 def board_console_rx_irq_ack():
     mmio_write32(0x4000400C, 2)          # INTCLEAR: RX

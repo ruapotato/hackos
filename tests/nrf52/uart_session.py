@@ -12,6 +12,9 @@
 #                    "0 0 0" (the n-th one for the n-th sh): CMD is done
 #   shn CMD          type CMD without waiting
 #   raw HEX          send bytes (e.g. 03 = Ctrl-C)
+#   paste N TEXT     N lines of TEXT (%d = the line number) in ONE write to
+#                    the socket: a pasted block, as fast as the emulated
+#                    UART takes it
 #   sleep SECONDS
 #   end TEXT         wait (at most 120 s) until TEXT has appeared, then stop
 # Exit status: 0 when every wait succeeded; the number of failed waits else.
@@ -94,6 +97,9 @@ for line in script:
             fails += 1
     elif op == 'shn':
         send(arg + '\r')
+    elif op == 'paste':
+        n, _, text = arg.partition(' ')
+        s.sendall(''.join((text % i) + '\r' for i in range(1, int(n) + 1)).encode())
     elif op == 'raw':
         s.sendall(bytes.fromhex(arg))
     elif op == 'sleep':
