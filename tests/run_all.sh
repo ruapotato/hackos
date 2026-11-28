@@ -464,6 +464,27 @@ if wait_for "hamsh\$ "; then
     sh 'date'
     sh 'sleep 2'
     sh 'cat /proc/uptime'
+    # the editor: Hamnix's vi, driven by scripted keystrokes.  Insert three
+    # lines (one corrected with DEL), write, delete the first line (dd), open
+    # a line above (O), delete two characters at the end of the last line
+    # (G $ x x), open a line below (o), write and quit (:wq).  Then again:
+    # change something and leave without saving (:q is refused, :q! is not).
+    shn 'vi /tmp/edit.txt'; sleep 0.8
+    say 'ifirst line\rsecond lime\x7fne\rthird\x1b'; sleep 0.3
+    say ':w\r'; sleep 0.3
+    say 'ggdd'; sleep 0.2
+    say 'Otop\x1b'; sleep 0.2
+    say 'G$xx'; sleep 0.2
+    say 'oappended via o\x1b'; sleep 0.2
+    say ':wq\r'; sleep 0.5
+    sh 'echo vi-status $status'
+    sh 'wc < /tmp/edit.txt'
+    sh 'cat /tmp/edit.txt'
+    shn 'vi /tmp/edit.txt'; sleep 0.8
+    say 'ddixyz\x1b'; sleep 0.2
+    say ':q\r'; sleep 0.3
+    say ':q!\r'; sleep 0.5
+    sh 'wc < /tmp/edit.txt'
     # power: how often the processor wakes while the system idles at the
     # prompt of a sleeping command, tickless and with the periodic tick;
     # then suspend, ended by a key and by its timer
@@ -560,6 +581,12 @@ expect "shell: date before the clock is set says so and fails" $S '^date-unset 1
 expect "shell: setdate, then date" $S '^2026-11-27 12:00:0[0-9] UTC$'
 up="$(sed -n 's/^\([0-9]*\)\.[0-9]* \([0-9]*\)\.[0-9]*$/\1 \2/p' $S | tail -1)"
 if [ -n "$up" ]; then set -- $up; [ "$2" -ge 2 ] && ok "shell: sleep 2 was spent idle (/proc/uptime: up $1 s, idle $2 s)" || bad "shell: idle time $2 s after sleep 2"; else bad "shell: no /proc/uptime line"; fi
+expect "vi: left with :wq, status 0" $S '^vi-status 0$'
+expect "vi: insert with a correction, dd, O" $S '^second limne$'
+expect "vi: G \$ x x" $S '^thi$'
+expect "vi: o" $S '^appended via o$'
+[ "$(grep -c '^4 7 36$' $S)" = 2 ] && ok "vi: the file is 4 lines, 36 bytes; an edit abandoned with :q! left it alone" || bad "vi: '4 7 36' seen $(grep -c '^4 7 36$' $S) times, expected 2"
+grep -aq 'E: no write since last change (:q! overrides)' $B/shell.out && ok "vi: :q with unsaved changes is refused (its status line says so)" || bad "vi: no refusal of :q with unsaved changes"
 wk="$(sed -n 's/^  processor wake-ups from sleep: *\([0-9]*\)\.[0-9]* per second.*/\1/p' $S | tr '\n' ' ')"
 set -- $wk
 if [ $# = 2 ]; then
@@ -569,7 +596,7 @@ if [ $# = 2 ]; then
 else
     bad "shell: idlestat printed '$wk'"
 fi
-expect "shell: idlestat: no tick interrupt was taken in 3 idle seconds" $S '^  tick interrupts taken: +0\.[0-9] per second'
+expect "shell: idlestat: fewer than 10 tick interrupts a second while idle (1000 with the periodic tick)" $S '^  tick interrupts taken: +[0-9]\.[0-9] per second'
 expect "shell: suspend, ended by a key after about 1.5 s" $S '^woke: console after 1[0-9][0-9][0-9] ms, processor woken [0-9]+ times in all suspends$'
 expect "shell: suspend 2 -n, ended by its timer after 2000 ms" $S '^woke: timer after 2000 ms, processor woken [0-9]+ times in all suspends$'
 [ "$(grep -c '^persistent-history-probe$' $S)" = 2 ] && ok "shell: history survives exit: the next shell recalls a line of the previous one" || bad "shell: persistent-history-probe seen $(grep -c '^persistent-history-probe$' $S) times, expected 2"

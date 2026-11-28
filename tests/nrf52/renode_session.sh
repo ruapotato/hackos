@@ -97,6 +97,9 @@ expect "tr" $S '^SHOUT$'
 expect "mv" $S '^moved-n$'
 expect "Ctrl-C ends a pipeline (cat | wc: both wait, the shell names no group for them)" $S '^pipeline interrupted 130$'
 expect "kill PID ends the background job" $S '^\[1\]\+ Done ptest loop$'
+expect "vi: scripted keystrokes, left with :wq" $S '^vi-status 0$'
+expect "vi: the file it wrote is 4 lines, 36 bytes" $S '^4 7 36$'
+expect "vi: insert with a correction, dd, O, G \$ x x, o" $S '^appended via o$'
 wk="$(sed -n 's/^  processor wake-ups from sleep: *\([0-9]*\)\.[0-9]* per second.*/\1/p' $S | tr '\n' ' ')"
 set -- $wk
 if [ $# = 2 ]; then

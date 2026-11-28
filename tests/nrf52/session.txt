@@ -79,6 +79,23 @@ shn cat | wc
 sleep 1
 raw 03
 sh echo pipeline interrupted $status
+# the editor (200 lines of 79 characters on this board)
+shn vi /tmp/edit.txt
+sleep 1
+keys ifirst line\rsecond lime\x7fne\rthird\x1b
+sleep 0.5
+keys :w\r
+sleep 0.5
+keys ggdd
+keys Otop\x1b
+keys G$xx
+keys oappended via o\x1b
+sleep 0.3
+keys :wq\r
+sleep 1
+sh echo vi-status $status
+sh wc < /tmp/edit.txt
+sh cat /tmp/edit.txt
 sh idlestat 3
 sh idlestat 3 -p
 shn suspend 30

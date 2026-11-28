@@ -12,6 +12,7 @@
 #                    "0 0 0" (the n-th one for the n-th sh): CMD is done
 #   shn CMD          type CMD without waiting
 #   raw HEX          send bytes (e.g. 03 = Ctrl-C)
+#   keys TEXT        type TEXT, with \\x1b, \\r and the like as escapes
 #   killbg           type `kill PID` with the PID of the last "[n] PID" the
 #                    shell printed for a background job, and wait like sh
 #   paste N TEXT     N lines of TEXT (%d = the line number) in ONE write to
@@ -110,6 +111,9 @@ for line in script:
         if not wait_for('0 0 0', marks, 60):
             print("uart_session: no answer to kill", file=sys.stderr)
             fails += 1
+    elif op == 'keys':
+        # keystrokes with Python escapes (\x1b, \r), typed one by one
+        send(arg.encode().decode('unicode_escape'))
     elif op == 'paste':
         n, _, text = arg.partition(' ')
         s.sendall(''.join((text % i) + '\r' for i in range(1, int(n) + 1)).encode())
